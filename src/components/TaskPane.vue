@@ -103,7 +103,7 @@
 </template>
 
 <script>
-const APP_VER = '0.9.25'
+const APP_VER = '0.9.26'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
@@ -117,7 +117,7 @@ import { zhEvent, cleanCity, formatEventLine } from '../lib/events.js'
 import { isPlanned } from '../lib/truth.js'
 import { stageOf, STAGE_COLOR, NO_FILL, STAGE_LABEL } from '../lib/milestone.js'
 import { notFoundText } from '../lib/retention.js'
-import { matchPortHeaders, matchDateHeaders } from '../lib/headers.js'
+import { matchPortHeaders, matchDateHeaders, matchNumberHeaders } from '../lib/headers.js'
 import { pickEtdEta } from '../lib/dates.js'
 
 const CARRIER_NAME = {
@@ -470,6 +470,7 @@ export default {
       const rows = [baseRow, baseRow - 1, baseRow - 2].filter((r) => r >= 1)
       let pol = this.cfg.polCol, pod = this.cfg.podCol, hitRow = 0
       let dateHit = !!(this.cfg.etdCol && this.cfg.etaCol)
+      let numHit = !!this.cfg.altCol
       for (const row of rows) {
         let vals = []
         try {
@@ -494,6 +495,18 @@ export default {
           const m2 = matchPortHeaders(cells2)
           m = { pol: m.pol || m2.pol, pod: m.pod || m2.pod, scores: m2.scores }
           cellsUsed = cells2
+        }
+        // 单号两列（提单号 / 订舱号）：另选一列做「第二查询」
+        if (!numHit) {
+          const mn = matchNumberHeaders(cellsUsed)
+          const main = this.cfg.numberCol
+          const cand = [mn.bl, mn.bk].filter((c) => c && c !== main)
+          if (cand.length) {
+            this.cfg = { ...this.cfg, altCol: cand[0] }
+            numHit = true
+            this.saveCfg()
+            this.log(`第二单号列 = ${colLetter(cand[0])}（另一个号也会查，取更新的动态）`)
+          }
         }
         // 船期列（ETD/ETA）：用最终读到的表头格来认
         if ((!this.cfg.etdCol || !this.cfg.etaCol) && !dateHit) {
@@ -1182,6 +1195,26 @@ export default {
           this.log(`${t.number} 查无 → 换同格的另一个号 ${alt} 再试`)
           const r2 = await call(alt)
           if (r2 && r2.ok !== false) { r = r2; usedNum = alt }
+        }
+        // 表格里还有另一列单号（提单号/订舱号）→ 也查一次，谁的动态更新用谁
+        const altCol2 = this.cfg.altCol || 0
+        if (altCol2 && altCol2 !== this.cfg.numberCol) {
+          let altNum = ''
+          try { altNum = cleanNumber(String(this.readOne(sheet, t.row, altCol2) || '')) } catch (e) { altNum = '' }
+          if (altNum && altNum !== usedNum) {
+            const r2 = await call(altNum)
+            const latestOf = (x) => {
+              const evs = (x && x.events) || []
+              return evs.length ? String(evs[evs.length - 1].time || '') : ''
+            }
+            const t1 = latestOf(r), t2 = latestOf(r2)
+            if (t2 && t2 > t1) {
+              this.log(`R${t.row} ${usedNum} → ${altNum}：后者动态更新（${t2.slice(0, 10)} > ${t1.slice(0, 10) || '无'}）`)
+              r = r2; usedNum = altNum
+            } else if (r && r.ok === false && r2 && r2.ok !== false) {
+              r = r2; usedNum = altNum
+            }
+          }
         }
         it.usedNumber = usedNum
         it.text = this.formatLatest(r)

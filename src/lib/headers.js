@@ -46,6 +46,30 @@ const ETA_WORDS = [
   '预计到港', '预计抵港', '预计到达', '到港日', '抵港日', '计划到港', '到港时间',
 ]
 
+// 单号类表头：提单号 / 订舱号（有些船司只认其中一个）
+const BL_WORDS = ['BILL OF LADING', 'B/L NO', 'BL NO', 'MASTER B/L', 'MBL', 'HBL', 'BL', '提单号', '提单', '主提单', '分提单']
+const BK_WORDS = ['BOOKING NO', 'BOOKING NUMBER', 'BOOKING', 'BKG', 'SO NO', 'S/O', '订舱号', '订舱单号', '订舱']
+
+/**
+ * 认「提单号 / 订舱号」两列
+ * @returns {{bl:number, bk:number, scores:{bl:number,bk:number}}}
+ */
+export function matchNumberHeaders(cells) {
+  let bl = 0, bk = 0, blScore = 0, bkScore = 0
+  const list = Array.isArray(cells) ? cells : []
+  for (let i = 0; i < list.length; i++) {
+    const t = CLEAN(list[i])
+    if (!t || t.length > 40) continue
+    const tc = t.replace(/[^A-Z0-9\u4e00-\u9fa5]/g, '')
+    const sb = Math.max(score(t, BL_WORDS), score(tc, BL_WORDS))
+    const sk = Math.max(score(t, BK_WORDS), score(tc, BK_WORDS))
+    if (sb && sb > blScore) { bl = i + 1; blScore = sb }
+    if (sk && sk > bkScore) { bk = i + 1; bkScore = sk }
+  }
+  if (bl && bk && bl === bk) { if (blScore >= bkScore) bk = 0; else bl = 0 }
+  return { bl, bk, scores: { bl: blScore, bk: bkScore } }
+}
+
 /**
  * 认 ETD / ETA 列（同一套打分，认不出返回 0）
  * @returns {{etd:number, eta:number, scores:{etd:number,eta:number}}}
