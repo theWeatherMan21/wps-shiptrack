@@ -31,3 +31,15 @@ scripts/publish.sh --notes "说明"
 ```
 
 桥与 App 共用 `ShipScheduleHub` 的追踪引擎目录（`SSH_REPO`）。
+
+## 与船期 App 的同步约定
+
+`ShipScheduleHub` 的 `engine/` 改动后，本仓库必须跟一个补丁版本：
+
+```bash
+cd ~/Documents/trae_projects/ShipScheduleHub
+scripts/hotfix-addon.sh "说明"
+```
+
+这条规则有机器兜底：`ShipScheduleHub` 推送前会跑 `scripts/addon-sync-check.sh`，
+引擎比插件新就直接拦下（急用可 `SKIP_ADDON_SYNC=1 git push`）。
