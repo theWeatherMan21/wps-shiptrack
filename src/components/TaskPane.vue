@@ -103,7 +103,7 @@
 </template>
 
 <script>
-const APP_VER = '0.9.26'
+const APP_VER = '0.9.27'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
@@ -501,6 +501,7 @@ export default {
           const mn = matchNumberHeaders(cellsUsed)
           const main = this.cfg.numberCol
           const cand = [mn.bl, mn.bk].filter((c) => c && c !== main)
+          if (mn.bl || mn.bk) this.cfg = { ...this.cfg, blCol: mn.bl || this.cfg.blCol || 0, bkCol: mn.bk || this.cfg.bkCol || 0 }
           if (cand.length) {
             this.cfg = { ...this.cfg, altCol: cand[0] }
             numHit = true
@@ -1196,24 +1197,24 @@ export default {
           const r2 = await call(alt)
           if (r2 && r2.ok !== false) { r = r2; usedNum = alt }
         }
-        // 表格里还有另一列单号（提单号/订舱号）→ 也查一次，谁的动态更新用谁
-        const altCol2 = this.cfg.altCol || 0
-        if (altCol2 && altCol2 !== this.cfg.numberCol) {
-          let altNum = ''
-          try { altNum = cleanNumber(String(this.readOne(sheet, t.row, altCol2) || '')) } catch (e) { altNum = '' }
+        // 双列策略（爹地 2026-10-27 定）：先查提单号，查无动态再查订舱号。
+        // 这样绝大多数行只发 1 个请求，不会因为多一列就把整批耗时翻倍。
+        const hasEvents = (x) => !!(x && x.ok !== false && (x.events || []).length)
+        if (!hasEvents(r)) {
+          const blCol = this.cfg.blCol || 0
+          const bkCol = this.cfg.bkCol || 0
+          const pick = (c) => {
+            if (!c || c === this.cfg.numberCol) return ''
+            try { return cleanNumber(String(this.readOne(sheet, t.row, c) || '')) } catch (e) { return '' }
+          }
+          // 什么时候还该试第二列：主查的是提单号 → 试订舱号；主查的是订舱号 → 试提单号
+          const curIsBl = blCol && this.cfg.numberCol === blCol
+          const secondCol = curIsBl ? bkCol : (blCol || this.cfg.altCol || 0)
+          const altNum = pick(secondCol)
           if (altNum && altNum !== usedNum) {
+            this.log(`R${t.row} ${usedNum} 无动态 → 再试另一列 ${altNum}`)
             const r2 = await call(altNum)
-            const latestOf = (x) => {
-              const evs = (x && x.events) || []
-              return evs.length ? String(evs[evs.length - 1].time || '') : ''
-            }
-            const t1 = latestOf(r), t2 = latestOf(r2)
-            if (t2 && t2 > t1) {
-              this.log(`R${t.row} ${usedNum} → ${altNum}：后者动态更新（${t2.slice(0, 10)} > ${t1.slice(0, 10) || '无'}）`)
-              r = r2; usedNum = altNum
-            } else if (r && r.ok === false && r2 && r2.ok !== false) {
-              r = r2; usedNum = altNum
-            }
+            if (hasEvents(r2) || (r && r.ok === false && r2 && r2.ok !== false)) { r = r2; usedNum = altNum }
           }
         }
         it.usedNumber = usedNum

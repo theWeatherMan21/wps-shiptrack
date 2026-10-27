@@ -104,6 +104,17 @@ eq('同一条：颜色应为蓝', stageOf(mskEta, { pol: 'SHANGHAI', pod: 'GDANS
 eq('isExpected 认 timeType=EXPECTED', isExpected({ activity: 'Container Arrival', timeType: 'EXPECTED' }), true)
 eq('isExpected 不误杀 ACTUAL', isExpected({ activity: 'Container Arrival', timeType: 'ACTUAL' }), false)
 
+
+// ---- 2026-10-27 头程驳船：重庆驳船接上海大船 ----
+const feeder = [
+  { activity: 'Gate-out', city: 'CHONGQING', time: '2026-10-01T00:00:00', timeType: 'ACTUAL' },
+  { activity: 'Vessel Departure', city: 'SHANGHAI', time: '2026-10-04T00:00:00', timeType: 'ACTUAL' },
+  { activity: 'Container Arrival', city: 'GDANSK', time: '2026-11-20T00:00:00', timeType: 'EXPECTED' },
+]
+const fr = stageOf(feeder, { pol: 'CHONGQING', pod: 'GDANSK' })
+eq('头程驳船：表格 POL=重庆、实际在上海开船 → 仍算已离起运港', fr.stage, STAGE.DEPARTED)
+eq('头程驳船：标记 feeder', fr.feeder, true)
+
 let bad = 0
 for (const [n, ok, d] of cases) {
   if (!ok) bad++
