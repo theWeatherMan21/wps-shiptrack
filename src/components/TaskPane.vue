@@ -103,7 +103,7 @@
 </template>
 
 <script>
-const APP_VER = '0.9.27'
+const APP_VER = '0.9.28'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
@@ -994,7 +994,7 @@ export default {
       // 2) 并发 2 条查询、完成即写回（桥的并发槽也是 2，正好吃满；中途断了保留已完成）
       const queue = todo.slice()
       // 与桥的并发保持一致（桥默认 4）；可用 window.__SHIPTRACK_CONC__ 调小做排障
-      const CONC = Math.min(Number(window.__SHIPTRACK_CONC__ || 4), queue.length)
+      const CONC = Math.min(Number(window.__SHIPTRACK_CONC__ || 2), queue.length)
       let netFails = 0            // 连续连接级失败计数：断网时别把 50 行全试一遍（每行都要起浏览器）
       const worker = async () => {
         while (queue.length && !this.stopFlag) {

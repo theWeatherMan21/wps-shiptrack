@@ -7,7 +7,7 @@ PORT="${WPS_TRACK_PORT:-8791}"
 LOG="/tmp/wps-shiptrack-bridge.log"
 PIDFILE="/tmp/wps-shiptrack-bridge.pid"
 
-alive() { curl -sS -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; }
+alive() { curl -sS -m 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; }
 
 case "${1:-start}" in
   start)
@@ -28,7 +28,7 @@ case "${1:-start}" in
     echo "✓ 已停止"
     ;;
   status)
-    if alive; then echo "✓ 在跑 · $(curl -sS -m 2 "http://127.0.0.1:$PORT/health")"; else echo "✗ 没在跑（$PORT）"; fi
+    if alive; then echo "✓ 在跑 · $(curl -sS -m 2 "http://127.0.0.1:${PORT}/health")"; else echo "✗ 没在跑（${PORT}）"; fi
     ;;
   restart)
     "$0" stop; sleep 1; "$0" start ;;
