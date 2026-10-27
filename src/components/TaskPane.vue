@@ -103,7 +103,7 @@
 </template>
 
 <script>
-const APP_VER = '0.9.21'
+const APP_VER = '0.9.22'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
@@ -117,7 +117,8 @@ import { zhEvent, cleanCity, formatEventLine } from '../lib/events.js'
 import { isPlanned } from '../lib/truth.js'
 import { stageOf, STAGE_COLOR, NO_FILL, STAGE_LABEL } from '../lib/milestone.js'
 import { notFoundText } from '../lib/retention.js'
-import { matchPortHeaders } from '../lib/headers.js'
+import { matchPortHeaders, matchDateHeaders } from '../lib/headers.js'
+import { pickEtdEta } from '../lib/dates.js'
 
 const CARRIER_NAME = {
   hapag: 'HPL', maersk: 'MSK', zim: 'ZIM', cosco: 'COSCO', cma: 'CMA',
@@ -467,6 +468,7 @@ export default {
       const baseRow = Math.max(1, this.cfg.startRow)
       const rows = [baseRow, baseRow - 1, baseRow - 2].filter((r) => r >= 1)
       let pol = this.cfg.polCol, pod = this.cfg.podCol, hitRow = 0
+      let dateHit = !!(this.cfg.etdCol && this.cfg.etaCol)
       for (const row of rows) {
         let vals = []
         try {
@@ -479,6 +481,7 @@ export default {
           cells.push(t)
         }
         let m = matchPortHeaders(cells)
+        let cellsUsed = cells
         if (!m.pol || !m.pod) {
           // 批量读法在某些 WPS 版本上只回第一格 → 逐格再读一遍兜底
           const cells2 = []
@@ -489,6 +492,14 @@ export default {
           }
           const m2 = matchPortHeaders(cells2)
           m = { pol: m.pol || m2.pol, pod: m.pod || m2.pod, scores: m2.scores }
+          cellsUsed = cells2
+        }
+        // 船期列（ETD/ETA）：用最终读到的表头格来认
+        if ((!this.cfg.etdCol || !this.cfg.etaCol) && !dateHit) {
+          const md = matchDateHeaders(cellsUsed)
+          if (md.etd) this.cfg = { ...this.cfg, etdCol: md.etd }
+          if (md.eta) this.cfg = { ...this.cfg, etaCol: md.eta }
+          if (md.etd || md.eta) { dateHit = true; this.saveCfg() }
         }
         if (!pol && m.pol) { pol = m.pol; hitRow = row }
         if (!pod && m.pod) { pod = m.pod; hitRow = hitRow || row }
@@ -1183,6 +1194,8 @@ export default {
           it.stage = st.stage
           it.stageLabel = st.label
           it.inferred = !!st.inferred   // 港口列读不到 → 用事件瞎猜，猜出来也不许着色
+          // 表格里有 ETD/ETA 列 → 用船司返回的真实船期覆盖
+          this.writeScheduleDates(sheet, t.row, r, routePod || pod)
         }
       } catch (e) {
         it.text = '查询失败：' + e.message
@@ -1190,6 +1203,36 @@ export default {
         it.failReason = e.message
       }
       return this.writeResult(it, sheet, t.row, outCol)
+    },
+
+    /**
+     * 表格里有 ETD / ETA 列时，用船司返回的真实船期覆盖
+     * 实际发生的优先；没发生的用船司给的计划时间（表格本来就填的计划）
+     */
+    writeScheduleDates(sheet, row, r, pod) {
+      const etdCol = this.cfg.etdCol || 0
+      const etaCol = this.cfg.etaCol || 0
+      if (!etdCol && !etaCol) return
+      let etd = '', eta = ''
+      try { ({ etd, eta } = pickEtdEta(r.events || [], { pod })) } catch (e) { this.log('船期取值失败: ' + (e.message || e)); return }
+      const put = (col, val) => {
+        if (!col || !val) return false
+        try {
+          const addr = `${colLetter(col)}${row}`
+          const rng = sheet.Range(addr)
+          let cur = '', fmt = ''
+          try { cur = String(rng.Value2 == null ? '' : rng.Value2).slice(0, 10) } catch (e) { cur = '' }
+          if (cur === val) return false
+          try { fmt = String(rng.NumberFormatLocal || '') } catch (e) { fmt = '' }
+          const isDate = /y{2,}|m{1,2}[-/]d|d{1,2}[-/]m/i.test(fmt)
+          const [y, m, d] = val.split('-').map(Number)
+          rng.Value2 = isDate ? new Date(y, m - 1, d) : val
+          return true
+        } catch (e) { return false }
+      }
+      const a = put(etdCol, etd)
+      const b = put(etaCol, eta)
+      if (a || b) this.log(`R${row} 回填船期：ETD ${etd || '—'} · ETA ${eta || '—'}`)
     },
 
     // 统一写回：确定结论可以覆盖，暂态失败保留旧值

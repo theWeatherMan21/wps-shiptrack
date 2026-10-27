@@ -36,6 +36,39 @@ function score(text, words) {
   return 0
 }
 
+// 船期日期列（ETD / ETA）—— 查到真实船期后回填
+const ETD_WORDS = [
+  'ESTIMATED TIME OF DEPARTURE', 'DEPARTURE DATE', 'ETD',
+  '预计开船', '预计离港', '预计出发', '开船日', '离港日', '计划开船', '计划离港', '开船时间',
+]
+const ETA_WORDS = [
+  'ESTIMATED TIME OF ARRIVAL', 'ARRIVAL DATE', 'ETA',
+  '预计到港', '预计抵港', '预计到达', '到港日', '抵港日', '计划到港', '到港时间',
+]
+
+/**
+ * 认 ETD / ETA 列（同一套打分，认不出返回 0）
+ * @returns {{etd:number, eta:number, scores:{etd:number,eta:number}}}
+ */
+export function matchDateHeaders(cells) {
+  let etd = 0, eta = 0, etdScore = 0, etaScore = 0
+  const list = Array.isArray(cells) ? cells : []
+  for (let i = 0; i < list.length; i++) {
+    const t = CLEAN(list[i])
+    if (!t || t.length > 40) continue
+    const tc = t.replace(/[^A-Z0-9\u4e00-\u9fa5]/g, '')
+    const se = Math.max(score(t, ETD_WORDS), score(tc, ETD_WORDS))
+    const sa = Math.max(score(t, ETA_WORDS), score(tc, ETA_WORDS))
+    if (se && se > etdScore) { etd = i + 1; etdScore = se }
+    if (sa && sa > etaScore) { eta = i + 1; etaScore = sa }
+  }
+  if (etd && eta && etd === eta) {
+    if (etdScore >= etaScore) eta = 0
+    else etd = 0
+  }
+  return { etd, eta, scores: { etd: etdScore, eta: etaScore } }
+}
+
 /**
  * @param {string[]} cells 一行的单元格文本（1 维数组，索引 0 = A 列）
  * @returns {{pol:number, pod:number, scores:{pol:number,pod:number}}} 列号从 1 开始，找不到为 0

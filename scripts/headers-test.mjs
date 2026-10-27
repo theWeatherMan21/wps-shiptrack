@@ -1,5 +1,5 @@
 // 表头识别单测：不同表格形态下都要能认出 POL/POD（不能依赖某一种固定格式）
-import { matchPortHeaders } from '../src/lib/headers.js'
+import { matchPortHeaders, matchDateHeaders } from '../src/lib/headers.js'
 
 const cases = []
 const eq = (name, got, want) => cases.push([name, JSON.stringify(got) === JSON.stringify(want), `got=${JSON.stringify(got)} want=${JSON.stringify(want)}`])
@@ -27,6 +27,12 @@ eq('POLICY 误伤', matchPortHeaders(['POLICY NO', 'ETA']).pol, 0)
 
 // 6) 完全没有港口列
 eq('无港口列', matchPortHeaders(['MBL', 'S/L', 'V/V', '备注']), { pol: 0, pod: 0, scores: { pol: 0, pod: 0 } })
+
+// 8) ETD / ETA 列
+eq('ETD/ETA 基本款', matchDateHeaders(['POL', 'POD', 'ETD', 'ETA', 'VOL']), { etd: 3, eta: 4, scores: { etd: 19, eta: 18 } })
+eq('中文船期列', matchDateHeaders(['起运港', '目的港', '预计开船', '预计到港']), { etd: 3, eta: 4, scores: { etd: 18, eta: 17 } })
+eq('ETD/ETA 合并列只占一个', (() => { const m = matchDateHeaders(['ETD/ETA']); return m.etd + m.eta })(), 1)
+eq('别把 PORT 认成 ETA', matchDateHeaders(['PORT OF LOADING', 'ARRIVAL DATE']).eta, 2)
 
 // 7) 大小写/空格/标点杂乱
 eq('杂乱写法', matchPortHeaders(['  p.o.l ', ' pod：']).pol, 1)
