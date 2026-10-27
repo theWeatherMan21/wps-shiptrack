@@ -1,0 +1,12 @@
+<customUI xmlns="http://schemas.microsoft.com/office/2006/01/customui" onLoad="ribbon.OnAddinLoad">
+    <ribbon startFromScratch="false">
+        <tabs>
+            <tab id="shipTrackTab" label="船期追踪">
+                <group id="grpTrack" label="提单 / 箱号">
+                    <button id="btnOpenPanel" label="打开追踪面板" onAction="ribbon.OnAction"
+                            getImage="ribbon.GetImage" getVisible="ribbon.OnGetVisible" size="large"/>
+                </group>
+            </tab>
+        </tabs>
+    </ribbon>
+</customUI>

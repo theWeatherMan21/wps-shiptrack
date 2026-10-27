@@ -1,0 +1,6 @@
+node_modules/
+wps-addon-build/
+dist/
+dist-updates/
+.DS_Store
+*.log

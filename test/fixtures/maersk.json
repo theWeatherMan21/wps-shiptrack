@@ -1,0 +1,60 @@
+{
+  "carrier": "maersk",
+  "origin": "SHANGHAI (CN) YANGSHAN SGH GUANDONG TERMINAL",
+  "destination": "GDANSK (PL) GDANSK BALTIC HUB TERMINAL",
+  "ok": true,
+  "events": [
+    {
+      "time": "2026-11-01T18:31:00.000",
+      "activity": "Container Departure",
+      "city": "SHANGHAI",
+      "terminal": "YANGSHAN SGH GUANDONG TERMINAL",
+      "vessel": "MANCHESTER MAERSK",
+      "voyage": "642W",
+      "timeType": "EXPECTED",
+      "container": "NOT_ASSIGNED"
+    },
+    {
+      "time": "2026-12-01T22:00:00.000",
+      "activity": "Container Arrival",
+      "city": "WILHELMSHAVEN",
+      "terminal": "WILHELMSHAVEN EUROGATE CT",
+      "vessel": "MANCHESTER MAERSK",
+      "voyage": "642W",
+      "timeType": "EXPECTED",
+      "container": "NOT_ASSIGNED"
+    },
+    {
+      "time": "2026-12-09T22:00:00.000",
+      "activity": "Container Departure",
+      "city": "WILHELMSHAVEN",
+      "terminal": "WILHELMSHAVEN EUROGATE CT",
+      "vessel": "MAERSK SARAT",
+      "voyage": "649N",
+      "timeType": "EXPECTED",
+      "container": "NOT_ASSIGNED"
+    },
+    {
+      "time": "2026-12-12T18:00:00.000",
+      "activity": "Container Arrival",
+      "city": "GDANSK",
+      "terminal": "GDANSK BALTIC HUB TERMINAL",
+      "vessel": "MAERSK SARAT",
+      "voyage": "649N",
+      "timeType": "EXPECTED",
+      "container": "NOT_ASSIGNED"
+    }
+  ],
+  "containers": [
+    {
+      "num": "NOT_ASSIGNED",
+      "size": "40",
+      "type": "DRY",
+      "iso": "45G1",
+      "status": "NOT_STARTED",
+      "label": "40'GP"
+    }
+  ],
+  "error": null,
+  "capturedAt": "2026-10-27"
+}

@@ -1,0 +1,7 @@
+{
+  "carrier": "evergreen",
+  "ok": false,
+  "events": [],
+  "error": "Evergreen: no tracking data for this number",
+  "capturedAt": "2026-10-27"
+}
