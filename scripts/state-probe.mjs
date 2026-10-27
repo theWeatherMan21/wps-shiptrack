@@ -327,6 +327,31 @@ async function page_setSel(p, col) {
   await ctx.close()
 }
 
+// ---------- H15 表格有 ETD/ETA 列 → 用真实船期覆盖 ----------
+{
+  const grid = { '1,14': 'ETD', '1,15': 'ETA', '1,16': 'S/L', '1,17': 'MBL',
+                 '2,14': '1-Nov', '2,15': '30-Nov', '2,16': 'HPL', '2,17': 'ONEY0000000002' }
+  const { ctx, page } = await open({ grid })
+  await page.evaluate(() => { window.__evKind = 'arrived' })   // 离港 10-03 / 到港 11-01
+  await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选单号列/)
+  await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选输出列/)
+  await waitIdle(page, 20000)
+  const etd = await page.evaluate(() => String((window.__grid || {})['2,14'] || ''))
+  const eta = await page.evaluate(() => String((window.__grid || {})['2,15'] || ''))
+  const dump = await page.evaluate(() => {
+    const out = {}
+    try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (/cfg|ship/i.test(k)) out[k] = String(localStorage.getItem(k)).slice(0, 200) } } catch (e) {}
+    return out
+  })
+  const outText = await page.evaluate(() => String((window.__grid || {})['2,18'] || ''))
+  const bodyTxt = await page.evaluate(() => document.body.innerText.slice(-300).replace(/\n/g, ' | '))
+  pass('H15 ETD/ETA 列被真实船期覆盖', /2026-10-03/.test(etd) && /2026-11-01/.test(eta),
+    `ETD=${etd} ETA=${eta} 输出列=${outText}\n     尾巴=${bodyTxt}`)
+  await ctx.close()
+}
+
 await browser.close()
 srv.close()
 const bad = results.filter(([, ok]) => !ok)
