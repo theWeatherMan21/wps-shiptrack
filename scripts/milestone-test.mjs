@@ -115,6 +115,24 @@ const fr = stageOf(feeder, { pol: 'CHONGQING', pod: 'GDANSK' })
 eq('头程驳船：表格 POL=重庆、实际在上海开船 → 仍算已离起运港', fr.stage, STAGE.DEPARTED)
 eq('头程驳船：标记 feeder', fr.feeder, true)
 
+
+// ---- 驳船是通用逻辑：不认港口名，只认「有没有在 POL 离港」+ 装船/离港事件 ----
+const feederCases = [
+  ['武汉 → 宁波', 'WUHAN', 'NINGBO', '2026-10-02', '2026-10-05'],
+  ['张家港 → 上海', 'ZHANGJIAGANG', 'SHANGHAI', '2026-10-01', '2026-10-03'],
+  ['南京 → 太仓', 'NANJING', 'TAICANG', '2026-09-28', '2026-09-30'],
+  ['泸州 → 重庆 → 上海', 'LUZHOU', 'SHANGHAI', '2026-09-20', '2026-10-01'],
+]
+for (const [name, polPort, seaPort, d1, d2] of feederCases) {
+  const evs = [
+    { activity: 'Gate-out', city: polPort, time: `${d1}T00:00:00`, timeType: 'ACTUAL' },
+    { activity: 'Vessel Departure', city: seaPort, time: `${d2}T00:00:00`, timeType: 'ACTUAL' },
+    { activity: 'Container Arrival', city: 'GDANSK', time: '2026-11-20T00:00:00', timeType: 'EXPECTED' },
+  ]
+  const r = stageOf(evs, { pol: polPort, pod: 'GDANSK' })
+  eq(`驳船 ${name}：按装船/大船离港判已离起运港`, r.stage, STAGE.DEPARTED)
+}
+
 let bad = 0
 for (const [n, ok, d] of cases) {
   if (!ok) bad++
