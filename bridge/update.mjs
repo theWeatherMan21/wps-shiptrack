@@ -60,8 +60,22 @@ const cmp = (a, b) => {
   return 0;
 };
 
+/**
+ * 更新源：
+ *   ① 环境变量 WPS_UPDATE_URL
+ *   ② 本机配置文件 ~/.hermes/wps-shiptrack/update-url.txt
+ *      （Windows 的桥由计划任务启动，改环境变量要动计划任务；写个文件更省事）
+ *   ③ 都没有 → 走 GitHub 仓库模式（WPS_UPDATE_REPO）
+ */
 export function updateSource() {
-  return String(process.env.WPS_UPDATE_URL || '').replace(/\/+$/, '');
+  const env = String(process.env.WPS_UPDATE_URL || '').trim();
+  if (env) return env.replace(/\/+$/, '');
+  try {
+    const f = path.join(os.homedir(), '.hermes', 'wps-shiptrack', 'update-url.txt');
+    const txt = String(fs.readFileSync(f, 'utf8')).trim();
+    if (txt) return txt.replace(/\/+$/, '');
+  } catch { /* 没有配置文件就走仓库模式 */ }
+  return '';
 }
 
 /** 固定 tag：绝不能依赖 releases/latest —— 宿主 App 自己发版会把 latest 顶掉，WPS 资产就不在那个 release 里了 */
@@ -129,7 +143,7 @@ export async function checkUpdate() {
       const hasUpdate = !!man.version && cmp(man.version, local) > 0;
       return { ok: true, enabled: true, source: 'github', repo, local, remote: { version: man.version, file: man.file, sha256: man.sha256, tag: man.tag }, hasUpdate, notes: man.notes || '' };
     }
-    const manName = process.env.WPS_UPDATE_MANIFEST || 'version.json';
+    const manName = process.env.WPS_UPDATE_MANIFEST || 'wps-version.json';
     const r = await fetchWithTimeout(`${base}/${manName}${base.includes('?') ? '&' : '?'}t=${Date.now()}`);
     if (!r.ok) return { ok: false, enabled: true, local, error: `拉取 version.json 失败 HTTP ${r.status}` };
     const man = await r.json();
