@@ -972,6 +972,7 @@ export default {
       this.stopFlag = false
       this.runStart = Date.now()
       const startDoc = this.docKey()
+      this.runDoc = startDoc
       this.total = todo.length
       this.done = 0
       this.log(`开始刷新 ${todo.length} 条${manual ? '（手动）' : '（自动）'}`)
@@ -1016,6 +1017,10 @@ export default {
       const completed = !this.stopFlag
       // 没收尾的行别挂着「查询中…」
       for (const it of this.items) {
+        if (it.state === 'querying') {
+          it.state = 'skip'
+          it.text = this.stopFlag ? '（已停止，未完成）' : '（本次未完成，点③重跑）'
+        }
         if (it.state === 'idle') {
           it.state = 'skip'
           it.text = this.stopFlag ? '（已停止，未查询）' : '（本次未查，点③刷新）'
@@ -1242,6 +1247,12 @@ export default {
     // 统一写回：确定结论可以覆盖，暂态失败保留旧值
     writeResult(it, sheet, row, outCol, definitiveNow) {
       if (this.capErr) return
+      // 并发下「查完→写」之间可能已被切表：写之前再核一次，别把结果写进别的表
+      if (this.runDoc && this.docKey() !== this.runDoc) {
+        this.stopFlag = true
+        this.actionErr = '查询过程中切换了工作表，本次刷新已中止（已完成的行保留）'
+        return
+      }
       const oldVal = this.readOne(sheet, row, outCol)
       const oldStr = oldVal == null ? '' : String(oldVal).trim()
       // 「未识别 / 未接入 / 暂无动态」是确定结论，可以写；其余失败一律不覆盖旧值
