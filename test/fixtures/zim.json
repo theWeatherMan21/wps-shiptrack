@@ -1,0 +1,7 @@
+{
+  "carrier": "zim",
+  "ok": false,
+  "events": [],
+  "error": "ZIM 未返回该号的追踪数据（请核对单号）",
+  "capturedAt": "2026-10-27"
+}

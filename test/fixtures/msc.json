@@ -1,0 +1,61 @@
+{
+  "carrier": "msc",
+  "origin": "SHANGHAI, CN",
+  "destination": "GDANSK, PL",
+  "ok": true,
+  "events": [
+    {
+      "time": "2026-10-02",
+      "activity": "Empty To Shipper",
+      "city": "SHANGHAI, CN",
+      "terminal": "SHANGHAI YANGSHAN SHANGDONG TERMINAL",
+      "vessel": "MSC FATMA",
+      "voyage": "QB641W",
+      "timeType": "ACTUAL",
+      "container": "TGBU#######"
+    },
+    {
+      "time": "2026-10-12",
+      "activity": "Export Received At Cy",
+      "city": "SHANGHAI, CN",
+      "terminal": "SHANGHAI GUANDONG INTERNATIONAL CONTAINER TERMINAL CO.,LTD",
+      "vessel": "",
+      "voyage": "",
+      "timeType": "ACTUAL",
+      "container": "TGBU#######"
+    },
+    {
+      "time": "2026-10-16",
+      "activity": "Export Loaded On Vessel",
+      "city": "SHANGHAI, CN",
+      "terminal": "SHANGHAI GUANDONG INTERNATIONAL CONTAINER TERMINAL CO.,LTD",
+      "vessel": "MSC FATMA",
+      "voyage": "QB641W",
+      "timeType": "ACTUAL",
+      "container": "TGBU#######",
+      "isCurrent": true
+    },
+    {
+      "time": "2026-11-02",
+      "activity": "Estimated Time Of Arrival",
+      "city": "SINGAPORE, SG",
+      "terminal": "TUAS TERMINAL",
+      "vessel": "MSC FATMA",
+      "voyage": "QB641W",
+      "timeType": "EXPECTED",
+      "container": "TGBU#######"
+    }
+  ],
+  "containers": [
+    {
+      "num": "TGBU#######",
+      "size": "40' HIGH CUBE",
+      "type": "",
+      "iso": "",
+      "status": "Export Loaded on Vessel",
+      "label": "40'HC"
+    }
+  ],
+  "error": null,
+  "capturedAt": "2026-10-27"
+}

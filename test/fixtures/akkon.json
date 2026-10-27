@@ -1,0 +1,8 @@
+{
+  "carrier": "akkon",
+  "ok": false,
+  "events": [],
+  "containers": null,
+  "error": "Akkon 未找到（已试 21 个起运国）：Not Found Booking number could not be found.",
+  "capturedAt": "2026-10-27"
+}

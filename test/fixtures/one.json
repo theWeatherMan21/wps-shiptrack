@@ -1,0 +1,7 @@
+{
+  "carrier": "one",
+  "ok": false,
+  "events": [],
+  "error": "no BL/booking found for \"1477324670\" (site rejected the number)",
+  "capturedAt": "2026-10-27"
+}
