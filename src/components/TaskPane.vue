@@ -103,7 +103,7 @@
 </template>
 
 <script>
-const APP_VER = '0.9.23'
+const APP_VER = '0.9.24'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
@@ -978,7 +978,8 @@ export default {
 
       // 2) 并发 2 条查询、完成即写回（桥的并发槽也是 2，正好吃满；中途断了保留已完成）
       const queue = todo.slice()
-      const CONC = Math.min(2, queue.length)
+      // 与桥的并发保持一致（桥默认 4）；可用 window.__SHIPTRACK_CONC__ 调小做排障
+      const CONC = Math.min(Number(window.__SHIPTRACK_CONC__ || 4), queue.length)
       let netFails = 0            // 连续连接级失败计数：断网时别把 50 行全试一遍（每行都要起浏览器）
       const worker = async () => {
         while (queue.length && !this.stopFlag) {
@@ -1165,7 +1166,8 @@ export default {
           return this.writeResult(it, sheet, t.row, outCol, true)
         }
         const call = async (num) => this.httpGet(
-          '/track?number=' + encodeURIComponent(num) + (override ? '&carrier=' + override : ''), 120000)
+          // 单条 90s：绝大多数成功查询 <15s；跑飞的（站点卡住）不能占着 worker 两分钟
+          '/track?number=' + encodeURIComponent(num) + (override ? '&carrier=' + override : '') + '&timeout=90000', 95000)
         let usedNum = t.number
         let r = await call(usedNum)
         // 查无此单 & 这一格还有别的号（订舱号/提单号）→ 换那个号再试一次

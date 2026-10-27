@@ -33,11 +33,13 @@ const REPO = process.env.SSH_REPO
 const CLI = path.join(REPO, 'engine/tracking/cli.mjs');
 const PORT = Number(process.env.WPS_TRACK_PORT || 8791);
 const HOST = process.env.WPS_TRACK_HOST || '127.0.0.1';
-const DEFAULT_TIMEOUT = Number(process.env.WPS_TRACK_TIMEOUT_MS || 120000);
+const DEFAULT_TIMEOUT = Number(process.env.WPS_TRACK_TIMEOUT_MS || 90000);
 const CACHE_TTL = Number(process.env.WPS_TRACK_CACHE_MS || 10 * 60 * 1000);
 // 插件配置落盘：WPS 的 PluginStorage 在开发模式加载项里不保证持久，走本地文件最稳
 const CFG_DIR = process.env.WPS_TRACK_CONFIG_DIR || path.join(os.homedir(), '.hermes', 'wps-shiptrack');
-const MAX_CONCURRENT = Number(process.env.WPS_TRACK_CONCURRENCY || 2);
+// 并发：默认 4（实测 2 时一批 96 单要十几分钟）。可用 WPS_TRACK_CONCURRENCY 覆盖。
+// 注意：每个查询会起一个 Chrome，机器弱就调回 2~3。
+const MAX_CONCURRENT = Math.max(1, Math.min(8, Number(process.env.WPS_TRACK_CONCURRENCY || 4)));
 
 if (!fs.existsSync(CLI)) {
   console.error(`[bridge] 找不到追踪 CLI: ${CLI}`);
