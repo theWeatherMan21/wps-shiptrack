@@ -112,7 +112,7 @@ const banner = (p) => p.evaluate(() => {
 
 // ---------- H4 运行时切换工作表 → 中止并说明 ----------
 {
-  const { ctx, page } = await open({ lead: 900 })
+  const { ctx, page } = await open({ lead: 3000 })
   await click(page, /选单号列/)
   await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
   await click(page, /选输出列/)
@@ -127,22 +127,29 @@ const banner = (p) => p.evaluate(() => {
   await waitIdle(page, 15000)
   const b = await banner(page)
   const wr = await page.evaluate(() => window.__written.length)
-  pass('H4 查询中切表 → 中止并说明', /切换了工作表/.test(b), `横幅="${b}" 写入=${wr} 格`)
+  const dbg = await page.evaluate(() => ({ calls: (window.__calls || []).filter((u) => u.includes('/track')).length, items: (document.body.innerText.match(/查询中/g) || []).length }))
+  pass('H4 查询中切表 → 中止并说明', /切换了工作表/.test(b), `横幅="${b}" 写入=${wr} 格 calls=${dbg.calls} 查询中=${dbg.items}`)
   await ctx.close()
 }
 
 // ---------- H5 停止：未查的行标「已停止」 ----------
 {
-  const { ctx, page } = await open({ lead: 900 })
+  // 关键：号码数要大于并发数（4），否则根本来不及有"排队的行"
+  const grid = {}
+  const nums = ['276759780', '802735343', '802735426', '279415121', '279847842', '279885106', '280324807', '280814801']
+  nums.forEach((n, i) => { grid[`${i + 2},17`] = n })
+  const { ctx, page } = await open({ grid, lead: 3000 })
+  await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })
   await click(page, /选单号列/)
   await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
   await click(page, /选输出列/)
-  await tryRun(page)   // 0.9.23 起选完列不再自动开跑
-  await page.waitForTimeout(500)
+  await tryRun(page)
+  await page.waitForTimeout(600)
   await click(page, /停止/)
-  await waitIdle(page)
+  await waitIdle(page, 20000)
   const t = await page.evaluate(() => document.querySelector('table') ? document.querySelector('table').innerText : '')
-  pass('H5 停止后不留「查询中…」', !/查询中/.test(t) && /已停止/.test(t), `表格含「已停止」=${/已停止/.test(t)}，含「查询中」=${/查询中/.test(t)}`)
+  const hasStop = /已停止/.test(t), hasRunning = /查询中/.test(t)
+  pass('H5 停止后不留「查询中…」', !hasRunning && hasStop, `已停止=${hasStop} 查询中=${hasRunning}`)
   await ctx.close()
 }
 
