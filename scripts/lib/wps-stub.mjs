@@ -121,6 +121,7 @@ export const STUB = ({ doc = 'A.xlsx', lead = 0, grid = null, evKind = null, sav
                 { time: '2026-11-05T00:00:00Z', activity: 'Empty Received At Cy', city: 'ISTANBUL' }]
       }
       if (/^HLCU/.test(num)) body = { ok: false, number: num, carrier: 'hapag', error: 'DOCUMENT does not exist. (Format : HLCUEUR2510CFF08BXX)' }
+      else if (window.__evByNumber && window.__evByNumber[num]) body = { ok: true, number: num, events: window.__evByNumber[num] }   // 按号给不同事件（双列测试用）
       else body = { ok: true, number: num, events: EV[window.__evKind || 'at_sea'] }
       if (window.__evKind) { /* 每条都按当前设定 */ }
     }
