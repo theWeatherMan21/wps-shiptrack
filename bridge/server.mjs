@@ -267,6 +267,7 @@ const server = http.createServer(async (req, res) => {
     const t0 = Date.now();
     let r = await runCli({ number, carrier, timeoutMs });
     const elapsed = Date.now() - t0;
+    console.error(`[track] ${number} ${carrier || 'auto'} ${r.ok ? 'ok' : 'FAIL'} ${elapsed}ms ${r.ok ? '' : String(r.error || '').slice(0, 80)}`);
     const hardDown = r.error && /ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET|ERR_NAME_NOT_RESOLVED|ENOTFOUND|EAI_AGAIN/i.test(String(r.error));
     // 连接不上（断网 / 代理没开）→ 立刻重试毫无意义，只是再开一个浏览器空烧
     if (!r.ok && r.error && TRANSIENT.test(r.error) && !r.timeout && elapsed < 60000) {
