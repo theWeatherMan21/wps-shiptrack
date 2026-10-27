@@ -39,6 +39,11 @@ async function open(opts = {}) {
   return { ctx, page, errs }
 }
 const click = (p, re) => p.getByRole('button', { name: re }).click()
+// 按 ③ 开跑；按钮不可用（配置没齐/正在跑）时静默跳过
+const tryRun = async (p) => {
+  try { await p.getByRole('button', { name: /③ 立即刷新/ }).click({ timeout: 3000, force: true }) } catch (e) { /* 跳过 */ }
+  await p.waitForTimeout(300)
+}
 const waitIdle = async (p, ms = 12000) => {
   const t0 = Date.now()
   while (Date.now() - t0 < ms) {
@@ -62,6 +67,7 @@ const banner = (p) => p.evaluate(() => {
   await page.evaluate(() => { window.__writeBlock = true })
   await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
   await click(page, /选输出列/)
+  await tryRun(page)   // 0.9.23 起选完列不再自动开跑
   await waitIdle(page)
   const b = await banner(page)
   const w = await page.evaluate(() => window.__written.length)
@@ -76,6 +82,7 @@ const banner = (p) => p.evaluate(() => {
   await click(page, /选单号列/)
   await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
   await click(page, /选输出列/)
+  await tryRun(page)   // 0.9.23 起选完列不再自动开跑
   await waitIdle(page)
   const b = await banner(page)
   const w = await page.evaluate(() => window.__written.length)
@@ -89,6 +96,7 @@ const banner = (p) => p.evaluate(() => {
   await click(page, /选单号列/)
   await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
   await click(page, /选输出列/)
+  await tryRun(page)   // 0.9.23 起选完列不再自动开跑
   await waitIdle(page)
   await page.evaluate(() => { window.__bridgeDown = true })
   await click(page, /立即刷新/)
@@ -108,6 +116,7 @@ const banner = (p) => p.evaluate(() => {
   await click(page, /选单号列/)
   await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
   await click(page, /选输出列/)
+  await tryRun(page)   // 0.9.23 起选完列不再自动开跑
   // 等真的开始跑（进度条出现），再切表
   for (let i = 0; i < 40; i++) {
     await page.waitForTimeout(100)
@@ -128,6 +137,7 @@ const banner = (p) => p.evaluate(() => {
   await click(page, /选单号列/)
   await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
   await click(page, /选输出列/)
+  await tryRun(page)   // 0.9.23 起选完列不再自动开跑
   await page.waitForTimeout(500)
   await click(page, /停止/)
   await waitIdle(page)
@@ -186,6 +196,7 @@ async function page_setSel(p, col) {
   const cfgText = await page.evaluate(() => (document.querySelector('.cfg') || {}).innerText || '')
   await page.evaluate(() => { window.__sel = { col: 19, row: 1, rows: 1048576, cols: 1 } })
   await click(page, /选输出列/)
+  await tryRun(page)   // 0.9.23 起选完列不再自动开跑
   await waitIdle(page, 15000)
   const calls = await page.evaluate(() => window.__calls)
   const track = calls.filter((u) => u.includes('/track'))
@@ -207,6 +218,7 @@ async function page_setSel(p, col) {
   await click(page, /选单号列/)
   await page.evaluate(() => { window.__sel = { col: 19, row: 1, rows: 1048576, cols: 1 } })
   await click(page, /选输出列/)
+  await tryRun(page)   // 0.9.23 起选完列不再自动开跑
   await waitIdle(page, 15000)
   const calls = await page.evaluate(() => window.__calls)
   const wrote = await page.evaluate(() => Object.entries(window.__grid).filter(([k]) => k.endsWith(',19')).map(([, v]) => v))
@@ -221,6 +233,7 @@ async function page_setSel(p, col) {
   const { ctx, page } = await open()
   await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
   await click(page, /选输出列/)
+  await tryRun(page)   // 0.9.23 起选完列不再自动开跑
   await page.waitForTimeout(300)
   const afterOut = await banner(page)
   await page.evaluate(() => { window.__sel = { col: 15, row: 1, rows: 1048576, cols: 1 } })
@@ -241,6 +254,7 @@ async function page_setSel(p, col) {
   await click(page, /选单号列/)
   await page.evaluate(() => { window.__sel = { col: 19, row: 1, rows: 1048576, cols: 1 } })
   await click(page, /选输出列/)
+  await tryRun(page)   // 0.9.23 起选完列不再自动开跑
   await waitIdle(page, 20000)
   const calls = await page.evaluate(() => window.__calls.filter((u) => u.includes('/track')))
   const wrote = await page.evaluate(() => Object.entries(window.__grid).filter(([k]) => k.endsWith(',19')).map(([, v]) => v).join(' | '))
@@ -264,6 +278,7 @@ async function page_setSel(p, col) {
     await click(page, /选单号列/)
     await page.evaluate(() => { window.__sel = { col: 19, row: 1, rows: 1048576, cols: 1 } })
     await click(page, /选输出列/)
+  await tryRun(page)   // 0.9.23 起选完列不再自动开跑
     await waitIdle(page, 20000)
     await page.waitForTimeout(1200)
     const fills = await page.evaluate(() => window.__fills.filter(([r]) => r === 2))  // 整行填充：记录在行首列
@@ -315,6 +330,7 @@ async function page_setSel(p, col) {
   await click(page, /选单号列/)
   await page.evaluate(() => { window.__sel = { col: 19, row: 1, rows: 1048576, cols: 1 } })
   await click(page, /选输出列/)
+  await tryRun(page)   // 0.9.23 起选完列不再自动开跑
   await waitIdle(page, 25000)
   const afterRun = await page.evaluate(() => document.body.innerText)
   const calls1 = await page.evaluate(() => (window.__calls || []).filter((u) => u.includes('/track')).length)
@@ -337,6 +353,7 @@ async function page_setSel(p, col) {
   await click(page, /选单号列/)
   await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
   await click(page, /选输出列/)
+  await tryRun(page)   // 0.9.23 起选完列不再自动开跑
   await waitIdle(page, 20000)
   const etd = await page.evaluate(() => String((window.__grid || {})['2,14'] || ''))
   const eta = await page.evaluate(() => String((window.__grid || {})['2,15'] || ''))
@@ -349,6 +366,23 @@ async function page_setSel(p, col) {
   const bodyTxt = await page.evaluate(() => document.body.innerText.slice(-300).replace(/\n/g, ' | '))
   pass('H15 ETD/ETA 列被真实船期覆盖', /2026-10-03/.test(etd) && /2026-11-01/.test(eta),
     `ETD=${etd} ETA=${eta} 输出列=${outText}\n     尾巴=${bodyTxt}`)
+  await ctx.close()
+}
+
+// ---------- H16 选完列不许自己开跑（0.9.23 回归） ----------
+{
+  const grid = { '1,16': 'S/L', '1,17': 'MBL', '2,17': 'ONEY0000000003' }
+  const { ctx, page } = await open({ grid })
+  await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选单号列/)
+  await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选输出列/)
+  await page.waitForTimeout(2500)
+  const calls1 = await page.evaluate(() => (window.__calls || []).filter((u) => u.includes('/track')).length)
+  await tryRun(page)
+  await waitIdle(page, 15000)
+  const calls2 = await page.evaluate(() => (window.__calls || []).filter((u) => u.includes('/track')).length)
+  pass('H16 选完两列不自动开跑，按③才查', calls1 === 0 && calls2 > 0, `点②后请求=${calls1}，点③后=${calls2}`)
   await ctx.close()
 }
 
