@@ -39,7 +39,8 @@ const CACHE_TTL = Number(process.env.WPS_TRACK_CACHE_MS || 10 * 60 * 1000);
 const CFG_DIR = process.env.WPS_TRACK_CONFIG_DIR || path.join(os.homedir(), '.hermes', 'wps-shiptrack');
 // 并发：默认 4（实测 2 时一批 96 单要十几分钟）。可用 WPS_TRACK_CONCURRENCY 覆盖。
 // 注意：每个查询会起一个 Chrome，机器弱就调回 2~3。
-const MAX_CONCURRENT = Math.max(1, Math.min(8, Number(process.env.WPS_TRACK_CONCURRENCY || 4)));
+let PROFILE_SEQ = 0;
+const MAX_CONCURRENT = Math.max(1, Math.min(8, Number(process.env.WPS_TRACK_CONCURRENCY || 2)));
 
 if (!fs.existsSync(CLI)) {
   console.error(`[bridge] 找不到追踪 CLI: ${CLI}`);
@@ -68,7 +69,7 @@ function slot() {
 
 // ---------- 查询缓存 ----------
 const cache = new Map(); // key -> {at, value}
-const cacheGet = (k) => { const e = cache.get(k); if (e && Date.now() - e.at < CACHE_TTL) return e.value; return null; };
+const cacheGet = (k, skip = false) => { if (skip) return null; const e = cache.get(k); if (e && Date.now() - e.at < CACHE_TTL) return e.value; return null; };
 const cacheSet = (k, v) => { cache.set(k, { at: Date.now(), value: v }); if (cache.size > 500) cache.delete(cache.keys().next().value); };
 
 // ---------- 跑一次 CLI，收 NDJSON ----------
@@ -81,7 +82,18 @@ function runCli({ number, carrier, timeoutMs, forceDirect = false }) {
     args.push('--timeout', String(Math.max(10000, timeoutMs - 8000)));
     const t0 = Date.now();
     let out = '', err = '', killed = false;
-    const child = spawn(process.execPath, args, { cwd: REPO, env: childEnv(forceDirect), stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
+    // 每个并发槽用独立 Chrome profile：
+    // 共用同一个 profile 时，多个进程同时 launchPersistentContext 会抢 Singleton 锁 →
+    // 报 "browserType.launchPersistentContext: Fail..."，表格里就是一堆失败行。
+    const profSlot = (PROFILE_SEQ++) % MAX_CONCURRENT;
+    const profDir = path.join(os.homedir(), '.hermes', 'wps-shiptrack', 'chrome', `p${profSlot}`);
+    console.error(`[bridge] profile=${profDir}`);
+    const child = spawn(process.execPath, args, {
+      cwd: REPO,
+      env: { ...childEnv(forceDirect), SSH_PROFILE_DIR: profDir },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
+    });
     const killTree = (sig) => {
       try {
         if (process.platform === 'win32') spawn('taskkill', ['/pid', String(child.pid), '/T', '/F']);
@@ -250,7 +262,7 @@ const server = http.createServer(async (req, res) => {
     const timeoutMs = Math.min(Math.max(Number(url.searchParams.get('timeout') || DEFAULT_TIMEOUT), 3000), DEFAULT_TIMEOUT);
     if (!number) return send(res, 400, { ok: false, error: '缺 number' });
     const key = number + '|' + carrier;
-    const hit = cacheGet(key);
+    const hit = cacheGet(key, url.searchParams.get('fresh') === '1');
     if (hit) return send(res, 200, { ...hit, cached: true });
     const t0 = Date.now();
     let r = await runCli({ number, carrier, timeoutMs });
