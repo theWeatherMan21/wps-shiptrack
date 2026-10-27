@@ -130,6 +130,16 @@ export function stageOf(events, ports = {}) {
     departEv = e;
     break;
   }
+
+  // 头程驳船（2026-10-27 爹地案例：重庆驳船接上海大船）：
+  // 表格里的起运港是重庆，而真正「开船」发生在上海 —— 按 POL 严格匹配会判成「没离港」。
+  // 兜底：没有在 POL 离港的明确事件时，认「装船 / 大船离港」这条（ACTUAL），也算已离起运港。
+  let feederDep = false;
+  if (!departEv) {
+    const loadOrDepart = (e) => isDepartEvent(e) || /LOAD(ED)?\s*(ON|INTO)?\s*VESSEL|装船|装柜|ON BOARD/i.test(String(e.activity || ''));
+    const cand = list.find((e) => loadOrDepart(e) && !isExpected(e));
+    if (cand) { departEv = cand; feederDep = true; }
+  }
   if (!polUsed && departEv) polUsed = departEv.city || '';
 
   // 到港：有 POD 就只认 POD（取最早一次到达目的港）；没 POD 就取「离港之后」的最后一次到港
@@ -169,6 +179,6 @@ export function stageOf(events, ports = {}) {
 
   return {
     stage, label: STAGE_LABEL[stage], color: STAGE_COLOR[stage] || NO_FILL, hits,
-    pol: polUsed, pod: podUsed, inferred: !pol || !pod,
+    pol: polUsed, pod: podUsed, inferred: !pol || !pod, feeder: feederDep,
   };
 }

@@ -393,16 +393,16 @@ async function page_setSel(p, col) {
   await ctx.close()
 }
 
-// ---------- H17 同时有提单号/订舱号两列 → 两个都查，取更新的 ----------
+// ---------- H17 双列：先查提单号，查无再查订舱号 ----------
 {
+  // A：提单号有动态（10-01），订舱号更新的（11-20）→ 仍用提单号，且只发 1 个请求
   const grid = { '1,17': '提单号', '1,19': '订舱号', '2,17': 'ONEY0000000010', '2,19': 'ONEY0000000011' }
   const { ctx, page } = await open({ grid })
   await page.evaluate(() => {
     window.__evByNumber = {
       ONEY0000000010: [{ time: '2026-09-01T00:00:00Z', activity: 'Departure From', city: 'QINGDAO' },
                        { time: '2026-10-01T00:00:00Z', activity: 'Arrival In', city: 'GDANSK' }],
-      ONEY0000000011: [{ time: '2026-09-01T00:00:00Z', activity: 'Departure From', city: 'QINGDAO' },
-                       { time: '2026-11-20T00:00:00Z', activity: 'Arrival In', city: 'GDANSK' }],
+      ONEY0000000011: [{ time: '2026-11-20T00:00:00Z', activity: 'Arrival In', city: 'GDANSK' }],
     }
   })
   await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })
@@ -413,7 +413,28 @@ async function page_setSel(p, col) {
   await waitIdle(page, 20000)
   const out = await page.evaluate(() => String((window.__grid || {})['2,18'] || ''))
   const calls = await page.evaluate(() => (window.__calls || []).filter((u) => u.includes('/track')).length)
-  pass('H17 两列都查，取更新的动态', /2026-11-20/.test(out) && calls >= 2, `输出=${out} 请求=${calls}`)
+  pass('H17 提单号有动态 → 不再查订舱号', /2026-10-01/.test(out) && calls === 1, `输出=${out} 请求=${calls}`)
+  await ctx.close()
+}
+{
+  // B：提单号查无动态，订舱号有 → 自动补查订舱号
+  const grid = { '1,17': '提单号', '1,19': '订舱号', '2,17': 'ONEY0000000020', '2,19': 'ONEY0000000021' }
+  const { ctx, page } = await open({ grid })
+  await page.evaluate(() => {
+    window.__evByNumber = {
+      ONEY0000000020: [],
+      ONEY0000000021: [{ time: '2026-11-20T00:00:00Z', activity: 'Arrival In', city: 'GDANSK' }],
+    }
+  })
+  await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选单号列/)
+  await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选输出列/)
+  await tryRun(page)
+  await waitIdle(page, 20000)
+  const out = await page.evaluate(() => String((window.__grid || {})['2,18'] || ''))
+  const calls = await page.evaluate(() => (window.__calls || []).filter((u) => u.includes('/track')).length)
+  pass('H17b 提单号查无 → 自动补查订舱号', /2026-11-20/.test(out) && calls >= 2, `输出=${out} 请求=${calls}`)
   await ctx.close()
 }
 
