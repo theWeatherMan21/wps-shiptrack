@@ -103,7 +103,7 @@
 </template>
 
 <script>
-const APP_VER = '0.9.22'
+const APP_VER = '0.9.23'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
@@ -416,7 +416,8 @@ export default {
         this.scan = null
         this.scanColumn()          // 立刻给反馈：这列里认出了几个提单号
         this.detectHeaderCols(sheet)
-        if (this.cfg.outCol > 0 && !this.busy) this.refresh(true)
+        // 同理：选完单号列也不自动开跑，避免刚点完就满屏刷新
+        if (this.cfg.outCol > 0) this.log('两步都选好了 → 点 ③ 立即刷新 开始查询')
       } catch (e) {
         this.actionErr = '选单号列失败：' + e.message
       }
@@ -735,8 +736,9 @@ export default {
         if (this.busy) { this.stopFlag = true; this.log('正在查询，已请求停止以便改配置') }
         this.cfg = { ...this.cfg, outCol: s.col }
         this.saveCfg()
-        this.log(`输出列 = ${colLetter(s.col)}`)
-        if (this.cfg.numberCol > 0 && this.cfg.startRow > 0 && !this.busy) this.refresh(true)
+        // 选完输出列不自动开跑：以前会自动 refresh，用户刚点完就看见表格被写、面板状态乱跳
+        // 现在只准备好配置，什么时候查由用户按「③ 立即刷新」决定
+        this.log(`输出列 = ${colLetter(s.col)}（准备好后点 ③ 立即刷新）`)
       } catch (e) {
         this.actionErr = '选输出列失败：' + e.message
       }
