@@ -171,7 +171,7 @@ function readCfgLoose(doc) {
   } catch { return { cfg: null, exact: false }; }
 }
 // 网络抖动类错误：自动重试一次（2026-10-23 实测：Maersk/MSC 偶发 ERR_CONNECTION_CLOSED，隔几秒再跑就通）
-const TRANSIENT = /ERR_CONNECTION|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|非 JSON|被拦|timeout|超时|net::ERR_/i;
+const TRANSIENT = /ERR_CONNECTION|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|非 JSON|被拦|timeout|超时|net::ERR_|has been closed|Target page, context or browser/i;
 const send = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', ...CORS }); res.end(JSON.stringify(obj)); };
 const clean = (s) => String(s || '').replace(/[\s\u200b\u3000]/g, '').toUpperCase();
 

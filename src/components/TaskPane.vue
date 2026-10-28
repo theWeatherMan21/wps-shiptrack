@@ -103,7 +103,7 @@
 </template>
 
 <script>
-const APP_VER = '0.9.30'
+const APP_VER = '0.9.31'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
