@@ -120,7 +120,7 @@
 </template>
 
 <script>
-const APP_VER = '0.9.37'
+const APP_VER = '0.9.38'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
@@ -162,6 +162,7 @@ export default {
       pinged: false,
       busy: false,
       stopFlag: false,
+      flushing: false,
       pendingWrites: [],   // ★ 10-28：切表期间查到的结果先攒着，切回来点「补齐回填」再写，不整轮作废
       actionErr: '',
       diag: '',
@@ -277,10 +278,13 @@ export default {
     // 自动刷新：延迟 10s 再判（WPS 刚启动时先让它把文档加载完），且全机只允许一个文档跑
     setTimeout(() => this.maybeAutoRefresh(), 10000)
     this.timer = setInterval(() => this.maybeAutoRefresh(), 60 * 60 * 1000)
+    // ★ 10-28：切表期间暂存的结果，一旦检测到已回到原表就自动补齐 —— 用户不用点（「简化优先」）
+    this.flushTimer = setInterval(() => this.autoFlushWhenBack(), 2500)
   },
   beforeUnmount() {
     try { clearTimeout(this.retryTimer) } catch (e) { /* ignore */ }
     if (this.timer) clearInterval(this.timer)
+    if (this.flushTimer) clearInterval(this.flushTimer)
   },
   methods: {
     app() {
@@ -1374,8 +1378,27 @@ export default {
       if (!/待回填/.test(String(it.text))) it.text = String(it.text || '') + '（待回填）'
       this.log(`R${it.row}: 当前不在目标表 → 结果暂存，切回原表点「补齐回填」`)
     },
+    /** ★ 10-28：回到原表就自动补齐（不用点按钮）；不在原表就什么都不做，绝不写错表 */
+    autoFlushWhenBack() {
+      if (!this.pendingWrites.length || this.busy) return
+      if (!this.runDoc) return
+      if (this.docKey() !== this.runDoc) return          // 还没回到原表 → 等
+      const same = this.pendingWrites.filter((x) => x.doc === this.runDoc)
+      if (!same.length) return
+      this.flushPending(true)
+    },
     /** ★ 10-28：切回原表后一次写回所有暂存结果（用 writeCell 的读回校验，写不进会如实报） */
-    async flushPending() {
+    async flushPending(auto = false) {
+      if (this.flushing) return                 // 防重入：自动补齐与手动点击不许同时写
+      if (!this.pendingWrites.length) return
+      this.flushing = true
+      try {
+        await this._flushPending(auto)
+      } finally {
+        this.flushing = false
+      }
+    },
+    async _flushPending(auto = false) {
       if (!this.pendingWrites.length) return
       const a = this.app()
       const sheet = a && a.ActiveSheet
@@ -1400,7 +1423,7 @@ export default {
       this.actionErr = fail
         ? `补齐：成功 ${ok} 条、补不进 ${fail} 条（多半是表被保护/只读）`
         : ''
-      this.log(`补齐回填：成功 ${ok} / 失败 ${fail}${other.length ? `，另有 ${other.length} 条在别的表` : ''}`)
+      this.log(`补齐回填${auto ? '（自动·已回到原表）' : ''}：成功 ${ok} / 失败 ${fail}${other.length ? `，另有 ${other.length} 条在别的表` : ''}`)
     },
 
     // 统一写回：确定结论可以覆盖，暂态失败保留旧值
