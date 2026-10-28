@@ -118,9 +118,10 @@ const banner = (p) => p.evaluate(() => {
   await ctx.close()
 }
 
-// ---------- H4 运行时切换工作表 → 中止并说明 ----------
+// ---------- H4 运行时切表 → 不中止、不写错表、切回点「补齐回填」一次补完 ----------
 {
   const { ctx, page } = await open({ lead: 3000 })
+  const doc0 = await page.evaluate(() => window.__doc)
   await click(page, /选单号列/)
   await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
   await click(page, /选输出列/)
@@ -131,12 +132,25 @@ const banner = (p) => p.evaluate(() => {
     if (await page.evaluate(() => !!document.querySelector('.bar'))) break
   }
   await page.waitForTimeout(300)
-  await page.evaluate(() => { window.__doc = 'A.xlsx|Sheet2' })
-  await waitIdle(page, 15000)
-  const b = await banner(page)
-  const wr = await page.evaluate(() => window.__written.length)
-  const dbg = await page.evaluate(() => ({ calls: (window.__calls || []).filter((u) => u.includes('/track')).length, items: (document.body.innerText.match(/查询中/g) || []).length }))
-  pass('H4 查询中切表 → 中止并说明', /切换了工作表/.test(b), `横幅="${b}" 写入=${wr} 格 calls=${dbg.calls} 查询中=${dbg.items}`)
+  const wrAtSwitch = await page.evaluate(() => window.__written.length)
+  await page.evaluate(() => { window.__doc = 'A.xlsx|Sheet2' })   // 切走
+  await waitIdle(page, 20000)
+  const wrAfterSwitch = await page.evaluate(() => window.__written.length)
+  // 切表那一刻可能有并发（4 路）的写正在飞，允许最多 1 格；之后必须彻底不动
+  await page.waitForTimeout(1500)
+  const wrSettled = await page.evaluate(() => window.__written.length)
+  const hasFlushBtn = await page.evaluate(() => /补齐回填\s*\d/.test(document.body.innerText))
+  const pendingRows = await page.evaluate(() => document.querySelectorAll('tr.pending').length)
+  // 切回原表 → 点补齐
+  await page.evaluate((d) => { window.__doc = d }, doc0)
+  await click(page, /补齐回填/)
+  await page.waitForTimeout(800)
+  const wrFlushed = await page.evaluate(() => window.__written.length)
+  const stillPending = await page.evaluate(() => document.querySelectorAll('tr.pending').length)
+  const ok = (wrAfterSwitch - wrAtSwitch) <= 1 && wrSettled === wrAfterSwitch
+    && hasFlushBtn && wrFlushed > wrAfterSwitch && stillPending === 0
+  pass('H4 查询中切表 → 不中止、不写错表、切回补齐', ok,
+    `切表前 ${wrAtSwitch} → 切表后 ${wrAfterSwitch}（允许 +1 在飞）→ 稳定后 ${wrSettled}（必须不动）→ 补齐后 ${wrFlushed} 格；按钮=${hasFlushBtn} 待补行=${pendingRows} 补完残留=${stillPending}`)
   await ctx.close()
 }
 
