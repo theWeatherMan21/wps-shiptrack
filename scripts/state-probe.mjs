@@ -156,6 +156,45 @@ const banner = (p) => p.evaluate(() => {
   await ctx.close()
 }
 
+// ---------- H4b 整轮没跑完、切回原表 → 自己补上，一下都不点 ----------
+// 这条才是「拦住 autoFlush 被 busy 挡住」的用例：H4 会点按钮，手动路径也能过，
+// 所以 H4 单独存在时拦不住那个 bug（红-绿证明见 wps-addon 技能验收段）。
+{
+  const grid = {}
+  // 16 行 = 4 批：前两批完成时后两批还在跑 → 既能攒到 pending，整轮又没结束
+  const nums = ['276759780', '802735343', '802735426', '279415121', '279847842', '279885106', '280324807', '280814801',
+                '280815902', '280816103', '280817204', '280818305', '280819406', '280820507', '280821608', '280822709']
+  nums.forEach((n, i) => { grid[`${i + 2},17`] = n })
+  const { ctx, page } = await open({ grid, lead: 4000 })
+  const doc0 = await page.evaluate(() => window.__doc)
+  await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })   // 单号在 Q 列
+  await page.evaluate(() => { window.__grid['1,17'] = 'MBL' })                                  // 表头，避免被当单号
+  await click(page, /选单号列/)
+  await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选输出列/)
+  await tryRun(page)
+  for (let i = 0; i < 40; i++) {
+    await page.waitForTimeout(100)
+    if (await page.evaluate(() => !!document.querySelector('.bar'))) break
+  }
+  await page.waitForTimeout(600)                                    // 刚开跑就切走（第一批还在飞）
+  await page.evaluate(() => { window.__doc = 'A.xlsx|Sheet2' })
+  await page.waitForTimeout(9000)                                   // 等前两批完成 → defer 进 pending，后两批还在跑
+  const pendingBefore = await page.evaluate(() => document.querySelectorAll('tr.pending').length)
+  const wrBeforeBack = await page.evaluate(() => window.__written.length)
+  await page.evaluate((d) => { window.__doc = d }, doc0)            // 切回，什么都不点
+  await page.waitForTimeout(3400)                                   // 等 2.5s 定时器
+  const wrAfterAuto = await page.evaluate(() => window.__written.length)
+  const pendingAfter = await page.evaluate(() => document.querySelectorAll('tr.pending').length)
+  const stillRunning = await page.evaluate(() => !!document.querySelector('.bar'))
+  // 判据核心 = pending 队列被清掉（只有 autoFlush 会清）+ 写入数涨 + 整轮没结束。
+  // 只看「写入数涨」不够：新到期的行也会正常写，分不清是补齐还是新行。
+  const ok = pendingBefore > 0 && pendingAfter < pendingBefore && wrAfterAuto > wrBeforeBack && stillRunning
+  pass('H4b 整轮未跑完时切回 → 自动补齐（不点按钮）', ok,
+    `切走期间待补=${pendingBefore} 写入=${wrBeforeBack} → 切回后待补=${pendingAfter} 写入=${wrAfterAuto} · 整轮仍在跑=${stillRunning}`)
+  await ctx.close()
+}
+
 // ---------- H5 停止：未查的行标「已停止」 ----------
 {
   // 关键：号码数要大于并发数（4），否则根本来不及有"排队的行"
