@@ -120,7 +120,7 @@
 </template>
 
 <script>
-const APP_VER = '0.9.38'
+const APP_VER = '0.9.39'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
@@ -1380,7 +1380,11 @@ export default {
     },
     /** ★ 10-28：回到原表就自动补齐（不用点按钮）；不在原表就什么都不做，绝不写错表 */
     autoFlushWhenBack() {
-      if (!this.pendingWrites.length || this.busy) return
+      // ★ 10-28 修正（知澜定位）：原来这里还有 `|| this.busy`，把整轮查询期间都挡住了 ——
+      //   用户中途切走再切回原表，人已经回来了却一直攒到整轮跑完才补，UI 上就多出一个多余按钮。
+      //   去掉 busy 判断是安全的：flushing 防重入、deferWrite 按 key 去重、
+      //   _flushPending 只写当前 doc 的 pending，而正在跑的行还没进队列，互不冲突。
+      if (!this.pendingWrites.length) return
       if (!this.runDoc) return
       if (this.docKey() !== this.runDoc) return          // 还没回到原表 → 等
       const same = this.pendingWrites.filter((x) => x.doc === this.runDoc)
@@ -1412,6 +1416,9 @@ export default {
       }
       let ok = 0, fail = 0
       for (const w of same) {
+        // ★ 10-28 硬保护：每写一格前都核一次「还在不在目标表」——
+        //   自动补齐是定时器驱动的，写入过程中用户随时可能又切走；一旦切走立刻停，绝不多写一格。
+        if (this.docKey() !== w.doc) break
         const r = this.writeCell(sheet, w.row, w.outCol, w.text)
         if (r && r.ok) {
           ok++

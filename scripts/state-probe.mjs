@@ -132,8 +132,9 @@ const banner = (p) => p.evaluate(() => {
     if (await page.evaluate(() => !!document.querySelector('.bar'))) break
   }
   await page.waitForTimeout(300)
-  const wrAtSwitch = await page.evaluate(() => window.__written.length)
-  await page.evaluate(() => { window.__doc = 'A.xlsx|Sheet2' })   // 切走
+  // 切表与采样必须在同一个 evaluate 里原子完成：分开做时，中间完成的 2~3 个并发写
+  // 会被算到「切表后」头上（它们其实写在原表、在切表之前，合法）
+  const wrAtSwitch = await page.evaluate(() => { window.__doc = 'A.xlsx|Sheet2'; return window.__written.length })
   await waitIdle(page, 20000)
   const wrAfterSwitch = await page.evaluate(() => window.__written.length)
   // 切表那一刻可能有并发（4 路）的写正在飞，允许最多 1 格；之后必须彻底不动
@@ -147,8 +148,9 @@ const banner = (p) => p.evaluate(() => {
   await page.waitForTimeout(800)
   const wrFlushed = await page.evaluate(() => window.__written.length)
   const stillPending = await page.evaluate(() => document.querySelectorAll('tr.pending').length)
+  // 按钮不再是必经路径（0.9.39 起回原表全自动）：有按钮=还在等，没按钮但已补完=更理想
   const ok = (wrAfterSwitch - wrAtSwitch) <= 1 && wrSettled === wrAfterSwitch
-    && hasFlushBtn && wrFlushed > wrAfterSwitch && stillPending === 0
+    && (hasFlushBtn || stillPending === 0) && wrFlushed > wrAfterSwitch && stillPending === 0
   pass('H4 查询中切表 → 不中止、不写错表、切回补齐', ok,
     `切表前 ${wrAtSwitch} → 切表后 ${wrAfterSwitch}（允许 +1 在飞）→ 稳定后 ${wrSettled}（必须不动）→ 补齐后 ${wrFlushed} 格；按钮=${hasFlushBtn} 待补行=${pendingRows} 补完残留=${stillPending}`)
   await ctx.close()
