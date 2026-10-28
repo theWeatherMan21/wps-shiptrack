@@ -40,7 +40,7 @@ const CFG_DIR = process.env.WPS_TRACK_CONFIG_DIR || path.join(os.homedir(), '.he
 // 并发：默认 4（实测 2 时一批 96 单要十几分钟）。可用 WPS_TRACK_CONCURRENCY 覆盖。
 // 注意：每个查询会起一个 Chrome，机器弱就调回 2~3。
 let PROFILE_SEQ = 0;
-const MAX_CONCURRENT = Math.max(1, Math.min(8, Number(process.env.WPS_TRACK_CONCURRENCY || 2)));
+const MAX_CONCURRENT = Math.max(1, Math.min(8, Number(process.env.WPS_TRACK_CONCURRENCY || 4)));
 
 if (!fs.existsSync(CLI)) {
   console.error(`[bridge] 找不到追踪 CLI: ${CLI}`);

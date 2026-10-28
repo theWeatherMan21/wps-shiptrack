@@ -438,6 +438,29 @@ async function page_setSel(p, col) {
   await ctx.close()
 }
 
+// ---------- H18 港口列已识别也不能跳过「单号两列」识别 ----------
+{
+  const grid = { '1,3': '起运港', '1,4': '目的港', '1,9': '提单号', '1,11': '订舱号',
+                 '2,3': 'SHANGHAI', '2,4': 'GDANSK', '2,9': 'ONEY0000000030', '2,11': '42084242' }
+  const { ctx, page } = await open({ grid })
+  await page.evaluate(() => {
+    window.__evByNumber = {
+      ONEY0000000030: [],
+      '42084242': [{ time: '2026-11-20T00:00:00Z', activity: 'Arrival In', city: 'GDANSK' }],
+    }
+  })
+  await page.evaluate(() => { window.__sel = { col: 9, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选单号列/)
+  await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选输出列/)
+  await tryRun(page)
+  await waitIdle(page, 20000)
+  const out = await page.evaluate(() => String((window.__grid || {})['2,18'] || ''))
+  const calls = await page.evaluate(() => (window.__calls || []).filter((u) => u.includes('/track')).length)
+  pass('H18 港口列已认出时仍识别订舱号列并补查', /2026-11-20/.test(out) && calls >= 2, `输出=${out} 请求=${calls}`)
+  await ctx.close()
+}
+
 await browser.close()
 srv.close()
 const bad = results.filter(([, ok]) => !ok)
