@@ -30,6 +30,7 @@
       <button @click="pickCarrierCol" class="mini-btn">船司列（可选）</button>
       <button @click="refresh(true)" :disabled="busy || !ready">③ 立即刷新</button>
       <button @click="stop" :disabled="!busy">停止</button>
+      <button v-if="pendingWrites.length" class="mini-btn pending-btn" :title="`暂存了 ${pendingWrites.length} 行结果：查询中切走的那几张表，切回来点这里一次写回`" @click="flushPending">补齐回填 {{ pendingWrites.length }}</button>
     </div>
 
     <!-- 三步清单：永远显示每一步选没选，不靠「报错」告诉用户下一步 -->
@@ -119,7 +120,7 @@
 </template>
 
 <script>
-const APP_VER = '0.9.36'
+const APP_VER = '0.9.37'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
@@ -161,6 +162,7 @@ export default {
       pinged: false,
       busy: false,
       stopFlag: false,
+      pendingWrites: [],   // ★ 10-28：切表期间查到的结果先攒着，切回来点「补齐回填」再写，不整轮作废
       actionErr: '',
       diag: '',
       items: [],
@@ -1210,14 +1212,9 @@ export default {
       const it = this.items.find((x) => x.row === t.row)
       if (!it) return
       const a = this.app()
-      try {
-        if (a && a.ActiveSheet && startDoc && this.docKey() !== startDoc) {
-          this.stopFlag = true
-          this.actionErr = '查询过程中切换了工作表，本次刷新已中止（已完成的行保留）'
-          this.log('检测到工作表切换 → 中止写回')
-          return
-        }
-      } catch (e) {}
+      // ★ 10-28（爹地报障：一个表不可能开 10 分钟不切 tab）：切表**不再阻止查询** ——
+      //   桥在跑、结果有用；是否现在写回由 writeResult 决定（切表了就攒进 pendingWrites）。
+      void a
       it.state = 'querying'
       it.text = '查询中…'
       it.failReason = ''
@@ -1364,13 +1361,62 @@ export default {
       if (a || b) this.log(`R${row} 回填船期：ETD ${etd || '—'} · ETA ${eta || '—'}`)
     },
 
+    /** ★ 10-28：切表时把这一行的结果攒起来（不写、不丢），切回来一次补齐 */
+    deferWrite(it, outCol) {
+      if (!it) return
+      const key = `${it.row}|${outCol}`
+      this.pendingWrites = this.pendingWrites.filter((x) => x.key !== key)
+      this.pendingWrites.push({
+        key, row: it.row, outCol, doc: this.runDoc,
+        text: String(it.text || ''), state: it.state,
+      })
+      it.state = 'pending'
+      if (!/待回填/.test(String(it.text))) it.text = String(it.text || '') + '（待回填）'
+      this.log(`R${it.row}: 当前不在目标表 → 结果暂存，切回原表点「补齐回填」`)
+    },
+    /** ★ 10-28：切回原表后一次写回所有暂存结果（用 writeCell 的读回校验，写不进会如实报） */
+    async flushPending() {
+      if (!this.pendingWrites.length) return
+      const a = this.app()
+      const sheet = a && a.ActiveSheet
+      if (!sheet) { this.actionErr = '没有活动工作表，补不了'; return }
+      const nowDoc = this.docKey()
+      const same = this.pendingWrites.filter((x) => x.doc === nowDoc)
+      const other = this.pendingWrites.filter((x) => x.doc !== nowDoc)
+      if (!same.length) {
+        this.actionErr = `补不齐：当前是「${nowDoc}」，暂存的 ${this.pendingWrites.length} 条属于「${(other[0] || {}).doc || '—'}」—— 切回那张表再点`
+        return
+      }
+      let ok = 0, fail = 0
+      for (const w of same) {
+        const r = this.writeCell(sheet, w.row, w.outCol, w.text)
+        if (r && r.ok) {
+          ok++
+          const it = this.items.find((x) => x.row === w.row)
+          if (it) { it.text = w.text; it.state = w.state === 'pending' ? 'ok' : (w.state || 'ok') }
+        } else fail++
+      }
+      this.pendingWrites = other
+      this.actionErr = fail
+        ? `补齐：成功 ${ok} 条、补不进 ${fail} 条（多半是表被保护/只读）`
+        : ''
+      this.log(`补齐回填：成功 ${ok} / 失败 ${fail}${other.length ? `，另有 ${other.length} 条在别的表` : ''}`)
+    },
+
     // 统一写回：确定结论可以覆盖，暂态失败保留旧值
     writeResult(it, sheet, row, outCol, definitiveNow) {
       if (this.capErr) return
-      // 并发下「查完→写」之间可能已被切表：写之前再核一次，别把结果写进别的表
+      // ★ 10-28（爹地报障）：切表时**不中止整轮**，把这一行攒进待补队列 —— 结果不丢，
+      //   切回原表点「补齐回填」一次写回。只有整个工作簿真的没了才放弃。
       if (this.runDoc && this.docKey() !== this.runDoc) {
-        this.stopFlag = true
-        this.actionErr = '查询过程中切换了工作表，本次刷新已中止（已完成的行保留）'
+        const app0 = this.app()
+        if (!app0 || !app0.ActiveWorkbook) {
+          // 整个工作簿被关掉了 —— 这时候真的没地方写，如实停
+          this.stopFlag = true
+          this.actionErr = '目标工作簿已关闭，本轮停止（已完成的行已写回原表）'
+          return
+        }
+        this.deferWrite(it, outCol)
         return
       }
       const oldVal = this.readOne(sheet, row, outCol)
@@ -1637,4 +1683,8 @@ tr.skip td { color: #aaa; }
 .manual-paste { width: 100%; box-sizing: border-box; font-size: 12px; font-family: inherit; padding: 6px 8px; border: 1px solid #e0d6c4; border-radius: 6px; background: #fff; resize: vertical; }
 .manual-foot { display: flex; align-items: center; gap: 8px; }
 .mini.primary { background: #a15c00; color: #fff; border-color: #a15c00; }
+/* ★ 10-28 切表不中止：暂存待补的行 + 补齐按钮 */
+.tbl tr.pending { background: #f2f7ff; }
+.tbl tr.pending td:first-child { box-shadow: inset 3px 0 0 #2f6df6; }
+.pending-btn { background: #2f6df6 !important; color: #fff !important; border-color: #2f6df6 !important; font-weight: 700; }
 </style>
