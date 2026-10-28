@@ -86,7 +86,7 @@
           <td>{{ it.row }}</td>
           <td class="mono">{{ it.number }}</td>
           <td class="ev">
-            <span v-if="it.stage" class="dot-stage" :class="'s' + it.stage" :title="it.stageLabel"></span>{{ it.text }}
+            <span v-if="it.stage" class="dot-stage" :class="'s' + it.stage" :title="it.stageLabel"></span>{{ it.text }}<span v-if="failLabel(it)" class="tag-fail">〔{{ failLabel(it) }}〕</span>
             <div v-if="it.note" class="muted">{{ it.note }}</div>
           </td>
         </tr>
@@ -103,7 +103,7 @@
 </template>
 
 <script>
-const APP_VER = '0.9.34'
+const APP_VER = '0.9.35'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
@@ -119,6 +119,7 @@ import { stageOf, STAGE_COLOR, NO_FILL, STAGE_LABEL } from '../lib/milestone.js'
 import { notFoundText } from '../lib/retention.js'
 import { matchPortHeaders, matchDateHeaders, matchNumberHeaders } from '../lib/headers.js'
 import { pickEtdEta } from '../lib/dates.js'
+import { summarize as summarizeFails, classifyFail } from '../lib/fail.js'
 
 const CARRIER_NAME = {
   hapag: 'HPL', maersk: 'MSK', zim: 'ZIM', cosco: 'COSCO', cma: 'CMA',
@@ -164,6 +165,7 @@ export default {
       retryTimer: null,
       retryCount: 0,
       aborts: new Set(),
+      runSummary: '',
       lastRun: 0,
       autoOn: true,
       timer: null
@@ -1057,6 +1059,8 @@ export default {
         }
       }
 
+      this.runSummary = summarizeFails(this.items)
+      this.log('本轮汇总：' + this.runSummary)
       this.scheduleRetry()
       if (completed) {
         this.saveLastRun(Date.now())
@@ -1333,6 +1337,12 @@ export default {
       }
     },
 
+    failLabel(it) {
+      if (!it || (it.state !== 'error' && !/查无|无数据|未找到|未返回|没有数据/.test(String(it.text || '')))) return ''
+      const { kind, label } = classifyFail(`${it.failReason || ''} ${it.text || ''}`)
+      return kind === 'other' ? '' : label
+    },
+
     stop() {
       this.stopFlag = true
       // 立刻中断在飞的请求（桥那边收到断开就会杀掉对应子进程），不用等 90s 超时
@@ -1496,6 +1506,8 @@ export default {
 </script>
 
 <style>
+.banner-sum { margin: 4px 0 6px; padding: 4px 8px; background: #f4f7fb; border: 1px solid #dbe4f0; border-radius: 6px; font-size: 11px; color: #33507a; }
+.tag-fail { margin-left: 4px; color: #a15c00; font-size: 11px; }
 .wrap { font-family: -apple-system, 'PingFang SC', sans-serif; font-size: 12px; color: #222; padding: 8px; }
 .hdr { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
 .upd { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 11px; color: #1f6f43;
