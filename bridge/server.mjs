@@ -73,7 +73,7 @@ const cacheGet = (k, skip = false) => { if (skip) return null; const e = cache.g
 const cacheSet = (k, v) => { cache.set(k, { at: Date.now(), value: v }); if (cache.size > 500) cache.delete(cache.keys().next().value); };
 
 // ---------- 跑一次 CLI，收 NDJSON ----------
-function runCli({ number, carrier, timeoutMs, forceDirect = false }) {
+function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = null }) {
   return new Promise(async (resolve) => {
     const release = await slot();
     const args = [CLI, '--number', number];
@@ -102,6 +102,16 @@ function runCli({ number, carrier, timeoutMs, forceDirect = false }) {
         try { child.kill(sig); } catch (e2) {}
       }
     };
+    // 客户端点了「停止」→ 前端 abort 请求 → 这里立刻杀掉子进程（含 Chromium 孙进程），不等超时
+    if (onSpawn) {
+      try {
+        onSpawn(() => {
+          killed = true;
+          killTree('SIGTERM');
+          setTimeout(() => killTree('SIGKILL'), 2000);
+        });
+      } catch (e) { /* ignore */ }
+    }
     const timer = setTimeout(() => { killed = true; killTree('SIGTERM'); setTimeout(() => killTree('SIGKILL'), 3000); }, timeoutMs);
 
     child.stdout.on('data', (b) => { out += b.toString(); });
@@ -265,7 +275,10 @@ const server = http.createServer(async (req, res) => {
     const hit = cacheGet(key, url.searchParams.get('fresh') === '1');
     if (hit) return send(res, 200, { ...hit, cached: true });
     const t0 = Date.now();
-    let r = await runCli({ number, carrier, timeoutMs });
+    let r = await runCli({
+      number, carrier, timeoutMs,
+      onSpawn: (kill) => req.on('close', () => { if (!res.writableEnded) { console.error(`[bridge] 客户端中断 ${number} → 杀子进程`); kill(); } }),
+    });
     const elapsed = Date.now() - t0;
     console.error(`[track] ${number} ${carrier || 'auto'} ${r.ok ? 'ok' : 'FAIL'} ${elapsed}ms ${r.ok ? '' : String(r.error || '').slice(0, 80)}`);
     const hardDown = r.error && /ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET|ERR_NAME_NOT_RESOLVED|ENOTFOUND|EAI_AGAIN/i.test(String(r.error));
