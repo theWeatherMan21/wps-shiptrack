@@ -103,7 +103,7 @@
 </template>
 
 <script>
-const APP_VER = '0.9.33'
+const APP_VER = '0.9.34'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
@@ -163,6 +163,7 @@ export default {
       net: null,
       retryTimer: null,
       retryCount: 0,
+      aborts: new Set(),
       lastRun: 0,
       autoOn: true,
       timer: null
@@ -785,11 +786,19 @@ export default {
       try {
         if (typeof fetch !== 'function') throw new Error('no-fetch')
         const ctl = typeof AbortController === 'function' ? new AbortController() : null
+        if (ctl) this.aborts.add(ctl)
         const timer = ctl ? setTimeout(() => ctl.abort(), timeoutMs) : null
-        const r = await fetch(url, ctl ? { signal: ctl.signal } : undefined)
-        if (timer) clearTimeout(timer)
+        let r
+        try {
+          r = await fetch(url, ctl ? { signal: ctl.signal } : undefined)
+        } finally {
+          if (timer) clearTimeout(timer)
+          if (ctl) this.aborts.delete(ctl)
+        }
         return await r.json()
       } catch (e) {
+        // 用户点了「停止」→ 主动 abort：别再走 XHR 兜底重发一遍
+        if (e && (e.name === 'AbortError' || /abort/i.test(String(e.message || '')))) throw e
         try {
           return await new Promise((resolve, reject) => {
             const x = new XMLHttpRequest()
@@ -1326,6 +1335,14 @@ export default {
 
     stop() {
       this.stopFlag = true
+      // 立刻中断在飞的请求（桥那边收到断开就会杀掉对应子进程），不用等 90s 超时
+      try { for (const c of this.aborts) { try { c.abort() } catch (e) {} } this.aborts.clear() } catch (e) {}
+      // 立刻把没跑完的行标出来，别等收尾逻辑（中断后收尾可能走不到）
+      for (const it of this.items) {
+        if (it.state === 'querying' || it.state === 'idle') { it.state = 'skip'; it.text = '（已停止）' }
+      }
+      this.busy = false
+      this.log('已停止（在飞的请求已中断）')
     },
 
     // ---------- 写权限体检 ----------
