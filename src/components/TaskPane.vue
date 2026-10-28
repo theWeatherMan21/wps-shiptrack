@@ -82,14 +82,30 @@
         <tr><th>行</th><th>单号</th><th>最新动态</th></tr>
       </thead>
       <tbody>
-        <tr v-for="it in items" :key="it.row" :class="it.state">
-          <td>{{ it.row }}</td>
-          <td class="mono">{{ it.number }}</td>
-          <td class="ev">
-            <span v-if="it.stage" class="dot-stage" :class="'s' + it.stage" :title="it.stageLabel"></span>{{ it.text }}<span v-if="failLabel(it)" class="tag-fail">〔{{ failLabel(it) }}〕</span>
-            <div v-if="it.note" class="muted">{{ it.note }}</div>
-          </td>
-        </tr>
+        <template v-for="it in items" :key="it.row">
+          <tr :class="[it.state, { handmade: it.handmade }]">
+            <td>{{ it.row }}</td>
+            <td class="mono">{{ it.number }}</td>
+            <td class="ev">
+              <span v-if="it.stage" class="dot-stage" :class="'s' + it.stage" :title="it.stageLabel"></span>{{ it.text }}<span v-if="failLabel(it)" class="tag-fail">〔{{ failLabel(it) }}〕</span><span v-if="it.handmade" class="tag-manual">手工</span>
+              <div v-if="it.note" class="muted">{{ it.note }}</div>
+              <button v-if="it.manualUrl && !it.handmade" class="mini manual-btn" @click.stop="toggleManual(it)">{{ it.manualOpen ? '收起' : '手工查' }}</button>
+            </td>
+          </tr>
+          <!-- ★ 10-28：查不通就给「链接 + 收粘贴」；解析走桥上的 /parse-manual（实现只有一处） -->
+          <tr v-if="it.manualOpen" class="manual-row">
+            <td colspan="3">
+              <div class="manual-box">
+                <a :href="it.manualUrl" target="_blank" rel="noreferrer" class="manual-link" @click="copyNumber(it.number)">① 打开 {{ it.manualLabel || '官网' }} 查（单号自动复制）</a>
+                <textarea v-model="it.manualDraft" class="manual-paste" rows="3" placeholder="② 把官网查到的整段文本粘进来（日期 / 事件 / 港口，贴多少解析多少，认不出也原文留着）"></textarea>
+                <div class="manual-foot">
+                  <button class="mini primary" :disabled="it.manualBusy" @click="applyManual(it)">{{ it.manualBusy ? '解析中…' : '解析并填入' }}</button>
+                  <span class="muted">{{ it.manualNote || '' }}</span>
+                </div>
+              </div>
+            </td>
+          </tr>
+        </template>
       </tbody>
     </table>
 
@@ -103,7 +119,7 @@
 </template>
 
 <script>
-const APP_VER = '0.9.35'
+const APP_VER = '0.9.36'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
@@ -767,7 +783,7 @@ export default {
     },
 
     // ---------- HTTP ----------
-    async httpPost(path, timeoutMs = 30000) {
+    async httpPost(path, timeoutMs = 30000, body = null) {
       const url = this.base() + path
       const ctl = typeof AbortController === 'function' ? new AbortController() : null
       const timer = ctl ? setTimeout(() => ctl.abort(), timeoutMs) : null
@@ -775,7 +791,7 @@ export default {
         const r = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-Shiptrack': '1' },
-          body: '{}',
+          body: body === null ? '{}' : JSON.stringify(body),   // ★ 10-28：/parse-manual 需要带正文
           ...(ctl ? { signal: ctl.signal } : {}),
         })
         return await r.json()
@@ -863,6 +879,52 @@ export default {
       if (!carrier || !this.carriers || !this.carriers.carriers) return false
       const c = this.carriers.carriers.find((x) => x.id === carrier)
       return !!c && !c.live
+    },
+    /** ★ 10-28：该船司的官网页（桥从 identify.mjs 直出，插件不维护第二份 URL 表） */
+    manualUrlOf(carrier) {
+      if (!carrier || !this.carriers || !this.carriers.carriers) return ''
+      const c = this.carriers.carriers.find((x) => x.id === carrier)
+      return (c && c.manualUrl) || ''
+    },
+    /** 打开官网页的同时把单号送进剪贴板（ASP.NET 的 postback 不认 GET 预填，只能复制） */
+    copyNumber(n) {
+      try { if (n && navigator.clipboard) navigator.clipboard.writeText(String(n)) } catch (e) { /* 剪贴板不可用就算了 */ }
+    },
+    /** 展开 / 收起某一行的手工兜底面板 */
+    toggleManual(it) {
+      it.manualOpen = !it.manualOpen
+      if (it.manualOpen && !it.manualDraft) it.manualDraft = ''
+    },
+    /** 把粘进来的官网文本交给桥解析（解析逻辑只有 engine/tracking/manual-parse.mjs 一处） */
+    async applyManual(it, sheet) {
+      const text = String(it.manualDraft || '').trim()
+      if (!text) { it.manualNote = '先粘点东西进来'; return }
+      it.manualBusy = true
+      try {
+        const r = await this.httpPost('/parse-manual', 12000, { text })
+        if (!r || !r.ok) throw new Error((r && r.error) || '解析失败')
+        if (r.parsed && r.events.length) {
+          const lines = r.events.map((e) => `${e.time.slice(5)} ${e.activity}${e.city ? ' @ ' + e.city : ''}`)
+          it.text = `手工 · ${r.events.length} 条：${lines.slice(-2).join(' / ')}`
+          it.handmade = true
+          it.state = 'ok'
+          it.failReason = ''
+          it.manualNote = `解析出 ${r.events.length} 条 · 已标为手工来源`
+          it.manualOpen = false
+        } else {
+          it.text = `手工 · 未解析：${String(r.raw || text).replace(/\s+/g, ' ').slice(0, 80)}`
+          it.handmade = true
+          it.state = 'ok'
+          it.failReason = ''
+          it.manualNote = '没认出日期/事件，原文已原样保留'
+        }
+        // 立刻写回单元格（不改列、不加列，沿用已选的输出列）
+        if (this.cfg.outCol > 0) this.writeResult(it, sheet, it.row, this.cfg.outCol, true)
+      } catch (e) {
+        it.manualNote = '解析失败：' + String(e.message || e)
+      } finally {
+        it.manualBusy = false
+      }
     },
 
     async ping() {
@@ -1200,6 +1262,8 @@ export default {
           it.text = `${CARRIER_NAME[override] || override} 暂未接入（官网需滑块/验证码，请手工查）`
           it.state = 'error'
           it.failReason = 'not-wired'
+          it.manualUrl = this.manualUrlOf(override)          // ★ 10-28：没接入也要给一条能点的路
+          it.manualLabel = CARRIER_NAME[override] || override
           return this.writeResult(it, sheet, t.row, outCol, true)
         }
         const call = async (num) => this.httpGet(
@@ -1238,7 +1302,11 @@ export default {
         it.usedNumber = usedNum
         it.text = this.formatLatest(r)
         it.state = r && r.ok === false ? 'error' : 'ok'
-        if (it.state === 'error') it.failReason = String((r && r.error) || '查询失败')
+        if (it.state === 'error') {
+          it.failReason = String((r && r.error) || '查询失败')
+          // ★ 10-28：查挂了也给出路 —— 桥把引擎的 manualUrl/manualLabel 透传出来
+          if (r && r.manualUrl) { it.manualUrl = r.manualUrl; it.manualLabel = r.manualLabel || it.manualLabel || '' }
+        }
         if (it.state === 'ok') {
           // 里程碑着色：蓝=已离起运港 / 绿=已到目的港 / 灰=已还空箱
           const pol = this.cfg.polCol ? String(this.readOne(sheet, t.row, this.cfg.polCol) || '') : ''
@@ -1557,4 +1625,16 @@ tr.skip td { color: #aaa; }
 .tbl tr.kept { background: #fffbe6; }
 .muted { color: #888; font-size: 11px; }
 .next { margin-top: 4px; color: #0a6; font-weight: 600; }
+/* ── ★ 10-28 手工兜底（爹地拍板）：查不通就给链接 + 收粘贴；手工来源要一眼看出 ── */
+.tag-manual { margin-left: 4px; padding: 0 6px; border-radius: 9px; font-size: 10.5px; font-weight: 800; color: #fff; background: #a15c00; }
+.tbl tr.handmade { background: #fffaf0; }
+.tbl tr.handmade td:first-child { box-shadow: inset 3px 0 0 #a15c00; }
+.manual-btn { margin-top: 3px; font-size: 11px; padding: 1px 7px; border: 1px solid #d8c3a0; border-radius: 6px; background: #fff; color: #a15c00; cursor: pointer; }
+.manual-row td { background: #fffaf0; padding: 8px 10px; }
+.manual-box { display: flex; flex-direction: column; gap: 6px; }
+.manual-link { font-size: 12px; font-weight: 700; color: #2f6df6; text-decoration: none; }
+.manual-link:hover { text-decoration: underline; }
+.manual-paste { width: 100%; box-sizing: border-box; font-size: 12px; font-family: inherit; padding: 6px 8px; border: 1px solid #e0d6c4; border-radius: 6px; background: #fff; resize: vertical; }
+.manual-foot { display: flex; align-items: center; gap: 8px; }
+.mini.primary { background: #a15c00; color: #fff; border-color: #a15c00; }
 </style>
