@@ -135,7 +135,12 @@ function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = nul
       const ms = Date.now() - t0;
 
       if (killed) return finish({ ok: false, number, carrier: carrier || started?.carrier || null, error: `超时（${Math.round(timeoutMs / 1000)}s 未出结果）`, timeout: true, ms });
-      if (error) return finish({ ok: false, number, carrier: carrier || null, error: error.msg || '追踪器报错', code: error.code, ms });
+      // ★ 10-28：原来只挑 msg/code，把引擎带出的 manualUrl/manualLabel 丢了 → 插件就没法给「手工查」链接
+      if (error) return finish({
+        ok: false, number, carrier: carrier || null,
+        error: error.msg || '追踪器报错', code: error.code, ms,
+        ...(error.manualUrl ? { manualUrl: error.manualUrl, manualLabel: error.manualLabel || null } : {}),
+      });
       if (!result) return finish({ ok: false, number, carrier: carrier || started?.carrier || null, error: `没有结果（exit ${code}）${err ? ': ' + err.trim().slice(0, 200) : ''}`, ms });
       finish({ ...result, detected: started?.detected || null, ms, exitCode: code });
     });
@@ -250,6 +255,7 @@ const server = http.createServer(async (req, res) => {
       const live = (await dynImport(path.join(REPO, 'engine/tracking/registry.mjs'))).availableCarriers();
       const carriers = (d.CARRIERS || idmod.CARRIERS || []).map((c) => ({
         id: c.id, name: c.name, live: live.includes(c.id), tracking: c.tracking,
+        manualUrl: c.manualUrl || null,   // ★ 10-28：未接入也要给一条能点的路（插件「手工查」用）
       }));
       return send(res, 200, { ok: true, count: carriers.length, liveCount: carriers.filter((c) => c.live).length, carriers });
     } catch (e) {
@@ -295,6 +301,29 @@ const server = http.createServer(async (req, res) => {
     }
     if (r.ok) cacheSet(key, r);
     return send(res, 200, { ...r, cached: false });
+  }
+
+  // ★ 10-28（爹地拍板）：手工兜底解析 —— 实现只有一处（engine/tracking/manual-parse.mjs），
+  //   插件只负责显示；以后改解析口径不用重装插件。
+  if (url.pathname === '/parse-manual' && req.method === 'POST') {
+    let body = '';
+    try {
+      for await (const chunk of req) { body += chunk; if (body.length > 200_000) break; }
+    } catch { /* 读流失败按空处理 */ }
+    let text = '';
+    try { text = String((JSON.parse(body || '{}') || {}).text || ''); } catch { return send(res, 400, { ok: false, error: 'body 不是 JSON' }); }
+    if (!text.trim()) return send(res, 400, { ok: false, error: '缺 text' });
+    try {
+      const mod = await dynImport(path.join(REPO, 'engine/tracking/manual-parse.mjs'));
+      const events = mod.parseManualText(text);
+      console.error(`[parse-manual] ${text.length} 字 → ${events.length} 条`);
+      return send(res, 200, {
+        ok: true,
+        parsed: events.length > 0,
+        events,
+        raw: events.length ? undefined : text.slice(0, 4000),   // 解析不出就把原文交回，插件原样显示
+      });
+    } catch (e) { return send(res, 200, { ok: false, error: String(e.message || e) }); }
   }
 
   if (url.pathname === '/track-batch') {

@@ -7,7 +7,14 @@ import os from 'node:os'
 import fs from 'node:fs'
 
 const require = createRequire(import.meta.url)
-const { chromium } = require('playwright')
+// playwright 未装在本仓时回落到引擎侧已装的 playwright-core（无头预览只用到 chromium）
+const { chromium } = (() => {
+  try { return require('playwright') }
+  catch {
+    const fb = process.env.PLAYWRIGHT_CORE || path.join(os.homedir(), 'Documents/trae_projects/ShipScheduleHub/engine/node_modules/playwright-core')
+    return require(fb)
+  }
+})()
 
 const ROOT = path.resolve(import.meta.dirname, '..')
 const OUT = process.env.PREVIEW_OUT || path.join(os.tmpdir(), 'shiptrack-preview')
