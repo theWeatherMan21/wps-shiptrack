@@ -103,7 +103,7 @@
 </template>
 
 <script>
-const APP_VER = '0.9.29'
+const APP_VER = '0.9.30'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
@@ -465,7 +465,12 @@ export default {
     // 认不出就不硬判——执行期用事件本身推断起讫港（见 milestone.stageOf 的 inferred 兜底）。
     detectHeaderCols(sheet) {
       this.detectCarrierCol(sheet)
-      if (this.cfg.polCol && this.cfg.podCol) return
+      // 以前这里「港口列已认出就直接 return」→ 单号两列/船期列永远不会再认
+      // （爹地 2026-10-28：表格有提单号+订舱号两列，插件完全没提取订舱号）
+      const needPort = !(this.cfg.polCol && this.cfg.podCol)
+      const needNum = !(this.cfg.blCol && this.cfg.bkCol)
+      const needDate = !(this.cfg.etdCol && this.cfg.etaCol)
+      if (!needPort && !needNum && !needDate) return
       const baseRow = Math.max(1, this.cfg.startRow)
       const rows = [baseRow, baseRow - 1, baseRow - 2].filter((r) => r >= 1)
       let pol = this.cfg.polCol, pod = this.cfg.podCol, hitRow = 0
@@ -497,7 +502,7 @@ export default {
           cellsUsed = cells2
         }
         // 单号两列（提单号 / 订舱号）：另选一列做「第二查询」
-        if (!numHit) {
+        if (needNum) {
           const mn = matchNumberHeaders(cellsUsed)
           const main = this.cfg.numberCol
           const cand = [mn.bl, mn.bk].filter((c) => c && c !== main)
@@ -520,11 +525,11 @@ export default {
         if (!pod && m.pod) { pod = m.pod; hitRow = hitRow || row }
         if (pol && pod) break
       }
-      if (pol || pod) {
+      if (needPort && (pol || pod)) {
         this.cfg = { ...this.cfg, polCol: pol, podCol: pod }
         this.saveCfg()
         this.log(`港口列：起运 ${pol ? colLetter(pol) : '—'} · 目的 ${pod ? colLetter(pod) : '—'}（表头第 ${hitRow || baseRow} 行）`)
-      } else {
+      } else if (needPort) {
         this.log('表头没认出 POL/POD → 改用事件本身推断起讫港（兜底）')
       }
     },
@@ -994,7 +999,7 @@ export default {
       // 2) 并发 2 条查询、完成即写回（桥的并发槽也是 2，正好吃满；中途断了保留已完成）
       const queue = todo.slice()
       // 与桥的并发保持一致（桥默认 4）；可用 window.__SHIPTRACK_CONC__ 调小做排障
-      const CONC = Math.min(Number(window.__SHIPTRACK_CONC__ || 2), queue.length)
+      const CONC = Math.min(Number(window.__SHIPTRACK_CONC__ || 4), queue.length)
       let netFails = 0            // 连续连接级失败计数：断网时别把 50 行全试一遍（每行都要起浏览器）
       const worker = async () => {
         while (queue.length && !this.stopFlag) {
