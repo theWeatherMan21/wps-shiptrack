@@ -2505,8 +2505,11 @@ export default {
           if (it.state === 'querying' || it.state === 'idle') { it.state = 'skip'; it.text = '（已停止）' }
         }
       }
+      // 排队中的批次一起取消（不然空出一格后它又自己开跑了）
+      for (const b of this.batches.filter((x) => x.state === 'queued')) { b.stop = true; b.state = 'stopped' }
       // 立刻中断在飞的请求（桥那边收到断开就会杀掉对应子进程），不用等 90s 超时
       try { for (const c of this.aborts) { try { c.abort() } catch (e) {} } this.aborts.clear() } catch (e) {}
+      this.publishBatches()
       this.log(`已停止${running.length > 1 ? `（${running.length} 批）` : ''}（在飞的请求已中断）`)
     },
 
