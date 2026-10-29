@@ -11,7 +11,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REPO="${REPO:-theWeatherMan21/wps-shiptrack}"
 TAG="${TAG:-wps-latest}"
-VER="$(python3 -c "import json;print(json.load(open('$ROOT/package.json'))['version'])")"
+VER="${VER:-$(python3 -c "import json;print(json.load(open('$ROOT/package.json'))['version'])")}"
 KEEP_PKG="wps-shiptrack-$VER.tar.gz"
 KEEP_JSON="wps-version.json"
 DRY=0
