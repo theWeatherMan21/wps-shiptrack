@@ -72,7 +72,7 @@
 > 改造前的数字取自 HEAD 上**只加计时器、不改逻辑**的一份临时构建（同一把尺、同一份桩），
 > 不是为了对比而造的模型。复现：`node scripts/write-bench.mjs --build <构建目录> --label <说明>`。
 
-### 正确性（`scripts/state-probe.mjs`，26/26 通过）
+### 正确性（`scripts/state-probe.mjs`，27/27 通过）
 
 - H22 / H23 仍全绿（删行、空行、跑到一半被清空的行：一格不写错位行）。
 - **新增 H24**：批量写路径下删中间一行 —— 前一批 4 行已批量落地、后一批里删除点上方的 3 行照写，
@@ -88,3 +88,26 @@
 - 真机（WPS）验收：装 0.9.42 后跑一轮 97 行，面板底部应显示「写回 N 格 / M 段 · XXms」；
   边跑边看表格应该不再一顿一顿。
 - 批量写着色在极旧版本 WPS（不认二维数组）上会整段退回逐格 —— 功能不受影响，只是慢回 0.9.41 的水平。
+
+## 同批带上的小改：清掉 OOCL「暂未接入 / 需滑块验证」的旧文案
+
+> 2026-10-29 · 触发：OOCL 追踪**已接入并真单实测**（`engine/tracking/oocl.mjs`，移动版匿名 JSF 页，512ms），
+> 但插件侧还留着按「OOCL 根本没接入」写的分支，会给出一句已经不成立的误导文案。
+
+- 删掉 `formatLatest` 里的 OOCL 特判（`carrier === 'oocl'` → 「OOCL 暂未接入（官网需滑块验证）」），
+  `no tracking module / not wired up for` 统一走 `「<船司> 未接入追踪（请手工查）」`。
+- `knownNotLive` 兜底分支同步改成同一句（原来写「官网需滑块/验证码」，对任何船司都是瞎猜），
+  展示名改由 `carrierLabel()` 取：插件短名表 → 桥给的 `name` → id（没适配器的船司也能显示成人名）。
+- 新增「站方限流」归类：`限流 / throttled / too many requests / 访问过于频繁` →
+  「OOCL 站方限流（过几分钟再查，别连续重试）」，不再被截成半句「失败：OOCL 站方限流（QF8：访问过于…」。
+- 失败态兜底链接**实测有线**（本机桥 `GET /track?number=OOLU0000000001&carrier=oocl`）：
+  `ok:false · errorKind=throttled · manualUrl=https://pbservice.moc.oocl.com/.../mobile_ct_search.jsf?...`，面板的「手工查」按钮点得开。
+- 夹具不再谎报 `oocl: live=false`（桥现在报 12/12 已接入）；未接入分支改用真·无适配器的 **SITC** 演练，
+  并新增 **H8b** 反向断言：S/L 写 OOCL 时必须真的发 `/track?carrier=oocl` 且写回一行结果，旧文案一个字都不许出现。
+  灵敏度验过：把夹具改回 `oocl: live=false`，H8b 立即变红（26/27）。
+- 验收：`grep -rc "暂未接入（官网需滑块验证" dist/ wps-addon-build/` → **0**；
+  `verify-all.sh --fast` 10 项全绿。
+
+> 顺带一个运维事实：桥是长驻进程、`identify.mjs` 是启动时载入的 ——
+> 引擎侧改了 `manualUrl`（PC 版 → 移动版）之后**必须 `scripts/bridge.sh restart`**，
+> 否则 `/carriers` 还会把 PC 版 `cargotracking.aspx` 吐给插件（本次实测踩到，重启后已是移动版）。
