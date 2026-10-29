@@ -36,7 +36,7 @@ case "${1:-install}" in
   --uninstall|uninstall)
     launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
     rm -f "$PLIST"
-    echo "已卸载 $LABEL（仓库和日志没动）"
+    echo "已卸载 ${LABEL}（仓库和日志没动）"
     exit 0 ;;
   install|"") ;;
   *) echo "用法: $0 [install|--status|--uninstall]"; exit 2 ;;
