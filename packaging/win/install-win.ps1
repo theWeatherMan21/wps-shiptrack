@@ -141,12 +141,23 @@ if ($NoBridge) {
   if (-not $nodeCmd) {
     Say "Node NOT found - live tracking needs Node.js LTS. Add-in still opens (shows 'bridge not connected')." "Yellow"
   } else {
-    if (-not $RepoPath) { $RepoPath = Read-Host "ShipScheduleHub path (contains engine\tracking\cli.mjs)" }
-    $starter = Join-Path $PSScriptRoot "start-win.ps1"
+    if (-not $RepoPath) {
+      # same layout as the dev machine; ask only if that guess is wrong
+      $guess = Join-Path $env:USERPROFILE "Documents\trae_projects\ShipScheduleHub"
+      if (Test-Path (Join-Path $guess "engine\tracking\cli.mjs")) {
+        $RepoPath = $guess
+        Say "ShipScheduleHub auto-detected: $RepoPath" "Green"
+      } else {
+        $RepoPath = Read-Host "ShipScheduleHub path (contains engine\tracking\cli.mjs)"
+      }
+    }
+    $starter = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "bridge\start-win.ps1"
     if ((Test-Path $starter) -and $RepoPath) {
-      & powershell -ExecutionPolicy Bypass -File $starter -RepoPath $RepoPath
+      # -InstallAutostart both registers the logon task AND starts the bridge inside it,
+      # so the bridge is supervised from the very first run (crash -> task restarts it).
+      & powershell -ExecutionPolicy Bypass -File $starter -RepoPath "$RepoPath" -InstallAutostart
     } else {
-      Say "start-win.ps1 not found next to this script - start the bridge manually." "Yellow"
+      Say "bridge\start-win.ps1 not found under the repo root - start the bridge manually." "Yellow"
     }
   }
 }

@@ -1,5 +1,5 @@
 // WPS 表格 API 桩（无头测试共用）：状态机探针与渲染冒烟都用它，避免两套桩行为不一致
-export const STUB = ({ doc = 'A.xlsx', lead = 0, grid = null, evKind = null, savedCfg = null, header2d = false }) => {
+export const STUB = ({ doc = 'A.xlsx', lead = 0, grid = null, evKind = null, savedCfg = null, header2d = false, bridgeMode = 'ok' }) => {
   // header2d: WPS 真实行为 —— 1 行 × N 列的范围，Value2 回的是 [[c1..cN]]（不是列向量）
   const NUM = 15, OUT = 18, LAST = 6
   window.__grid = grid || { [`1,${NUM}`]: 'MBL', [`2,${NUM}`]: '276759780', [`3,${NUM}`]: '802735343', [`4,${NUM}`]: '802735426' }
@@ -11,6 +11,13 @@ export const STUB = ({ doc = 'A.xlsx', lead = 0, grid = null, evKind = null, sav
   window.__readonly = false
   window.__writeBlock = false
   window.__bridgeDown = false
+  // 桥的四种现场（H19-H21 用）：
+  //   ok      健康
+  //   down    8791 无监听（连接被拒）→ 面板应说「进程没在跑」
+  //   blocked 端口能连上（no-cors 探针通过），但页面请求被 CSP/跨域拦 → 「加载项被拦」
+  //   denied  桥在跑但自报 ok:false（例如 Origin 被拒）→ 原样转述桥的原因
+  window.__bridgeMode = bridgeMode
+  const bridgeModeNow = () => (window.__bridgeDown ? 'down' : window.__bridgeMode)
   window.__wantStop = false
   const parse = (addr) => {
     const p = String(addr).split(':')
@@ -88,7 +95,8 @@ export const STUB = ({ doc = 'A.xlsx', lead = 0, grid = null, evKind = null, sav
       open() {}, setRequestHeader() {},
       send() {
         setTimeout(() => {
-          if (window.__bridgeDown) { this.onerror && this.onerror(new Error('network')) }
+          const mode = bridgeModeNow()
+          if (mode === 'down' || mode === 'blocked') { this.onerror && this.onerror(new Error('network')) }
           else {
             this.responseText = '{"ok":true}'
             this.onload && this.onload()
@@ -97,12 +105,19 @@ export const STUB = ({ doc = 'A.xlsx', lead = 0, grid = null, evKind = null, sav
       }
     }
   }
-  window.fetch = (u) => {
+  window.fetch = (u, init) => {
     window.__calls.push(String(u))
-    if (window.__bridgeDown) return Promise.reject(new Error('ECONNREFUSED'))
+    const mode = bridgeModeNow()
+    // 连接被拒：浏览器层面就是 TypeError（和跨域被拦同一张脸）—— 这正是面板要靠 no-cors 探针区分的原因
+    if (mode === 'down') return Promise.reject(new TypeError('Failed to fetch'))
+    if (mode === 'blocked') {
+      if (init && init.mode === 'no-cors') return Promise.resolve({ type: 'opaque', status: 0, ok: false, json: () => Promise.reject(new TypeError('opaque')) })
+      return Promise.reject(new TypeError('Failed to fetch'))
+    }
     const s = String(u)
     let body = { ok: true }
-    if (s.includes('/health')) body = { ok: true }
+    if (mode === 'denied' && s.includes('/health')) body = { ok: false, error: '只接受本机页面调用' }
+    else if (s.includes('/health')) body = { ok: true }
     else if (s.includes('/config')) body = { ok: true, cfg: savedCfg, exact: true }
     else if (s.includes('/carriers')) body = { ok: true, count: 12, liveCount: 11, carriers: [
       { id: 'hapag', name: 'Hapag-Lloyd', live: true }, { id: 'oocl', name: 'OOCL', live: false }] }

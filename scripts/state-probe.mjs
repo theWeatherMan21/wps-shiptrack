@@ -114,7 +114,7 @@ const banner = (p) => p.evaluate(() => {
   await click(page, /重连/)
   await page.waitForTimeout(700)
   const b2 = await banner(page)
-  pass('H3 桥掉线提示 → 重连后自动消失', /没连上/.test(b1) && !/没连上/.test(b2), `断开时="${b1}" 重连后="${b2 || '(无)'}"`)
+  pass('H3 桥掉线提示 → 重连后自动消失', /没在跑/.test(b1) && !/没在跑/.test(b2), `断开时="${b1}" 重连后="${b2 || '(无)'}"`)
   await ctx.close()
 }
 
@@ -521,6 +521,37 @@ async function page_setSel(p, col) {
   const out = await page.evaluate(() => String((window.__grid || {})['2,18'] || ''))
   const calls = await page.evaluate(() => (window.__calls || []).filter((u) => u.includes('/track')).length)
   pass('H18 港口列已认出时仍识别订舱号列并补查', /2026-11-20/.test(out) && calls >= 2, `输出=${out} 请求=${calls}`)
+  await ctx.close()
+}
+
+// ---------- H19 桥进程没起：横幅必须说「进程没在跑」并给可复制的启动命令 ----------
+{
+  const { ctx, page } = await open({ bridgeMode: 'down' })
+  await page.waitForTimeout(600)
+  const b = await banner(page)
+  const hasPing = await page.getByRole('button', { name: /重连/ }).count()
+  const hasCopy = await page.getByRole('button', { name: /复制命令/ }).count()
+  pass('H19 8791 无监听 → 说清「进程没在跑」+ 给启动命令',
+    /进程没在跑/.test(b) && /8791/.test(b) && /bridge\.sh start|start-win\.ps1/.test(b) && hasPing > 0 && hasCopy > 0,
+    `横幅="${b}" 重连按钮=${hasPing} 复制按钮=${hasCopy}`)
+  await ctx.close()
+}
+
+// ---------- H20 桥活着但自报 ok:false → 原样转述桥的原因，不误报「没在跑」 ----------
+{
+  const { ctx, page } = await open({ bridgeMode: 'denied' })
+  await page.waitForTimeout(600)
+  const b = await banner(page)
+  pass('H20 桥返回 ok:false → 转述桥自报原因', /只接受本机页面调用/.test(b) && !/进程没在跑/.test(b), `横幅="${b}"`)
+  await ctx.close()
+}
+
+// ---------- H21 端口通但请求被拦 → 说「加载项被拦」，与「没在跑」区分 ----------
+{
+  const { ctx, page } = await open({ bridgeMode: 'blocked' })
+  await page.waitForTimeout(600)
+  const b = await banner(page)
+  pass('H21 端口通但请求被拦 → 说「加载项被拦」', /加载项被拦/.test(b) && !/进程没在跑/.test(b), `横幅="${b}"`)
   await ctx.close()
 }
 

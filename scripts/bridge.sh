@@ -4,8 +4,13 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${WPS_TRACK_PORT:-8791}"
-LOG="/tmp/wps-shiptrack-bridge.log"
-PIDFILE="/tmp/wps-shiptrack-bridge.pid"
+# 日志/pid 落 ~/.hermes（10-29 前是 /tmp：重启即清，出事时一点痕迹都没有）
+STATE_DIR="${WPS_TRACK_CONFIG_DIR:-$HOME/.hermes/wps-shiptrack}"
+mkdir -p "$STATE_DIR"
+LOG="$STATE_DIR/bridge.log"
+PIDFILE="$STATE_DIR/bridge.pid"
+LABEL="com.wanyi.wps-shiptrack-bridge"
+DOMAIN="gui/$(id -u)"
 
 alive() { curl -sS -m 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; }
 
@@ -29,6 +34,11 @@ case "${1:-start}" in
     ;;
   status)
     if alive; then echo "✓ 在跑 · $(curl -sS -m 2 "http://127.0.0.1:${PORT}/health")"; else echo "✗ 没在跑（${PORT}）"; fi
+    if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+      echo "守护: 已装 ($LABEL)"; launchctl print "$DOMAIN/$LABEL" | grep -E "^\s*(state|pid|last exit code)" || true
+    else
+      echo "守护: 未装 —— 跑一次 scripts/install-launchagent.sh（否则重启/崩溃后要人手 start）"
+    fi
     ;;
   restart)
     "$0" stop; sleep 1; "$0" start ;;

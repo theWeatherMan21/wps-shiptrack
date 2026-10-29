@@ -9,7 +9,11 @@
 
     <!-- 唯一横幅：完全由状态推导，任何一步成功后自动消失，不会挂僵尸提示 -->
     <div v-if="banner" :class="banner.kind === 'err' ? 'err' : 'warn'">
-      {{ banner.text }}
+      <div>{{ banner.text }}</div>
+      <div v-if="banner.cmd" class="banner-cmd">
+        <code>{{ banner.cmd }}</code>
+        <button class="mini" @click="copyStartCmd">复制命令</button>
+      </div>
       <button v-if="banner.action === 'unprotect'" class="mini" @click="tryUnprotect">尝试解除保护</button>
       <button v-if="banner.action === 'ping'" class="mini" @click="ping">重连</button>
     </div>
@@ -120,7 +124,7 @@
 </template>
 
 <script>
-const APP_VER = '0.9.39'
+const APP_VER = '0.9.40'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
@@ -160,6 +164,8 @@ export default {
     return {
       bridge: false,
       pinged: false,
+      bridgeState: '',   // '' | ok | down | blocked | degraded —— 横幅文案按它分支（10-29）
+      bridgeWhy: '',     // 桥自报 / 页面侧的真实原因，直接给人看
       busy: false,
       stopFlag: false,
       flushing: false,
@@ -197,7 +203,19 @@ export default {
         return { kind: 'err', text: `这张表现在写不进去：${this.capErr}。`, action: 'unprotect' }
       }
       if (this.pinged && !this.bridge) {
-        return { kind: 'warn', text: '本地桥没连上（127.0.0.1:8791）—— 查询会全部失败。', action: 'ping' }
+        // ★ 10-29：三态分开，别再用一句「没连上」把三种完全不同的病根糊在一起
+        if (this.bridgeState === 'blocked') {
+          return { kind: 'warn', text: '加载项被拦：桥在 8791 上活着，但这个面板发的请求被跨域/CSP 挡住 —— 查询会全部失败。重开一次加载项面板；还不行就重装加载项。', action: 'ping' }
+        }
+        if (this.bridgeState === 'degraded') {
+          return { kind: 'err', text: `本地桥进程在跑，但自报异常：${this.bridgeWhy || 'ok:false'}`, action: 'ping' }
+        }
+        return {
+          kind: 'warn',
+          text: '本地桥进程没在跑（127.0.0.1:8791 无监听）—— 查询会全部失败。',
+          cmd: this.startCmdHint,
+          action: 'ping'
+        }
       }
       if (this.writeErr) return { kind: 'err', text: this.writeErr, action: '' }
       if (this.actionErr) return { kind: 'err', text: this.actionErr, action: '' }
@@ -208,6 +226,19 @@ export default {
     },
     ver() {
       return APP_VER
+    },
+    isWindows() {
+      try { return /Windows|Win32|WOW64/i.test(String((typeof navigator !== 'undefined' && navigator.userAgent) || '')) }
+      catch (e) { return false }
+    },
+    /** 桥没起时给一条能直接粘进终端/PS 的命令（mac / win 各一条，按宿主平台给） */
+    startCmdHint() {
+      return this.isWindows
+        ? '启动：powershell -ExecutionPolicy Bypass -File "%USERPROFILE%\\Documents\\trae_projects\\wps-shiptrack\\bridge\\start-win.ps1"'
+        : '启动：~/Documents/trae_projects/wps-shiptrack/scripts/bridge.sh start'
+    },
+    startCmdClean() {
+      return this.startCmdHint.replace(/^启动：/, '')
     },
     ready() {
       return this.cfg.numberCol > 0 && this.cfg.outCol > 0 && this.cfg.startRow > 0 && this.cfg.rows > 0
@@ -934,18 +965,56 @@ export default {
     },
 
     async ping() {
+      this.pinged = true
       try {
         const h = await this.httpGet('/health', 3000)
         const was = this.bridge
-        this.bridge = !!(h && h.ok)
-        this.pinged = true
-        this.log('bridge: ' + JSON.stringify(h))
-        if (this.bridge && !was) this.log('桥已重新连上')
-        if (this.bridge) this.writeErr = ''
+        if (h && h.ok) {
+          this.bridge = true
+          this.bridgeState = 'ok'
+          this.bridgeWhy = ''
+          this.log('bridge: ' + JSON.stringify(h))
+          if (!was) this.log('桥已重新连上')
+          this.writeErr = ''
+        } else {
+          // 连得上、但桥自己说 ok:false（Origin 被拒 / 依赖缺失…）→ 原样转述，不猜
+          this.bridge = false
+          this.bridgeState = 'degraded'
+          this.bridgeWhy = String((h && (h.error || h.msg || h.detail)) || 'ok:false')
+          this.log('bridge 自报异常: ' + JSON.stringify(h))
+        }
       } catch (e) {
         this.bridge = false
-        this.pinged = true
-        this.log('ping 失败: ' + e.message)
+        this.bridgeWhy = String((e && e.message) || e)
+        // 关键区分：连接被拒 与 被跨域/CSP 拦，在 fetch 眼里是同一张脸
+        // 靠 no-cors 探针（不读响应、只问「连得上吗」）把两者分开
+        this.bridgeState = (await this.reachProbe()) === 'reachable' ? 'blocked' : 'down'
+        this.log(`ping 失败（${this.bridgeState}）: ${this.bridgeWhy}`)
+      }
+    },
+    /** 只问「8791 连得上吗」，不读内容（no-cors：能连上就 resolve 一个 opaque 响应） */
+    async reachProbe() {
+      if (typeof fetch !== 'function') return 'unknown'
+      const ctl = typeof AbortController === 'function' ? new AbortController() : null
+      const timer = ctl ? setTimeout(() => ctl.abort(), 2500) : null
+      try {
+        await fetch(this.base() + '/health', { mode: 'no-cors', cache: 'no-store', ...(ctl ? { signal: ctl.signal } : {}) })
+        return 'reachable'
+      } catch (e) {
+        // no-cors 也可能被 PNA/CSP 挡（那就说明页面侧有拦截，不是没进程）
+        return /cors|cross-origin|private network|content security|csp/i.test(String((e && e.message) || '')) ? 'reachable' : 'unreachable'
+      } finally {
+        if (timer) clearTimeout(timer)
+      }
+    },
+    async copyStartCmd() {
+      const cmd = this.startCmdClean
+      try {
+        if (!(navigator.clipboard && navigator.clipboard.writeText)) throw new Error('no-clipboard')
+        await navigator.clipboard.writeText(cmd)
+        this.flash('启动命令已复制，粘到终端跑一次就好')
+      } catch (e) {
+        this.flash('复制不了，手工粘这条：' + cmd, 15000)
       }
     },
     diagDump() {
@@ -1678,6 +1747,10 @@ button:disabled { opacity: .45; cursor: default; }
 .hint { color: #666; line-height: 1.7; margin: 6px 0; }
 .cfg { background: #f6f8fb; border: 1px solid #e3e8f0; border-radius: 4px; padding: 6px 8px; line-height: 1.7; margin: 6px 0; }
 .err { background: #fdecec; border: 1px solid #f3b6b6; color: #a32020; padding: 6px 8px; border-radius: 4px; margin-bottom: 8px; line-height: 1.5; }
+/* 10-29：warn 之前没有样式，横幅在白底上像普通文字，用户看不见「桥没连上」 */
+.warn { background: #fff8e6; border: 1px solid #f0d79a; color: #8a5b00; padding: 6px 8px; border-radius: 4px; margin-bottom: 8px; line-height: 1.5; }
+.banner-cmd { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+.banner-cmd code { font-family: ui-monospace, Menlo, monospace; font-size: 11px; background: rgba(0, 0, 0, .06); padding: 2px 5px; border-radius: 3px; word-break: break-all; user-select: all; }
 .bar { position: relative; height: 16px; background: #eef1f5; border-radius: 3px; overflow: hidden; margin: 6px 0; }
 .bar-in { height: 100%; background: #4c8bf5; transition: width .2s; }
 .bar-t { position: absolute; inset: 0; text-align: center; font-size: 10px; line-height: 16px; color: #333; }
