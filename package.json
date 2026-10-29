@@ -1,24 +1,24 @@
 {
-  "name": "ShipTrack",
-  "addonType": "et",
-  "version": "0.9.43",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
-  },
-  "dependencies": {
-    "axios": "^1.7.2",
-    "core-js": "^3.37.1",
-    "vue": "^3.4.29",
-    "vue-router": "^4.3.3"
-  },
-  "devDependencies": {
-    "@vitejs/plugin-vue": "^5.0.5",
-    "vite": "^5.3.1",
-    "wps-jsapi-declare": "latest",
-    "wpsjs": "latest"
-  }
+	"name": "ShipTrack",
+	"addonType": "et",
+	"version": "0.9.44",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "vite",
+		"build": "vite build",
+		"preview": "vite preview"
+	},
+	"dependencies": {
+		"axios": "^1.7.2",
+		"core-js": "^3.37.1",
+		"vue": "^3.4.29",
+		"vue-router": "^4.3.3"
+	},
+	"devDependencies": {
+		"@vitejs/plugin-vue": "^5.0.5",
+		"vite": "^5.3.1",
+		"wps-jsapi-declare": "latest",
+		"wpsjs": "latest"
+	}
 }

@@ -5,7 +5,7 @@ const RULES = [
   { kind: 'blocked',  label: '站点拦截', re: /被拦|改版|非 JSON|DataDome|Cloudflare|cf_clearance|验证码|滑块|两个入口都不可用|无查询表单/i },
   { kind: 'format',   label: '号码格式', re: /格式不符|位数|应为\s*\d+\s*位|格式错误/i },
   { kind: 'network',  label: '网络',     re: /ECONN|ERR_|XHR|网络|超时|timeout|Target page|browser has been closed|桥没连上/i },
-  { kind: 'notfound', label: '官网查无', re: /查无此号|无数据|未找到|not found|No tracking data|不存在|no record/i },
+  { kind: 'notfound', label: '官网查无', re: /查无此号|查无此单|无数据|未找到|not found|No tracking data|不存在|no record/i },
   { kind: 'notwired', label: '未接入',   re: /暂未接入|未接入追踪|请手工查/i },
 ]
 

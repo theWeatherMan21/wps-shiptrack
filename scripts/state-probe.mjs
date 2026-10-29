@@ -988,6 +988,96 @@ function auditWrites(written, gridAfter, numCol, outCol) {
   await ctx.close()
 }
 
+// ---------- H31 收尾写回：不再停在「97/97 · 剩约 0 秒」，写回有独立进度、主线程会还手 ----------
+// 爹地 2026-10-29 真机截图：97 行查完，进度条停在「97/97 · 剩约 0 秒」，界面像卡住了。
+// 判据（120 行大表 + 每格注入同步 COM 忙等，模拟真机主线程开销）：
+//   ① 全程进度条文本从没出现「剩约 0 秒」
+//   ② 收尾写回阶段真的出现过「写回 x/y」——这条只有主线程让出过才能在屏幕上画出来
+//   ③ 页面心跳（20ms）最大间隔 < 400ms：写回不许独占主线程
+//   ④ 跑完进度条消失，120 行全部按行身份写对
+{
+  const N = 120
+  const grid = { '1,17': 'MBL' }
+  const evBy = {}
+  for (let i = 0; i < N; i++) {
+    const n = 'TEST-BL-7' + String(i + 1).padStart(3, '0')
+    grid[`${i + 2},17`] = n
+    evBy[n.replace(/-/g, '')] = [{ time: '2026-10-05T00:00:00Z', activity: 'Departure From', city: n.replace(/-/g, '') }]
+  }
+  const { ctx, page } = await open({ grid, lead: 40, last: N + 1, comMs: 15 })
+  await page.evaluate((e) => {
+    window.__evByNumber = e
+    window.__SHIPTRACK_WRITE_CHUNK__ = 3           // 段长压到 3 行：让「写回写到一半」这一步一定能被心跳采到
+    // 心跳：10ms 一次，顺手记下当时的进度条文本 + 写回条数 + COM 次数
+    window.__samples = []
+    window.__hb = setInterval(() => {
+      const el = document.querySelector('.bar-t')
+      window.__samples.push({ t: performance.now(), bar: el ? el.innerText : '', wr: (window.__written || []).length, ops: window.__ops || 0 })
+    }, 10)
+  }, evBy)
+  await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选单号列/)
+  await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选输出列/)
+  // 让最后 10 条结果一起到：这样收尾这一次写回必然是 10 行（不是「碰巧只剩 2 行」），
+  // 「写回写到一半」那一步才稳定可采，不靠运气。
+  await page.evaluate(() => {
+    const f = window.fetch
+    window.fetch = (u, init) => {
+      const m = /number=TEST-BL-7(\d{3})/.exec(String(u))
+      const p = f(u, init)
+      if (m && Number(m[1]) > 110) return new Promise((res) => setTimeout(() => res(p), 2500))
+      return p
+    }
+  })
+  await tryRun(page)
+  const seenBar = []
+  let sawWriteProg = false
+  let sawZeroEta = false
+  for (let i = 0; i < 900; i++) {
+    const t = await page.evaluate(() => { const el = document.querySelector('.bar-t'); return el ? el.innerText : '' })
+    if (t) {
+      if (!seenBar.includes(t)) seenBar.push(t)
+      if (/写回\s*\d+\/\d+/.test(t)) sawWriteProg = true
+      if (/剩约\s*0\s*秒/.test(t)) sawZeroEta = true
+    }
+    const st = await page.evaluate(() => window.__SHIPTRACK_BATCHES__ || [])
+    if (st.length && st.every((b) => b.state !== 'running' && b.state !== 'queued')) break
+    await page.waitForTimeout(40)
+  }
+  await page.waitForTimeout(300)
+  await page.evaluate(() => clearInterval(window.__hb))
+  // 只看「收尾写回」这段窗口里主线程被独占多久（扫描/查询阶段的老开销不在这张卡的账上）
+  const samples = await page.evaluate(() => window.__samples || [])
+  let maxGap = 0, writeOps = 0
+  for (let i = 1; i < samples.length; i++) {
+    const a = samples[i - 1], b = samples[i]
+    if (!/写回/.test(a.bar) && !/写回/.test(b.bar)) continue
+    const g = b.t - a.t
+    if (g > maxGap) { maxGap = g; writeOps = b.ops - a.ops }
+  }
+  const final = await waitBatches(page, 60000)
+  const writeTexts = new Set(samples.filter((s) => /写回/.test(s.bar)).map((s) => s.bar))
+  // 「写回 x/y，且 0 < x < y」= 写回写到一半时界面真的重绘过（这就是每 30 行让出主线程的直接证据）
+  const midWrite = samples.some((s) => {
+    const m = /写回\s*(\d+)\/(\d+)/.exec(s.bar)
+    return m && Number(m[1]) > 0 && Number(m[1]) < Number(m[2])
+  })
+  const barGone = await page.evaluate(() => !document.querySelector('.bar'))
+  const gridAfter = await page.evaluate(() => window.__grid);
+  const written = await page.evaluate(() => window.__written || []);
+  const audit = auditWrites(written, gridAfter, 17, 18)
+  const done = final.filter((b) => b.state === 'done' && b.done === N && b.total === N)
+  const ok = !sawZeroEta && sawWriteProg && maxGap > 0 && maxGap < 400 && barGone
+    && midWrite && done.length === 1 && audit.bad.length === 0 && audit.n >= N
+  pass('H31 收尾写回：没有「剩约 0 秒」+ 独立写回进度 + 写回不独占主线程（120 行）', ok,
+    `出现「剩约 0 秒」=${sawZeroEta} · 采样到「写回 x/y」=${sawWriteProg}（写到一半重绘=${midWrite}）· 写回阶段心跳最大间隔 ${Math.round(maxGap)}ms（<400ms，区间内 COM ${writeOps} 次）`
+    + ` · 跑完进度条消失=${barGone} · 批次=${JSON.stringify(final.map((b) => [b.state, b.done + '/' + b.total]))}`
+    + ` · 写入 ${audit.n} 格/错位 ${audit.bad.length}${audit.bad.slice(0, 2).join('；')}`
+    + `\n     写回进度采样：${[...writeTexts].slice(0, 8).join(' | ')}`)
+  await ctx.close()
+}
+
 await browser.close()
 srv.close()
 const bad = results.filter(([, ok]) => !ok)
