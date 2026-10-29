@@ -4,3 +4,4 @@ dist/
 dist-updates/
 .DS_Store
 *.log
+.worktrees/
