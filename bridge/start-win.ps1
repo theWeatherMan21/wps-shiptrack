@@ -7,6 +7,7 @@ param(
   [string]$GhToken = "",
   [switch]$Stop,
   [switch]$Status,
+  [switch]$Foreground,
   [switch]$InstallAutostart,
   [switch]$RemoveAutostart
 )
@@ -37,14 +38,34 @@ function Get-Health {
 }
 
 # --- autostart at logon (current user, no admin needed) ---
+# Registered through the ScheduledTasks cmdlets, not `schtasks /SC ONLOGON`, so that
+# RestartOnFailure is available: if the bridge dies (crash, killed, sleep/resume),
+# the task service starts it again. `schtasks /SC ONLOGON` only ever fires once.
 $TaskName = "ShipTrackBridge"
 if ($InstallAutostart) {
   if (-not $RepoPath -and (Test-Path $RepoFile)) { $RepoPath = (Get-Content $RepoFile | Select-Object -First 1).Trim() }
   if (-not $RepoPath) { Say "Run once with -RepoPath first, then add -InstallAutostart" "Red"; exit 1 }
+  if (-not (Test-Path (Join-Path $RepoPath "engine\tracking\cli.mjs"))) { Say "No engine\tracking\cli.mjs under: $RepoPath" "Red"; exit 1 }
+  Set-Content -Path $RepoFile -Value $RepoPath -Encoding UTF8
   $ps = (Get-Command powershell).Source
-  $argLine = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`" -RepoPath `"$RepoPath`" -Port $Port"
-  schtasks /Create /TN $TaskName /SC ONLOGON /TR "`"$ps`" $argLine" /F | Out-Null
-  if ($LASTEXITCODE -eq 0) { Say "OK: autostart registered (task: $TaskName)" "Green" } else { Say "Failed to register autostart (check with -Status)" "Red" }
+  # -Foreground: the task process IS the bridge (no detached child), so the task stays
+  # "Running" while the bridge lives and RestartOnFailure actually means something.
+  $argLine = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`" -RepoPath `"$RepoPath`" -Port $Port -Foreground"
+  try {
+    $action = New-ScheduledTaskAction -Execute $ps -Argument $argLine -WorkingDirectory $RepoPath
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+      -StartWhenAvailable -MultipleInstances IgnoreNew -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
+      -ExecutionTimeLimit ([TimeSpan]::Zero)
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
+    Say "OK: autostart registered (task: $TaskName, restart-on-failure every 1 min)" "Green"
+  } catch {
+    Say ("Failed to register autostart: " + $_.Exception.Message) "Red"
+    Say "Fallback (no restart-on-failure): schtasks /Create /TN $TaskName /SC ONLOGON /TR `"`"$ps`" $argLine`" /F" "Yellow"
+    exit 1
+  }
+  # start it right now instead of waiting for the next logon
+  try { Start-ScheduledTask -TaskName $TaskName; Say "Task started now." "Green" } catch { Say "Task registered; will start at next logon." "Yellow" }
   exit 0
 }
 if ($RemoveAutostart) {
@@ -91,6 +112,23 @@ if ($h) { Say "Already running: $h" "Green"; exit 0 }
 $node = Get-Command node -ErrorAction SilentlyContinue
 if (-not $node) { Say "Node.js (LTS) not found - install it, then re-run this script." "Red"; exit 1 }
 Say "Node: $(& node -v)  ->  $($node.Source)"
+
+# --- Foreground mode: this process IS the bridge (used by the logon task) ---
+# Blocking on purpose: the scheduled task then stays "Running" exactly as long as the
+# bridge lives, so Task Scheduler's RestartOnFailure can bring it back after a crash.
+if ($Foreground) {
+  $env:SSH_REPO = $RepoPath
+  $env:WPS_TRACK_PORT = "$Port"
+  if ($UpdateUrl -ne "") { $env:WPS_UPDATE_URL = $UpdateUrl; $env:WPS_UPDATE_MANIFEST = $UpdateManifest }
+  if ($UpdateRepo -ne "") { $env:WPS_UPDATE_REPO = $UpdateRepo }
+  if ($GhToken -ne "") { $env:GH_TOKEN = $GhToken }
+  Set-Location $RepoPath
+  Say "Foreground bridge: $Bridge  repo=$RepoPath  port=$Port"
+  # go through cmd.exe so the log stays plain UTF-8 text (PowerShell redirection writes UTF-16)
+  $cmdLine = '"' + $node.Source + '" "' + $Bridge + '" >> "' + $LogFile + '" 2>&1'
+  & cmd /c $cmdLine
+  exit $LASTEXITCODE
+}
 
 # 4) start the bridge, hidden window, detached from this session
 #    Over SSH, Start-Process children die with the session -> use a scheduled task

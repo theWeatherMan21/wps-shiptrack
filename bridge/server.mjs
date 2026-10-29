@@ -344,6 +344,81 @@ const server = http.createServer(async (req, res) => {
   send(res, 404, { ok: false, error: '未知路径: ' + url.pathname });
 });
 
+// ---------- 启动/运行期自检：起不来、监听丢了，都要留下可读原因并以非 0 退出 ----------
+// 为什么：以前端口被占只会吐一段 node 栈，守护进程（LaunchAgent / 计划任务）重启它
+// 也留不下「为什么起不来」；用户看到的就是面板一句「桥没连上」，无从下手。
+const STATE_DIR = process.env.WPS_TRACK_CONFIG_DIR || path.join(os.homedir(), '.hermes', 'wps-shiptrack');
+const FAIL_FILE = path.join(STATE_DIR, 'bridge-listen-failures.json');
+const stamp = () => {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+};
+const say = (msg) => console.error(`[bridge ${stamp()}] ${msg}`);
+
+function healthOnce(timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    const req = http.get({ host: HOST, port: PORT, path: '/health', timeout: timeoutMs }, (res) => {
+      let b = '';
+      res.on('data', (c) => { b += c; if (b.length > 4000) req.destroy(); });
+      res.on('end', () => { try { resolve(JSON.parse(b)); } catch { resolve(null); } });
+    });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve(null));
+  });
+}
+
+// 端口被别人占了：连续 3 次以上就停下，别每 30 秒写一行日志永远循环
+function noteForeignOccupant(detail) {
+  let st = { count: 0, first: 0, last: 0 };
+  try { st = { ...st, ...JSON.parse(fs.readFileSync(FAIL_FILE, 'utf8')) }; } catch { /* 没有就新建 */ }
+  const now = Date.now();
+  if (!st.first || now - st.first > 10 * 60 * 1000) st = { count: 0, first: now, last: now };
+  st.count += 1; st.last = now;
+  try { fs.mkdirSync(STATE_DIR, { recursive: true }); fs.writeFileSync(FAIL_FILE, JSON.stringify(st)); } catch { /* 写不了就算了 */ }
+  const giveUp = st.count >= 3;
+  say(`端口 ${PORT} 被别的进程占着（不是本桥）：${detail}`);
+  say(`  查是谁：lsof -nP -iTCP:${PORT} -sTCP:LISTEN`);
+  if (giveUp) {
+    say(`连续 ${st.count} 次被占（10 分钟内）→ 停止自动重启，先手工清掉占用者；本进程退出码 0（守护进程不再拉起）`);
+    return 0;
+  }
+  say(`  第 ${st.count}/3 次，守护进程会按 ThrottleInterval 重试；本进程退出码 1`);
+  return 1;
+}
+
+server.on('error', async (e) => {
+  if (e && e.code === 'EADDRINUSE') {
+    const h = await healthOnce();
+    if (h && h.service === 'wps-shiptrack-bridge') {
+      say(`已经有一个本桥在 ${HOST}:${PORT} 上跑（pid 不在本进程），本进程直接退出，不重复起`);
+      process.exit(0);
+    }
+    process.exit(noteForeignOccupant(h ? JSON.stringify(h) : String(e.message || e)));
+  }
+  say(`监听失败（${(e && e.code) || 'unknown'}）：${(e && e.message) || e}`);
+  process.exit(1);
+});
+
 server.listen(PORT, HOST, () => {
-  console.log(`[bridge] listening http://${HOST}:${PORT}  repo=${REPO}`);
+  try { fs.unlinkSync(FAIL_FILE); } catch { /* 清掉上次的失败计数 */ }
+  say(`listening http://${HOST}:${PORT}  pid=${process.pid}  node=${process.version}  repo=${REPO}`);
+});
+
+// 运行期监听丢了（被关掉 / 内部出错）→ 非 0 退出，交给守护进程重启
+setInterval(() => {
+  if (!server.listening) {
+    say('监听已丢失（server.listening=false）→ 退出等守护进程重启');
+    process.exit(1);
+  }
+}, 60 * 1000).unref();
+
+// 未捕获异常：本来就会让进程死，这里先落一行人能看懂的原因，退出码 1
+process.on('uncaughtException', (e) => {
+  say(`未捕获异常，退出等守护进程重启：${(e && e.stack) || e}`);
+  process.exit(1);
+});
+// 未处理的 Promise 拒绝：只记不杀 —— 一批查询跑一半时杀进程会丢掉在飞的结果
+process.on('unhandledRejection', (e) => {
+  say(`未处理的 Promise 拒绝（不退出）：${(e && e.stack) || e}`);
 });

@@ -21,6 +21,22 @@ node scripts/build.cjs online       # 构建到 wps-addon-build/
 ./scripts/pack-update.sh            # 打更新包到 dist-updates/
 ```
 
+## 本地桥常驻（别让人守着终端）
+
+桥（`127.0.0.1:8791`）原来只能人手 `scripts/bridge.sh start`：重启、合盖休眠被杀、崩溃退出之后，
+面板就永远「桥没连上」。现在两边都有守护：
+
+```bash
+# macOS：LaunchAgent（登录即起，崩溃/被杀自动重拉，日志在 ~/Library/Logs/wps-shiptrack-bridge.log）
+scripts/install-launchagent.sh
+scripts/install-launchagent.sh --status
+
+# Windows：登录计划任务（RestartOnFailure 1 分钟一次）
+powershell -ExecutionPolicy Bypass -File bridge\start-win.ps1 -RepoPath "<ShipScheduleHub>" -InstallAutostart
+```
+
+`scripts/bridge.sh` 仍留着做手工排查（start/stop/status/restart），`status` 会顺带报守护有没有装。
+
 ## 发布
 
 本仓库**只发插件**，与船期查询 App 的 release 分开：
