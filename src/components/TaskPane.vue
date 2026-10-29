@@ -73,7 +73,7 @@
         <span class="lg green">绿 · 已到目的港</span>
         <span class="lg gray">灰 · 已还空箱</span>
       </div>
-      <div class="muted" v-if="cfg.outCol > 0">上次刷新 {{ lastRunText }}<span v-if="misalign" class="stale">（本轮错位 {{ misalign }} 行 → 这个时间与范围行数不可信）</span> · API 读法 {{ readVia || '—' }} · 写法 {{ writeVia || '—' }}</div>
+      <div class="muted" v-if="cfg.outCol > 0">上次刷新 {{ lastRunText }}<span v-if="misalign" class="stale">（本轮错位 {{ misalign }} 行 → 这个时间与范围行数不可信）</span> · API 读法 {{ readVia || '—' }} · 写法 {{ writeVia || '—' }}<span v-if="writeStats && writeStats.cells"> · 写回 {{ writeStats.cells }} 格/{{ writeStats.runs }} 段 · {{ writeStats.ms }}ms</span></div>
       <div class="muted" v-if="cfg.outCol > 0 && autoOn">已开启：每 24 小时自动刷新（WPS 开着时）</div>
     </div>
 
@@ -124,7 +124,7 @@
 </template>
 
 <script>
-const APP_VER = '0.9.41'
+const APP_VER = '0.9.42'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
@@ -188,6 +188,8 @@ export default {
       runStart: 0,
       readVia: '',
       writeVia: '',
+      writeMs: 0,           // ★ 0.9.42：最近一次「写回阶段」耗时（批量核身份 + 批量写 + 读回校验 + 着色）
+      writeStats: null,     // ★ 0.9.42：最近一次写回的 格数/段数/成功/失败/错位
       apiReport: null,
       flashT: null,
       carriers: null,
@@ -314,6 +316,13 @@ export default {
     }
   },
   mounted() {
+    // ★ 0.9.42 写回层状态：批量写队列 / 我们自己刷过的颜色记账 / 本轮只读快照
+    this.writeQ = []                    // 待写队列（入队 → 一顿攒 → 一次批量写）
+    this.wqTimer = null                 // 攒批定时器
+    this.writing = false                // 防重入
+    this.ourColor = new Map()           // `${doc}|${row}` → 我们刷的底色（清色只清自己的）
+    this.colSnap = null                 // 本轮开始时的整列快照（港口/船司/双列号）
+    this.outSnap = null                 // 本轮开始时输出列的快照（判断「保留旧值」）
     this.diagDump()
     this.ping()
     this.loadCarriers()
@@ -330,6 +339,7 @@ export default {
   },
   beforeUnmount() {
     try { clearTimeout(this.retryTimer) } catch (e) { /* ignore */ }
+    try { clearTimeout(this.wqTimer) } catch (e) { /* ignore */ }
     if (this.timer) clearInterval(this.timer)
     if (this.flushTimer) clearInterval(this.flushTimer)
   },
@@ -743,48 +753,146 @@ export default {
       }
       return { values: [], via: '', error: JSON.stringify(this.apiReport) }
     },
-    // ---------- 整行底色（里程碑）----------
-    // 爹地要求：按里程碑给「该行整行」填充，而不是只染输出单元格。
-    applyStageColor(sheet, row, col, stage) {
-      const color = STAGE_COLOR[stage] || NO_FILL
-      // 行内填充到表格已用区最右列（不刷整张 16384 列，省得又慢又脏）
-      let firstCol = 1
-      let lastCol = col
+    /**
+     * ★ 0.9.42 批量读：整列一次读出，行内查询只查内存。
+     * 以前每行要 readOne 船司列（两次）、POL、POD、订舱号列 —— 97 行就是几百次同步 COM；
+     * 现在每种列一次 Range 读回整段。取不全的列不进缓存，行内自动退回逐格读（绝不因为缓存没读到就当空）。
+     */
+    prefetchCols(sheet, cols, r1, r2) {
+      const cache = new Map()
+      const n = r2 - r1 + 1
+      if (!n || n < 1) return cache
+      for (const c of cols || []) {
+        const col = Number(c || 0)
+        if (!col || cache.has(col)) continue
+        const r = this.readRangeValues(sheet, col, r1, r2)
+        if (r && r.values && r.values.length === n) cache.set(col, { from: r1, to: r2, values: r.values })
+        else this.log(`第 ${colLetter(col)} 列整列读取不全，这一列退回逐格读`)
+      }
+      return cache
+    },
+    /** 行内读一列：命中本轮快照就查内存，否则逐格读（分类用的列才走快照；核行身份永远读实时值） */
+    readColCached(col, row) {
+      const c = Number(col || 0)
+      if (!c) return ''
+      const hit = this.colSnap && this.colSnap.get(c)
+      if (hit && row >= hit.from && row <= hit.to) {
+        const v = hit.values[row - hit.from]
+        return v == null ? '' : v
+      }
+      try {
+        const a = this.app()
+        const v = this.readOne(a.ActiveSheet, row, c)
+        return v == null ? '' : v
+      } catch (e) { return '' }
+    },
+    /** 输出列原值：本轮开头批量读的那一份快照（1 次 COM 覆盖整段），取不到才逐格读 */
+    oldOutText(row, col) {
+      const s = this.outSnap
+      if (s && s.col === col && row >= s.from && row < s.from + s.values.length) {
+        const v = s.values[row - s.from]
+        return v == null ? '' : String(v).trim()
+      }
+      try {
+        const a = this.app()
+        const v = this.readOne(a.ActiveSheet, row, col)
+        return v == null ? '' : String(v).trim()
+      } catch (e) { return '' }
+    },
+    // ---------- 整行底色（里程碑）★ 0.9.42：区段批量刷 ----------
+    // 为什么改：逐格 Interior.Color 也是同步 COM，97 行 = 97 次 —— 和逐格写一样卡。
+    // 现在按「连续行 + 同一种颜色」合并成区段，一次赋值刷完整段；只有区段批量失败才退回逐行。
+    usedColSpan(sheet) {
+      let left = 1
+      let right = this.cfg.outCol || 1
       try {
         const ur = sheet.UsedRange
-        const left = ur.Column || 1
-        const right = left + ((ur.Columns && ur.Columns.Count) || 1) - 1
-        if (left > 0) firstCol = left
-        if (right > lastCol) lastCol = right
+        const l = ur.Column || 1
+        const r = l + ((ur.Columns && ur.Columns.Count) || 1) - 1
+        if (l > 0) left = l
+        if (r > right) right = r
       } catch (e) {}
-      const rowAddr = `${colLetter(firstCol)}${row}:${colLetter(lastCol)}${row}`
-      const setIt = (interior) => {
-        if (color === NO_FILL) {
-          interior.ColorIndex = NO_FILL
-        } else {
-          interior.Pattern = 1
-          interior.Color = color
-        }
-      }
+      return { left, right }
+    },
+    /** 单行整行上色/清色（区段批量不行时的退路；单行也用得上） */
+    paintRow(sheet, row, left, right, color) {
+      const addr = `${colLetter(left)}${row}:${colLetter(right)}${row}`
       const tries = [
-        ['Range(整行).Interior', () => setIt(sheet.Range(rowAddr).Interior)],
-        ['Rows(row).Interior', () => setIt(sheet.Rows(row).Interior)],
-        ['Cells(整行)', () => setIt(sheet.Rows(row).Cells.Interior)]
+        ['Range(整行).Interior', () => sheet.Range(addr).Interior],
+        ['Rows(row).Interior', () => sheet.Rows(row).Interior],
+        ['Cells(整行)', () => sheet.Rows(row).Cells.Interior]
       ]
-      for (const [name, fn] of tries) {
+      for (const [name, get] of tries) {
         try {
-          fn()
+          const it = get()
+          if (color === NO_FILL) it.ColorIndex = NO_FILL
+          else { it.Pattern = 1; it.Color = color }
           this.fillVia = name
           return true
-        } catch (e) {
-          this.fillErr = String(e.message || e)
-        }
+        } catch (e) { this.fillErr = String(e.message || e) }
       }
       this.log(`整行上色失败（第 ${row} 行）：${this.fillErr}`)
       return false
     },
+    /**
+     * ★ 0.9.42 着色批量刷：plan = [{row, color}]（color = NO_FILL 表示「清我们自己刷的色」）
+     *   · 连续行 + 同色 → 一次 Range("A2:M6").Interior.Color（1 次 COM，不是 5 次）
+     *   · 清色只清 this.ourColor 里记账的（= 我们刷过），用户手工标的底色一律不碰；
+     *     也正因为有记账，不必再为了「这色是不是我们的」每行读一次 Interior.Color。
+     */
+    paintRows(sheet, plan) {
+      if (!plan || !plan.length) return 0
+      const doc = this.docKey()
+      const { left, right } = this.usedColSpan(sheet)
+      const todo = []
+      for (const p of plan) {
+        const k = `${doc}|${p.row}`
+        if (p.color === NO_FILL) {
+          if (!this.ourColor.has(k)) continue      // 没刷过 → 不读也不写
+          todo.push(p)
+        } else {
+          this.ourColor.set(k, p.color)
+          todo.push(p)
+        }
+      }
+      todo.sort((x, y) => x.row - y.row)
+      let ops = 0
+      let i = 0
+      while (i < todo.length) {
+        let j = i
+        while (j + 1 < todo.length && todo[j + 1].row === todo[j].row + 1 && todo[j + 1].color === todo[j].color) j++
+        const seg = todo.slice(i, j + 1)
+        i = j + 1
+        const from = seg[0].row
+        const to = seg[seg.length - 1].row
+        const color = seg[0].color
+        let done = false
+        if (to > from) {   // 单行走退路就够了，不必为 1 行再试一次区段
+          try {
+            const it = sheet.Range(`${colLetter(left)}${from}:${colLetter(right)}${to}`).Interior
+            if (color === NO_FILL) it.ColorIndex = NO_FILL
+            else { it.Pattern = 1; it.Color = color }
+            done = true
+            ops++
+          } catch (e) { this.fillErr = String(e.message || e) }
+        }
+        if (!done) {
+          for (const p of seg) { if (this.paintRow(sheet, p.row, left, right, p.color)) ops++ }
+        }
+        if (color === NO_FILL) for (const p of seg) this.ourColor.delete(`${doc}|${p.row}`)
+      }
+      return ops
+    },
+    /** 单行清我们自己刷的色（零散调用留的口；批量路径统一走 paintRows） */
+    clearOurColor(sheet, row) {
+      this.paintRows(sheet, [{ row, color: NO_FILL }])
+    },
+    clearOurColors(sheet, rows) {
+      const plan = (rows || []).map((row) => ({ row, color: NO_FILL }))
+      if (plan.length) this.paintRows(sheet, plan)
+    },
 
-        readOne(sheet, r, c) {
+    readOne(sheet, r, c) {
       const a = this.app()
       const A1 = this.addr(r, c)
       try { const v = sheet.Range(A1).Value2; if (v !== undefined && v !== null) return v } catch (e) {}
@@ -793,20 +901,24 @@ export default {
       try { return a.Range(A1).Value2 } catch (e) {}
       return undefined
     },
-    // 只清「我们自己刷的三种里程碑色」；用户手工标的底色一律不碰
-    clearOurColor(sheet, row) {
-      const ours = [STAGE_COLOR[1], STAGE_COLOR[2], STAGE_COLOR[3]]
-      try {
-        const ur = sheet.UsedRange
-        const left = ur.Column || 1
-        const right = left + ((ur.Columns && ur.Columns.Count) || 1) - 1
-        const rng = sheet.Range(`${colLetter(left)}${row}:${colLetter(right)}${row}`)
-        const cur = Number(rng.Interior.Color)
-        if (ours.includes(cur)) { rng.Interior.ColorIndex = NO_FILL; return true }
-      } catch (e) { /* 读不到就算了，不动 */ }
-      return false
+    /** 毫秒表（写回阶段计时用；WPS 里 performance 可能没有，退回 Date） */
+    nowMs() {
+      try { if (typeof performance !== 'undefined' && performance.now) return performance.now() } catch (e) {}
+      return Date.now()
     },
 
+    /**
+     * 单号比对 —— 唯一口径：全角/空格/连字符归一化后，一格多号命中任一即可。
+     * 批量核身份（_writeSeg）与逐格核身份（verifyRowIdentity）必须共用这把尺，
+     * 两处口径不一样等于没有校验。
+     */
+    sameNumber(want, cellValue) {
+      const w = normNum(want)
+      if (!w) return false
+      const have = splitParts(toHalf(cellValue)).map(normNum).filter(Boolean)
+      if (!have.length) return false
+      return have.includes(w)
+    },
     /**
      * ★ 0.9.41 行身份校验 —— 唯一一把尺：writeResult / _flushPending / 自动刷新 / ETD-ETA 写回全走这里。
      *
@@ -819,16 +931,12 @@ export default {
      * 严格比对会把「同一行」误判成错位而少写 —— 那是另一种错。
      */
     verifyRowIdentity(sheet, row, number, numCol) {
-      const want = normNum(number)
-      if (!want) return false
+      if (!normNum(number)) return false
       const col = Number(numCol || this.cfg.numberCol || 0)
       if (!col) return false
       let cur
       try { cur = this.readOne(sheet, row, col) } catch (e) { return false }
-      const have = splitParts(toHalf(cur)).map(normNum).filter(Boolean)
-      if (!have.length) return false
-      // 一格两号（订舱号/提单号同格）时，查询用的可能就是其中之一 → 命中任一即可
-      return have.includes(want)
+      return this.sameNumber(number, cur)
     },
     /** 错位跳过：不写、计数（按行去重）、界面给一句能照着做的提示 */
     markMisalign(it, row, numCol, why) {
@@ -871,18 +979,258 @@ export default {
       return { ok: false, error: errs[0] || '写入失败', all: errs }
     },
 
+    // ================= ★ 0.9.42（P0-2）唯一写回入口 + 批量写 =================
     /**
-     * ★ 0.9.41 唯一的写回入口：先核行身份，通不过就跳过，通过才真写。
-     * 写业务单元格的路径（写结果 / 补写暂存 / 写船期）一律走这里或 verifyRowIdentity，
-     * 不许再直接调 writeCell —— 否则下次又只修一处。
+     * writeRowChecked(sheet, row, col, text, number) —— 写业务单元格只许走这里。
+     *   = 核行身份 + 写入 + 写后校验，三步都在这一层收口（别处不许再直接调 writeCell）。
+     *
+     * 为什么是「入队」而不是「立刻写」：
+     *   以前每来一条结果就写一格，97 行 = 97 次写 + 97 次读回校验，每格至少 2 次同步 COM 打在主线程上，WPS 明显卡。
+     *   现在先入队 → _flushWriteQueue 按列聚合成「连续区段」→ 一次 Range("K2:K98").Value2 = [[...]] 写完
+     *   → 再一次批量读回校验。身份校验也批量：一次读单号列整段，逐行比号。
+     *   只有批量写不可用（老版本不认二维数组 / 写入抛错 / 读回不一致）才退回逐格定位，逐格时依旧逐格核身份。
+     *
+     * 已接入本入口的写回路径（4 条，全部走这里）：
+     *   ① 实时写回 writeResult（③ 立即刷新 / 自动刷新 / 自动重查 runRetry / 手工兜底 applyManual 都汇到这里）
+     *   ② 暂存补写 _flushPending（查询中切走攒下的结果，切回原表补齐）
+     *   ③ 船期回填 writeScheduleDates（ETD / ETA 两列）
+     *   ④ 自动重查 runRetry → queryAndWrite → writeResult（与 ① 同一条链）
      */
-    writeRowChecked(it, sheet, row, col, text, numCol) {
-      const nc = Number(numCol || (it && it.numCol) || this.cfg.numberCol || 0)
-      if (!this.verifyRowIdentity(sheet, row, it ? it.number : '', nc)) {
-        this.markMisalign(it, row, nc, '写前核对不通过')
-        return { ok: false, skipped: true }
+    writeRowChecked(sheet, row, col, text, number, numCol, it, rawValue) {
+      const c = Number(col || 0)
+      const r = Number(row || 0)
+      if (!c || !r) {
+        this.writeErr = '写入失败：列或行没定'
+        return { ok: false, error: '列或行没定' }
       }
-      return this.writeCell(sheet, row, col, text)
+      const entry = {
+        doc: this.docKey(),
+        sheet,
+        row: r,
+        col: c,
+        numCol: Number(numCol || (it && it.numCol) || this.cfg.numberCol || 0),
+        number: String(number == null ? '' : number),
+        text: String(text == null ? '' : text),
+        value: rawValue === undefined ? String(text == null ? '' : text) : rawValue,
+        it: it || null,
+        result: 'queued'
+      }
+      this.writeQ.push(entry)
+      this._armWriteFlush()
+      return { ok: true, queued: true, entry }
+    },
+    /** 攒一小会儿再写：并发查到的结果合并进同一次批量写，用户看到的仍是「边查边出」 */
+    _armWriteFlush() {
+      // 攒批窗口 400ms（人眼看不出滞后）；队列一旦够 10 行就立刻写，不必等满窗口 ——
+      // 每段写回都有固定开销（核身份读 + 写 + 读回 ≈ 3~4 次 COM），段越少越省。
+      const ms = Number(window.__SHIPTRACK_FLUSH_MS__ || 0) || 400
+      if (!this.wqTimer && this.writeQ.length >= 10) { this.flushWrites(); return }
+      if (this.wqTimer) return
+      this.wqTimer = setTimeout(() => {
+        this.wqTimer = null
+        this.flushWrites()
+      }, ms)
+    },
+    flushWrites() {
+      if (this.wqTimer) { clearTimeout(this.wqTimer); this.wqTimer = null }
+      return this._flushWriteQueue()
+    },
+    /**
+     * 队列落盘：按 (输出列, 单号列) 分组 → 行排序 → 连续区段 → 段内批量核身份 → 批量写 → 批量读回校验。
+     * 中间有洞就断开：只对连续区段批量写，「不写的格」一个都不碰。
+     * （整段覆盖会把洞里的公式/用户内容替换成死值 —— 这是最隐蔽的一种数据损坏，所以宁可按段写。）
+     */
+    _flushWriteQueue() {
+      const st = { ok: 0, fail: 0, miss: 0, runs: 0, cells: 0, fills: 0, via: '', ms: 0 }
+      if (this.writing || !this.writeQ.length) return st
+      const a = this.app()
+      const sheet = a && a.ActiveSheet
+      if (!sheet) return st
+      const doc = this.docKey()
+      const mine = []
+      const rest = []
+      for (const w of this.writeQ) (w.doc === doc ? mine : rest).push(w)
+      this.writeQ = rest            // 别的表的结果继续排队：切回去再写，绝不写错表
+      if (!mine.length) return st
+      this.writing = true
+      const t0 = this.nowMs()
+      try {
+        const groups = new Map()
+        for (const w of mine) {
+          const k = `${w.col}|${w.numCol}`
+          if (!groups.has(k)) groups.set(k, [])
+          groups.get(k).push(w)
+        }
+        const paints = []
+        for (const list of groups.values()) {
+          list.sort((x, y) => x.row - y.row)
+          let i = 0
+          while (i < list.length) {
+            let j = i
+            while (j + 1 < list.length && list[j + 1].row === list[j].row + 1) j++   // 连续行号
+            const seg = list.slice(i, j + 1)
+            i = j + 1
+            this._writeSeg(sheet, seg, st, paints)
+          }
+        }
+        if (paints.length) st.fills = this.paintRows(sheet, paints)
+      } catch (e) {
+        this.writeErr = '写入失败：' + String((e && e.message) || e)
+        this.log('批量写回异常：' + String((e && e.message) || e))
+      } finally {
+        this.writing = false
+      }
+      st.ms = Math.round(this.nowMs() - t0)
+      this.writeMs = (this.writeMs || 0) + st.ms
+      // 本轮累计（界面/诊断看的是「这一轮一共写了多少格、一共多少段、一共多久」，
+      // 只报最后一次 flush 会让人以为只写了 3 格）
+      const prev = this.writeStats || { ok: 0, fail: 0, miss: 0, runs: 0, cells: 0, fills: 0, via: '', ms: 0 }
+      this.writeStats = {
+        ok: prev.ok + st.ok, fail: prev.fail + st.fail, miss: prev.miss + st.miss,
+        runs: prev.runs + st.runs, cells: prev.cells + st.cells, fills: prev.fills + st.fills,
+        via: st.via || prev.via, ms: prev.ms + st.ms
+      }
+      if (st.via) this.writeVia = st.via
+      if (st.fail) {
+        this.writeErr = `写入失败 ${st.fail} 格（批量写不可用，退回逐格也没写进）`
+        this.log(`写回：成功 ${st.ok} / 失败 ${st.fail} / 错位跳过 ${st.miss}`)
+      } else if (st.cells) {
+        this.writeErr = ''
+        this.log(`写回：${st.cells} 格 / ${st.runs} 段 / ${st.ms}ms${st.via ? ' · ' + st.via : ''}`)
+      }
+      try { window.__SHIPTRACK_STATS__ = { ...this.writeStats, lastMs: st.ms, lastCells: st.cells } } catch (e) {}
+      return st
+    },
+    _cellValueOf(w) {
+      return w.value === undefined ? w.text : w.value
+    },
+    /** 读回校验：日期列回来的可能是 Date，按 y-m-d 比 */
+    sameCellText(back, w) {
+      const want = this._cellValueOf(w)
+      if (want instanceof Date) {
+        const p = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+        if (back instanceof Date) return p(back) === p(want)
+        const s = String(back == null ? '' : back)
+        return s === p(want) || s.slice(0, 10) === p(want) || s === w.text
+      }
+      return String(back == null ? '' : back) === String(want)
+    },
+    /** 一段连续行：批量核身份 → 逐段写（段内批量）→ 记着色计划 */
+    _writeSeg(sheet, seg, st, paints) {
+      const from = seg[0].row
+      const to = seg[seg.length - 1].row
+      const nc = seg[0].numCol
+      // ① 批量核身份：单号列整段一次读（1 次 COM），不再逐格 readOne
+      let idVals = null
+      if (nc) {
+        const r = this.readRangeValues(sheet, nc, from, to)
+        if (r && r.values && r.values.length === (to - from + 1)) idVals = r.values
+      }
+      const passed = []
+      for (const w of seg) {
+        // 批量读不出来就退回逐格读 —— 身份校验可以慢，绝不能省
+        const cell = idVals ? idVals[w.row - from] : (nc ? this.readOne(sheet, w.row, nc) : '')
+        if (nc && this.sameNumber(w.number, cell)) passed.push(w)
+        else {
+          w.result = 'miss'
+          st.miss++
+          this.markMisalign(w.it, w.row, nc, idVals ? '批量核对不通过' : '核对不通过')
+        }
+      }
+      if (!passed.length) return
+      // ② 过了身份的行再切连续段（没过的是洞 → 跳过，绝不写）
+      let i = 0
+      while (i < passed.length) {
+        let j = i
+        while (j + 1 < passed.length && passed[j + 1].row === passed[j].row + 1) j++
+        const run = passed.slice(i, j + 1)
+        i = j + 1
+        if (run.length === 1) {
+          // 单行段走逐格口（身份刚刚在本段批量核过，needCheck=false 不重复读一次）
+          this._writeOneChecked(sheet, run[0], st, false)
+        } else {
+          this._batchWriteRun(sheet, run, st)
+        }
+        // ③ 着色计划：等全部写完，最后一遍按区段批量刷（这里不碰 Interior）
+        for (const w of run) {
+          const it = w.it
+          if (!it || w.result !== 'ok') continue
+          if (it.state === 'ok' && it.stage > 0 && !it.inferred) paints.push({ row: w.row, color: STAGE_COLOR[it.stage] || NO_FILL })
+          else if (it.state === 'ok') paints.push({ row: w.row, color: NO_FILL })
+        }
+      }
+    },
+    /** 批量写：一次 Range("K2:K98").Value2 = [[...]]，再一次批量读回校验 */
+    _batchWriteRun(sheet, run, st) {
+      const col = run[0].col
+      const from = run[0].row
+      const to = run[run.length - 1].row
+      const addr = `${colLetter(col)}${from}:${colLetter(col)}${to}`
+      const flat = run.map((w) => this._cellValueOf(w))
+      const grid = flat.map((v) => [v])
+      const a = this.app()
+      const tries = [
+        ['Range.Value2(二维)', () => { sheet.Range(addr).Value2 = grid }],
+        ['Range.Value2(一维)', () => { sheet.Range(addr).Value2 = flat }],
+        ['App.Range(二维)', () => { if (typeof a.Range !== 'function') throw new Error('无 Application.Range'); a.Range(addr).Value2 = grid }]
+      ]
+      const errs = []
+      for (const [name, fn] of tries) {
+        try {
+          fn()
+          const back = this.readRangeValues(sheet, col, from, to)
+          if (back && back.values && back.values.length === run.length) {
+            let bad = 0
+            run.forEach((w, k) => { if (!this.sameCellText(back.values[k], w)) bad++ })
+            if (!bad) {
+              st.ok += run.length
+              st.cells += run.length
+              st.runs++
+              st.via = name
+              this.apiReport = { ...(this.apiReport || {}), write: name }
+              run.forEach((w) => { w.result = 'ok'; w.via = name })
+              return true
+            }
+            errs.push(`${name}: 读回不一致 ${bad}/${run.length} 格`)
+          } else {
+            errs.push(`${name}: 读回不全（${back && back.values ? back.values.length : 0}/${run.length}）`)
+          }
+        } catch (e) {
+          errs.push(`${name}: ${String((e && e.message) || e)}`)
+        }
+      }
+      // ③ 批量写不可用 → 逐格定位；每格重新核身份（不因为「刚核过」就省）
+      this.log(`批量写 ${addr} 不可用（${errs[0] || '未知'}）→ 退回逐格写`)
+      for (const w of run) this._writeOneChecked(sheet, w, st, true, '退回逐格时核对不通过')
+      return false
+    },
+    /**
+     * 逐格写（批量写的唯一旁路：整个文件里只有这一处调 writeCell）。
+     * 单行段、以及批量写不可用时的逐格定位都走它：先核身份（needCheck=true 时），再写，写内置读回校验。
+     */
+    _writeOneChecked(sheet, w, st, needCheck = true, why = '写前核对不通过') {
+      if (needCheck) {
+        const cur = w.numCol ? this.readOne(sheet, w.row, w.numCol) : ''
+        if (w.numCol && !this.sameNumber(w.number, cur)) {
+          w.result = 'miss'
+          st.miss++
+          this.markMisalign(w.it, w.row, w.numCol, why)
+          return false
+        }
+      }
+      const r = this.writeCell(sheet, w.row, w.col, this._cellValueOf(w))
+      if (r && r.ok) {
+        st.ok++
+        st.cells++
+        st.runs++
+        w.result = 'ok'
+        w.via = r.via
+        return true
+      }
+      st.fail++
+      w.result = 'fail'
+      w.error = r && r.error
+      return false
     },
 
     pickOutputCol() {
@@ -1003,11 +1351,18 @@ export default {
         this.log('加载船司清单失败: ' + e.message)
       }
     },
-    /** S/L 写了船司但该船司没接适配器（如 OOCL）→ 直接给结论，不发请求 */
+    /** S/L 写了船司、但桥报该船司没有适配器（如 SITC/ANL/KMTC）→ 直接给结论，不发请求 */
     knownNotLive(carrier) {
       if (!carrier || !this.carriers || !this.carriers.carriers) return false
       const c = this.carriers.carriers.find((x) => x.id === carrier)
       return !!c && !c.live
+    },
+    /** 展示名：优先插件自己的短名表，其次桥给的 name（没适配器的船司如 SITC 只有桥知道名字） */
+    carrierLabel(carrier) {
+      if (!carrier) return ''
+      if (CARRIER_NAME[carrier]) return CARRIER_NAME[carrier]
+      const c = ((this.carriers && this.carriers.carriers) || []).find((x) => x.id === carrier)
+      return (c && c.name) || carrier
     },
     /** ★ 10-28：该船司的官网页（桥从 identify.mjs 直出，插件不维护第二份 URL 表） */
     manualUrlOf(carrier) {
@@ -1205,6 +1560,13 @@ export default {
         return
       }
       this.readVia = read.via
+      // ★ 0.9.42 批量读：输出列整段一次读（「保留旧值」判断、自动刷新筛空行都靠它），不再逐格 readOne
+      const outRead = this.readRangeValues(sheet, outCol, r1, r2)
+      this.outSnap = (outRead && outRead.values && outRead.values.length === (r2 - r1 + 1))
+        ? { col: outCol, from: r1, values: outRead.values }
+        : null
+      // ★ 0.9.42 批量读：船司/港口/双列号各整列一次读（原来每行 4~5 次 readOne）
+      this.colSnap = this.prefetchCols(sheet, [this.cfg.carrierCol, this.cfg.polCol, this.cfg.podCol, this.cfg.blCol, this.cfg.bkCol], r1, r2)
       const nums = vals.map((v, i) => {
         const row = r1 + i
         // 一格写「订舱号/提单号」时：主用提单号，另一个留作兜底（有些船司只认订舱号）
@@ -1214,7 +1576,7 @@ export default {
       let todo = nums.filter((x) => x.number)
       if (opts.auto) {
         // 自动刷新只补空行：已经写过结果的行不重查（省得开机就几十个浏览器查询把机器拖死）
-        const empty = todo.filter((t) => !String(this.readOne(sheet, t.row, outCol) || '').trim())
+        const empty = todo.filter((t) => !this.oldOutText(t.row, outCol))
         if (!empty.length) { this.log('自动刷新：没有待补的空行，跳过'); return }
         if (empty.length > AUTO_MAX_ROWS) this.log(`自动刷新：待查 ${empty.length} 行，只处理前 ${AUTO_MAX_ROWS} 行`)
         todo = empty.slice(0, AUTO_MAX_ROWS)
@@ -1232,6 +1594,8 @@ export default {
         text: x.number ? '' : '（空/非单号，跳过）',
         state: x.number ? 'idle' : 'skip'
       }))
+      this.writeStats = null     // ★ 0.9.42：本轮写回统计从零开始（界面/诊断看的是这一轮的总账）
+      this.writeMs = 0
       this.misalign = 0          // 新一轮从零计数：上一轮的错位提示随这次刷新消失，不挂僵尸
       this.misalignSeen.clear()
       this.busy = true
@@ -1279,9 +1643,13 @@ export default {
         this.actionErr = '刷新异常终止：' + (e.message || e)
       } finally {
         this.busy = false
+        // ★ 0.9.42：本轮剩余的写回队列立刻落盘（一次批量写 + 一次读回），
+        //   然后再统计——不然「查询跑完了但结果还堆在队列里」会把汇总算错。
+        this.flushWrites()
       }
       const completed = !this.stopFlag
       // 没收尾的行别挂着「查询中…」
+      const idleRows = []
       for (const it of this.items) {
         if (it.state === 'querying') {
           it.state = 'skip'
@@ -1290,10 +1658,13 @@ export default {
         if (it.state === 'idle') {
           it.state = 'skip'
           it.text = this.stopFlag ? '（已停止，未查询）' : '（本次未查，点③刷新）'
-          // 这行这次没重算 → 之前刷的里程碑色可能已过期，清掉
-          this.clearOurColor(sheet, it.row)
+          // 这行这次没重算 → 之前刷的里程碑色可能已过期，清掉（一起批量清，不逐行摸 Interior）
+          idleRows.push(it.row)
         }
       }
+      if (idleRows.length) this.clearOurColors(sheet, idleRows)
+      this.colSnap = null
+      this.outSnap = null
 
       this.runSummary = summarizeFails(this.items)
       this.log('本轮汇总：' + this.runSummary)
@@ -1395,7 +1766,7 @@ export default {
         // ① 先看船司列（用户自己的 S/L，最权威；SOC/COC 等字样自动忽略）
         if (this.cfg.carrierCol > 0) {
           try {
-            const sl = this.readOne(sheet, t.row, this.cfg.carrierCol)
+            const sl = this.readColCached(this.cfg.carrierCol, t.row)   // ★ 0.9.42 整列快照，不再逐行读
             override = carrierFromSl(sl)
             if (override) this.log(`${t.number}: 按 S/L「${String(sl).trim()}」→ ${override}`)
           } catch (e) {}
@@ -1403,7 +1774,7 @@ export default {
         // ①b 写了船司名、但这个船司没有适配器 → 直接给结论，一个请求都不发
         if (!override && this.cfg.carrierCol > 0) {
           try {
-            const sl = this.readOne(sheet, t.row, this.cfg.carrierCol)
+            const sl = this.readColCached(this.cfg.carrierCol, t.row)   // ★ 0.9.42 整列快照，不再逐行读
             const raw = String(sl == null ? '' : sl).trim()
             if (looksLikeCarrierToken(raw)) {
               it.state = 'error'
@@ -1428,11 +1799,11 @@ export default {
           this.log(`${t.number}: identify 失败 ${e.message}`)
         }
         if (override && this.knownNotLive(override)) {
-          it.text = `${CARRIER_NAME[override] || override} 暂未接入（官网需滑块/验证码，请手工查）`
+          it.text = `${this.carrierLabel(override) || override} 未接入追踪（请手工查）`
           it.state = 'error'
           it.failReason = 'not-wired'
           it.manualUrl = this.manualUrlOf(override)          // ★ 10-28：没接入也要给一条能点的路
-          it.manualLabel = CARRIER_NAME[override] || override
+          it.manualLabel = this.carrierLabel(override) || override
           return this.writeResult(it, sheet, t.row, outCol, true)
         }
         const call = async (num) => this.httpGet(
@@ -1456,7 +1827,7 @@ export default {
           const bkCol = this.cfg.bkCol || 0
           const pick = (c) => {
             if (!c || c === this.cfg.numberCol) return ''
-            try { return cleanNumber(String(this.readOne(sheet, t.row, c) || '')) } catch (e) { return '' }
+            try { return cleanNumber(String(this.readColCached(c, t.row) || '')) } catch (e) { return '' }
           }
           // 什么时候还该试第二列：主查的是提单号 → 试订舱号；主查的是订舱号 → 试提单号
           const curIsBl = blCol && this.cfg.numberCol === blCol
@@ -1478,8 +1849,8 @@ export default {
         }
         if (it.state === 'ok') {
           // 里程碑着色：蓝=已离起运港 / 绿=已到目的港 / 灰=已还空箱
-          const pol = this.cfg.polCol ? String(this.readOne(sheet, t.row, this.cfg.polCol) || '') : ''
-          const pod = this.cfg.podCol ? String(this.readOne(sheet, t.row, this.cfg.podCol) || '') : ''
+          const pol = this.cfg.polCol ? String(this.readColCached(this.cfg.polCol, t.row) || '') : ''   // ★ 0.9.42 整列快照
+          const pod = this.cfg.podCol ? String(this.readColCached(this.cfg.podCol, t.row) || '') : ''
           // 船司查询结果里本来就写着起运港/目的港（Maersk 页头就有 "XINGANG, CN → GDANSK, PL"）
           // → 它是第一优先；事件推断次之；表格列兜底（爹地 2026-10-27 明确）
           const cityOf = (v) => String(v || '').split('(')[0].trim()
@@ -1511,13 +1882,11 @@ export default {
       const etdCol = this.cfg.etdCol || 0
       const etaCol = this.cfg.etaCol || 0
       if (!etdCol && !etaCol) return
-      // ★ 0.9.41：船期也是写进这一行 —— 行变了同样不许写（否则日期会写到别人的货上）
-      if (!this.verifyRowIdentity(sheet, row, number, this.cfg.numberCol)) {
-        this.log(`R${row} 船期不写：该行单号已变（防写到别的行）`)
-        return
-      }
       let etd = '', eta = ''
       try { ({ etd, eta } = pickEtdEta(r.events || [], { pod })) } catch (e) { this.log('船期取值失败: ' + (e.message || e)); return }
+      const numCol = this.cfg.numberCol
+      // ★ 0.9.42：船期也是「写回」——一律走唯一入口（入队 → 批量核身份 → 批量写），
+      //   不再直接摸 Range；行身份由 writeRowChecked 那一把尺统一核，写错行的口子彻底收掉。
       const put = (col, val) => {
         if (!col || !val) return false
         try {
@@ -1529,13 +1898,13 @@ export default {
           try { fmt = String(rng.NumberFormatLocal || '') } catch (e) { fmt = '' }
           const isDate = /y{2,}|m{1,2}[-/]d|d{1,2}[-/]m/i.test(fmt)
           const [y, m, d] = val.split('-').map(Number)
-          rng.Value2 = isDate ? new Date(y, m - 1, d) : val
+          this.writeRowChecked(sheet, row, col, val, number, numCol, null, isDate ? new Date(y, m - 1, d) : val)
           return true
         } catch (e) { return false }
       }
       const a = put(etdCol, etd)
       const b = put(etaCol, eta)
-      if (a || b) this.log(`R${row} 回填船期：ETD ${etd || '—'} · ETA ${eta || '—'}`)
+      if (a || b) this.log(`R${row} 待回填船期：ETD ${etd || '—'} · ETA ${eta || '—'}`)
     },
 
     /** ★ 10-28：切表时把这一行的结果攒起来（不写、不丢），切回来一次补齐 */
@@ -1593,23 +1962,27 @@ export default {
         return
       }
       let ok = 0, fail = 0, miss = 0
+      // ★ 0.9.42：暂存补写也走唯一入口 —— 全部入队后一次批量写 + 批量核身份；
+      //   每条结果从队列条目的 result 回读（queued / ok / fail / miss）。
+      const handles = []
       for (const w of same) {
-        // ★ 10-28 硬保护：每写一格前都核一次「还在不在目标表」——
-        //   自动补齐是定时器驱动的，写入过程中用户随时可能又切走；一旦切走立刻停，绝不多写一格。
+        // ★ 10-28 硬保护：写入过程中用户随时可能又切走；一旦切走立刻停，绝不多写一格。
         if (this.docKey() !== w.doc) break
-        // ★ 0.9.41 同一把尺：暂存的 row 可能隔了几十分钟，行被删/插/排过就弃写
-        //   （弃掉而不是留着——留着只会每 2.5 秒重试一次、每次都过不去）
-        if (!this.verifyRowIdentity(sheet, w.row, w.number, w.numCol)) {
-          miss++
-          this.markMisalign(null, w.row, w.numCol, `暂存结果 ${w.number} 对不上号`)
-          continue
+        const pseudo = {
+          number: w.number, numCol: w.numCol,
+          text: w.text, state: w.state === 'pending' ? 'ok' : (w.state || 'ok')
         }
-        const r = this.writeCell(sheet, w.row, w.outCol, w.text)
-        if (r && r.ok) {
+        handles.push({ w, h: this.writeRowChecked(sheet, w.row, w.outCol, w.text, w.number, w.numCol, pseudo) })
+      }
+      this.flushWrites()          // 补齐是用户明确要的动作 → 立刻落盘，不等攒批
+      for (const { w, h } of handles) {
+        const res = h && h.entry ? h.entry.result : 'fail'
+        if (res === 'ok') {
           ok++
           const it = this.items.find((x) => x.row === w.row)
           if (it) { it.text = w.text; it.state = w.state === 'pending' ? 'ok' : (w.state || 'ok') }
-        } else fail++
+        } else if (res === 'miss') miss++
+        else fail++
       }
       this.pendingWrites = other
       this.actionErr = fail || miss
@@ -1634,10 +2007,9 @@ export default {
         this.deferWrite(it, outCol)
         return
       }
-      const oldVal = this.readOne(sheet, row, outCol)
-      const oldStr = oldVal == null ? '' : String(oldVal).trim()
+      const oldStr = this.oldOutText(row, outCol)   // ★ 0.9.42：本轮开头整段读一次的快照，不再逐格读
       // 「未识别 / 未接入 / 暂无动态」是确定结论，可以写；其余失败一律不覆盖旧值
-      const definitive = definitiveNow || /未识别承运人|暂未接入|暂无动态/.test(it.text)
+      const definitive = definitiveNow || /未识别承运人|未接入追踪|未接入|暂无动态/.test(it.text)
       const transient = it.state === 'error' && !definitive
       if (transient && oldStr) {
         // 上一轮刷过的颜色可能已经过期（比如当时误判成到港）→ 清掉，别误导
@@ -1648,22 +2020,12 @@ export default {
         this.log(`R${row} 保留旧值（本次 ${this.shortReason(it.failReason)}）`)
         return
       }
-      const w = this.writeRowChecked(it, sheet, row, outCol, it.text)
+      // ★ 0.9.42 唯一写回入口：入队 → 批量核身份 → 批量写 → 批量读回；
+      //   着色也一并交给 _flushWriteQueue 按区段批量刷（这里不再逐行摸 Interior）。
+      const w = this.writeRowChecked(sheet, row, outCol, it.text, it.number, it.numCol, it)
       if (!w || !w.ok) {
-        if (w && w.skipped) return          // 错位跳过：已经记过账、给过提示，不算写入失败
         this.writeErr = '写入失败：' + (w ? w.error : '未知')
         this.log(`写 ${colLetter(outCol)}${row} 失败: ${w ? w.error : '未知'}`)
-      } else {
-        this.writeVia = w.via
-        this.writeErr = ''      // 写成功即清掉上一次的写入失败提示
-        // 里程碑底色：只有判出里程碑（1/2/3）才动颜色
-        // stage=0 表示「还没离起运港」——这时不刷色，避免把用户自己标的底色刷没了
-        // 只有「认得出起讫港 + 判出里程碑」才刷色；否则清掉上一轮刷的色（不然旧色赖着不走，看着乱七八糟）
-        if (it.state === 'ok' && it.stage > 0 && !it.inferred) {
-          this.applyStageColor(sheet, row, outCol, it.stage)
-        } else if (it.state === 'ok') {
-          this.clearOurColor(sheet, row)
-        }
       }
     },
 
@@ -1786,7 +2148,7 @@ export default {
       if (r.ok === false) {
         const raw = String(r.error || '查询失败')
         if (/Cannot tell which carrier|unknown-prefix|未识别/i.test(raw)) return '未识别承运人（可能是货代单）'
-        // 未接入追踪的船司（目前只有 OOCL）：官网挂了 Cloudflare + CargoSmart 滑块，自动化不可靠
+        // 官网只保留近 12 个月 / 单号不存在 → 统一按「查无」处理
         if (/仅保留 12 个月|DOCUMENT does not exist/i.test(raw)) {
           return notFoundText(r.carrier, CARRIER_NAME[r.carrier])
         }
@@ -1797,11 +2159,13 @@ export default {
           return 'AKK 查无此单（需 14 位提单号，箱号不能单独查）'
         }
         if (/no tracking module|not wired up for/i.test(raw)) {
-          return String(r.carrier || '').toLowerCase() === 'oocl'
-            ? 'OOCL 暂未接入（官网需滑块验证，请手工查）'
-            : '该船司暂未接入追踪'
+          return `${this.carrierLabel(r.carrier) || '该船司'} 未接入追踪（请手工查）`
         }
         if (/超时|timeout/i.test(raw)) return '查询超时（网络慢，稍后重试）'
+        // ★ 10-29：OOCL 匿名端点有 QF8 限流（连查 6-8 次会被封一阵）→ 如实说，别叫人反复重试
+        if (/限流|throttled|too many requests|访问过于频繁/i.test(raw)) {
+          return `${this.carrierLabel(r.carrier) || '船司'} 站方限流（过几分钟再查，别连续重试）`
+        }
         if (/HTTP 404|No tracking data found/i.test(raw)) {
           return notFoundText(r.carrier, CARRIER_NAME[r.carrier])
         }

@@ -280,9 +280,9 @@ async function page_setSel(p, col) {
   await ctx.close()
 }
 
-// ---------- H8 S/L 写了未接入船司（OOCL）→ 不发请求，直接给结论 ----------
+// ---------- H8 S/L 写了没有适配器的船司（SITC）→ 不发请求，直接给结论 ----------
 {
-  const grid = { '1,15': 'S/L', '1,16': 'MBL', '2,15': 'OOCL', '2,16': 'OOLU1234567890' }
+  const grid = { '1,15': 'S/L', '1,16': 'MBL', '2,15': 'SITC', '2,16': 'SITC12345678901' }
   const { ctx, page } = await open({ grid })
   await page.evaluate(() => { window.__sel = { col: 16, row: 1, rows: 1048576, cols: 1 } })
   await click(page, /选单号列/)
@@ -292,9 +292,30 @@ async function page_setSel(p, col) {
   await waitIdle(page, 15000)
   const calls = await page.evaluate(() => window.__calls)
   const wrote = await page.evaluate(() => Object.entries(window.__grid).filter(([k]) => k.endsWith(',19')).map(([, v]) => v))
-  const noTrack = !calls.some((u) => u.includes('/track?number=OOLU'))
-  const msg = /暂未接入/.test(wrote.join(' '))
+  const noTrack = !calls.some((u) => u.includes('/track?number=SITC'))
+  const msg = /未接入追踪/.test(wrote.join(' '))
   pass('H8 未接入船司直接给结论', noTrack && msg, `未发 /track=${noTrack}；写入="${wrote.join(' | ')}"`)
+  await ctx.close()
+}
+
+// ---------- H8b S/L 写了 OOCL（已接入）→ 照常查，绝不再出现「暂未接入/需滑块验证」----------
+{
+  const grid = { '1,15': 'S/L', '1,16': 'MBL', '2,15': 'OOCL', '2,16': 'OOLU1234567890' }
+  const { ctx, page } = await open({ grid })
+  await page.evaluate(() => { window.__sel = { col: 16, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选单号列/)
+  await page.evaluate(() => { window.__sel = { col: 19, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选输出列/)
+  await tryRun(page)
+  await waitIdle(page, 15000)
+  const calls = await page.evaluate(() => window.__calls)
+  const wrote = await page.evaluate(() => Object.entries(window.__grid).filter(([k]) => k.endsWith(',19')).map(([, v]) => v))
+  const tracked = calls.some((u) => u.includes('/track?number=OOLU1234567890') && u.includes('carrier=oocl'))
+  const stale = /暂未接入|滑块|验证码/.test(wrote.join(' '))
+  // 反向断言：必须真的发出了查询并写回一行结果，防「什么都不做也算通过」
+  const gotResult = wrote.length > 0 && /离港|装船|到港|QINGDAO|ISTANBUL/i.test(wrote.join(' '))
+  pass('H8b OOCL 已接入照常查（旧「未接入/需滑块」文案已清）', tracked && !stale && gotResult,
+    `发 /track?carrier=oocl=${tracked}；旧文案残留=${stale}；写入="${wrote.join(' | ')}"`)
   await ctx.close()
 }
 
@@ -640,6 +661,53 @@ function auditWrites(written, gridAfter, numCol, outCol) {
   pass('H23 单号列为空的行保持空（范围里的空行 + 跑到一半被清空的行）',
     bad.length === 0 && hint && emptyRowsTouched.length === 0 && okRows.length >= 2,
     `写入 ${n} 格；空行被写=${JSON.stringify(emptyRowsTouched)}（必须空）；正常行写入=${JSON.stringify(okRows)}；冲突 ${bad.length}${bad.length ? '：' + bad.join('；') : ''}\n     横幅="${b}"`)
+  await ctx.close()
+}
+
+// ---------- H24 批量写路径：删中间一行 → 一格都不许写到错位行（且确实走了批量写）----------
+// 和 H22 的区别：H22 只有 1 格合法写入（都在删除点上方），根本走不到批量写。
+// 这条把删除点放在数据区偏下（第 9 行）：前一批（2–5 行）批量写落地，后一批里 6–8 行仍然合法（也批量写），
+// 第 9 行及以下被顶下来的行必须一格不写 —— 批量写如果漏了身份校验，就会整段写错行。
+{
+  const grid = { '1,17': 'MBL' }
+  const nums = []
+  for (let i = 0; i < 11; i++) nums.push('TEST-BL-' + String(201 + i).padStart(4, '0'))   // 第 2–12 行（补齐 4 位：单号形态筛要求字母≥2、数字≥4）
+  nums.forEach((n, i) => { grid[`${i + 2},17`] = n })
+  const evBy = {}
+  nums.forEach((n) => { const k = n.replace(/-/g, ''); evBy[k] = [{ time: '2026-10-01T00:00:00Z', activity: 'Departure From', city: k }] })
+  const { ctx, page } = await open({ grid, lead: 900, last: 13 })
+  await page.evaluate((e) => { window.__evByNumber = e }, evBy)
+  await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选单号列/)
+  await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选输出列/)
+  await tryRun(page)
+  // 等第一批（2–5 行）真的批量写进表，再删行 —— 这样「批量写」这条路确实被走过
+  let firstBatch = false
+  for (let i = 0; i < 60; i++) {
+    await page.waitForTimeout(100)
+    firstBatch = await page.evaluate(() => (window.__batchWrites || []).some((b) => b.rows > 1))
+    if (firstBatch) break
+  }
+  await page.evaluate(() => window.__deleteRow(9))     // 数据区中间删一行：下面整体上移
+  await waitIdle(page, 40000)
+  await page.waitForTimeout(500)
+  const gridAfter = await page.evaluate(() => window.__grid)
+  const written = await page.evaluate(() => window.__written)
+  const batchWrites = await page.evaluate(() => window.__batchWrites || [])
+  const stats = await page.evaluate(() => window.__SHIPTRACK_STATS__ || null)
+  const { n, bad } = auditWrites(written, gridAfter, 17, 18)
+  const b = await banner(page)
+  const hint = /错位|表格行变了/.test(b)
+  const multi = batchWrites.filter((x) => x.rows > 1)
+  const maxRun = batchWrites.reduce((m, x) => Math.max(m, x.rows), 0)
+  // 反向断言：删除点上方仍该照写（证明校验没变成「一律不写」）
+  const okRows = written.filter(([r, c]) => c === 18 && normNum(gridAfter[`${r},17`])).map(([r]) => r)
+  const touchedAfterDelete = written.filter(([r, c]) => c === 18 && r >= 9).map(([r]) => r)
+  pass('H24 批量写路径下删中间一行 → 不写错位行（且确实用到批量写）',
+    firstBatch && multi.length >= 1 && maxRun >= 2 && bad.length === 0 && hint && okRows.length >= 3,
+    `批量写 ${batchWrites.length} 次（多行段 ${multi.length} 个，最大段长 ${maxRun}）· 写入 ${n} 格 · 合法行=${JSON.stringify(okRows)} · 删除点及以下被写=${JSON.stringify(touchedAfterDelete)} · 冲突 ${bad.length}${bad.length ? '：' + bad.join('；') : ''}`
+      + `\n     写回统计=${JSON.stringify(stats)}\n     横幅="${b}"`)
   await ctx.close()
 }
 

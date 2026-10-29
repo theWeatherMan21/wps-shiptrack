@@ -32,7 +32,7 @@ run "单测：里程碑/颜色"     "$ADDON" node scripts/milestone-test.mjs
 run "不变量：计划≠事实"      "$ADDON" node scripts/invariants-test.mjs
 run "单测：表头识别"        "$ADDON" node scripts/headers-test.mjs
 run "单测：ribbon"          "$ADDON" node scripts/ribbon-test.mjs
-run "探针：状态机 H1-H23"   "$ADDON" node scripts/state-probe.mjs
+run "探针：状态机 H1-H24"   "$ADDON" node scripts/state-probe.mjs
 if [ "${1:-}" != "--fast" ]; then
 run "探针：审计 A-G"        "$ADDON" node scripts/audit-probe.mjs all
 fi
