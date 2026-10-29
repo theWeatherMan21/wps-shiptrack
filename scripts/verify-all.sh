@@ -4,13 +4,24 @@
 # 因为此前每次改动只挑相关探针跑，问题靠运气被某个探针撞见。
 # 现在改完必须整条跑一遍，任何一项红都不算交付。
 #
-#   用法: scripts/verify-all.sh [--fast]
-#     --fast  跳过 audit-probe（比较慢）
+#   用法: scripts/verify-all.sh [--fast] [--smoke]
+#     --fast   跳过 audit-probe（比较慢）
+#     --smoke  状态机探针只跑冒烟 5 条（每轮回归用，<60s）；
+#              发布前请不带 --smoke 跑全量 33 条
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ADDON="$ROOT"
 export NODE_PATH="${NODE_PATH:-$(npm root -g 2>/dev/null)}"
 FAIL=0
+FAST=0
+PROBE_ARG=""
+for a in "$@"; do
+  case "$a" in
+    --fast)  FAST=1 ;;
+    --smoke) PROBE_ARG="--smoke" ;;
+    *) printf '未知参数：%s（支持 --fast / --smoke）\n' "$a" >&2; exit 2 ;;
+  esac
+done
 declare -a RESULTS
 
 run() { # run <名字> <目录> <命令...>
@@ -32,8 +43,12 @@ run "单测：里程碑/颜色"     "$ADDON" node scripts/milestone-test.mjs
 run "不变量：计划≠事实"      "$ADDON" node scripts/invariants-test.mjs
 run "单测：表头识别"        "$ADDON" node scripts/headers-test.mjs
 run "单测：ribbon"          "$ADDON" node scripts/ribbon-test.mjs
-run "探针：状态机 H1-H31"   "$ADDON" node scripts/state-probe.mjs
-if [ "${1:-}" != "--fast" ]; then
+if [ -n "$PROBE_ARG" ]; then
+run "探针：状态机冒烟（H3/H4b/H22/H23/H31）" "$ADDON" node scripts/state-probe.mjs "$PROBE_ARG"
+else
+run "探针：状态机 H1-H31（全量）" "$ADDON" node scripts/state-probe.mjs
+fi
+if [ "$FAST" -eq 0 ]; then
 run "探针：审计 A-G"        "$ADDON" node scripts/audit-probe.mjs all
 fi
 run "渲染冒烟（无 pageerror / 按钮齐全）" "$ROOT" node scripts/render-smoke.mjs

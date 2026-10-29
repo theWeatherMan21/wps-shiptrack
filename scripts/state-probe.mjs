@@ -1,6 +1,7 @@
 // 状态机探针（无头）：把面板当成状态机，逐条走「异常路径」，断言 UI 与副作用
 // 目的：消灭「提示粘住 / 无反馈 / 无出路」这类蠢问题
 import { createRequire } from 'node:module'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import path from 'node:path'
 import fs from 'node:fs'
 
@@ -31,8 +32,47 @@ await new Promise((r) => srv.listen(0, '127.0.0.1', r))
 const URL0 = `http://127.0.0.1:${srv.address().port}/index.html#/taskpane`
 
 const browser = await chromium.launch({ headless: true, channel: 'chrome' })
+const T_START = Date.now()
 const results = []
-const pass = (n, ok, d) => { results.push([n, ok]); console.log(`${ok ? '✅' : '❌'} ${n}\n     ${d}`) }
+const pass = (n, ok, d) => { results.push([n, ok]); out(`${ok ? '✅' : '❌'} ${n}\n     ${d}`) }
+
+// ---------- 分层：冒烟 5 条（每轮回归） / 全量 33 条（发布前）----------
+// 只决定「跑哪些、并发怎么排」，断言判定逻辑一行不动（H 编号原样保留）。
+//   默认 / --full  → 全量 33 条，逐条串行（与分层前完全一致）
+//   --smoke        → 只跑下面这 5 条关键路径，按 SMOKE_PLAN 分组：组内并行、组间串行
+const MODE = process.argv.includes('--smoke') ? 'smoke' : 'full'
+const SMOKE_IDS = ['H3', 'H4b', 'H22', 'H23', 'H31']
+// 为什么分组：5 条串行约 59s，贴着 60s 上限一撞就超；并行不改变任何断言条件
+// （每条自有浏览器上下文，lead/超时都由桩控制），只是把「等网络」的时间叠起来。
+// H31 单独一组：它的断言要采样主线程心跳间隔（<400ms），不跟别人抢 CPU。
+const SMOKE_PLAN = [['H4b', 'H22', 'H23'], ['H3'], ['H31']]
+const timings = []
+const skipped = []
+const queued = new Map()
+// 并行时先攒一个段自己的输出，跑完按 H 编号顺序打印（AsyncLocalStorage：并行段的 sink 互不串）
+const als = new AsyncLocalStorage()
+const out = (s) => { const store = als.getStore(); if (store) store.push(s); else console.log(s) }
+async function runSeg(id, fn) {
+  const before = results.length
+  const lines = []
+  const t0 = Date.now()
+  try {
+    await als.run(lines, () => fn())
+  } catch (e) {
+    lines.forEach((l) => console.log(l))   // 出错也要先把已产出的行吐出来，别吞证据
+    throw e
+  }
+  timings.push([id, Date.now() - t0, results.length - before])
+  return lines
+}
+async function seg(id, fn) {
+  if (MODE === 'smoke') {                    // 冒烟：先登记，末尾按计划执行
+    if (SMOKE_IDS.includes(id)) queued.set(id, fn)
+    else skipped.push(id)
+    return
+  }
+  for (const line of await runSeg(id, fn)) console.log(line)
+}
 
 import { STUB } from './lib/wps-stub.mjs'
 
@@ -93,7 +133,7 @@ const checkSheet = (writes, grid, numCol, outCol) => {
 }
 
 // ---------- H1 写入被拒：横幅说明 + 不丢数据 ----------
-{
+await seg('H1', async () => {
   const { ctx, page } = await open()
   await click(page, /选单号列/)
   await page.evaluate(() => { window.__writeBlock = true })
@@ -105,10 +145,10 @@ const checkSheet = (writes, grid, numCol, outCol) => {
   const w = await page.evaluate(() => window.__written.length)
   pass('H1 写入被拒 → 有提示且不假装成功', /写入失败|写不进去/.test(b) && w === 0, `横幅="${b}" 写入次数=${w}`)
   await ctx.close()
-}
+})
 
 // ---------- H2 只读工作簿：提前拦住，不写格 ----------
-{
+await seg('H2', async () => {
   const { ctx, page } = await open()
   await page.evaluate(() => { window.__readonly = true })
   await click(page, /选单号列/)
@@ -120,10 +160,10 @@ const checkSheet = (writes, grid, numCol, outCol) => {
   const w = await page.evaluate(() => window.__written.length)
   pass('H2 只读工作簿 → 明确提示且零写入', /只读/.test(b) && w === 0, `横幅="${b}" 写入次数=${w}`)
   await ctx.close()
-}
+})
 
 // ---------- H3 桥断开 → 重连后横幅自动消失 ----------
-{
+await seg('H3', async () => {
   const { ctx, page } = await open()
   await click(page, /选单号列/)
   await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
@@ -140,12 +180,12 @@ const checkSheet = (writes, grid, numCol, outCol) => {
   const b2 = await banner(page)
   pass('H3 桥掉线提示 → 重连后自动消失', /没在跑/.test(b1) && !/没在跑/.test(b2), `断开时="${b1}" 重连后="${b2 || '(无)'}"`)
   await ctx.close()
-}
+})
 
 // ---------- H4 (b) 现场：非活动表摸不到 → 不中止、不写错表、切回自动补齐 ----------
 // ★ 0.9.43：多表并行后「切表能不能继续写」取决于 WPS 版本（(a)/(b)）。
 // 这条专测保守路径：__crossSheetBlock = true（写非活动表抛错）→ 必须自动回落「攒着等切回」。
-{
+await seg('H4', async () => {
   const { ctx, page } = await open({ lead: 3000 })
   await page.evaluate(() => { window.__crossSheetBlock = true })
   const doc0 = await page.evaluate(() => window.__doc)
@@ -182,12 +222,12 @@ const checkSheet = (writes, grid, numCol, outCol) => {
   pass('H4 查询中切表 → 不中止、不写错表、切回补齐', ok,
     `切表前 ${wrAtSwitch} → 切表后 ${wrAfterSwitch}（允许 +1 在飞）→ 稳定后 ${wrSettled}（必须不动）→ 补齐后 ${wrFlushed} 格；按钮=${hasFlushBtn} 待补行=${pendingRows} 补完残留=${stillPending}`)
   await ctx.close()
-}
+})
 
 // ---------- H4b 整轮没跑完、切回原表 → 自己补上，一下都不点 ----------
 // 这条才是「拦住 autoFlush 被 busy 挡住」的用例：H4 会点按钮，手动路径也能过，
 // 所以 H4 单独存在时拦不住那个 bug（红-绿证明见 wps-addon 技能验收段）。
-{
+await seg('H4b', async () => {
   const grid = {}
   // 16 行 = 4 批：前两批完成时后两批还在跑 → 既能攒到 pending，整轮又没结束
   const nums = ['900000009', '802735343', '802735426', '900000010', '900000011', '900000012', '900000013', '900000014',
@@ -238,10 +278,10 @@ const checkSheet = (writes, grid, numCol, outCol) => {
   pass('H4b 整轮未跑完时切回 → 自动补齐（不点按钮）', ok,
     `切走期间待补=${pendingBefore} 写入=${wrBeforeBack} → 切回后待补=${pendingAfter} 写入=${wrAfterAuto} · 整轮仍在跑=${stillRunning}`)
   await ctx.close()
-}
+})
 
 // ---------- H5 停止：未查的行标「已停止」 ----------
-{
+await seg('H5', async () => {
   // 关键：号码数要大于并发数（4），否则根本来不及有"排队的行"
   const grid = {}
   const nums = ['900000009', '802735343', '802735426', '900000010', '900000011', '900000012', '900000013', '900000014']
@@ -259,10 +299,10 @@ const checkSheet = (writes, grid, numCol, outCol) => {
   const hasStop = /已停止/.test(t), hasRunning = /查询中/.test(t)
   pass('H5 停止后不留「查询中…」', !hasRunning && hasStop, `已停止=${hasStop} 查询中=${hasRunning}`)
   await ctx.close()
-}
+})
 
 // ---------- H6 两个文档的配置互不覆盖 ----------
-{
+await seg('H6', async () => {
   const ctx = await browser.newContext({ viewport: { width: 520, height: 820 } })
   await ctx.exposeFunction('noop', () => {})
   const mk = async (doc) => {
@@ -291,14 +331,14 @@ const checkSheet = (writes, grid, numCol, outCol) => {
   const hasO = /单号列 O/.test(aText)
   pass('H6 多文档配置互不覆盖', hasO, `重新打开 A 后配置：${aText.replace(/\n/g, ' | ').slice(0, 90) || '(空)'}`)
   await ctx.close()
-}
+})
 
 async function page_setSel(p, col) {
   await p.evaluate((c) => { window.__sel = { col: c, row: 1, rows: 1048576, cols: 1 } }, col)
 }
 
 // ---------- H7 复合单号 + S/L 船司列（爹地表里的真实形态）----------
-{
+await seg('H7', async () => {
   const grid = {
     '1,15': 'S/L', '1,16': 'MBL',
     '2,15': 'HPL SOC', '2,16': '11527275/HLCTSTU09000025E7XX',
@@ -323,10 +363,10 @@ async function page_setSel(p, col) {
   pass('H7 复合单号拆分 + S/L 自动认列', splitOk && hapagOk && autoCol,
     `自动认列=${autoCol}；拆分=${splitOk}；HPL 行都用 hapag=${hapagOk}\n     track 调用: ${JSON.stringify(track.map((u) => u.replace(/^.*\/track\?/, '')).slice(0, 4))}`)
   await ctx.close()
-}
+})
 
 // ---------- H8 S/L 写了没有适配器的船司（SITC）→ 不发请求，直接给结论 ----------
-{
+await seg('H8', async () => {
   const grid = { '1,15': 'S/L', '1,16': 'MBL', '2,15': 'SITC', '2,16': 'SITC12345678901' }
   const { ctx, page } = await open({ grid })
   await page.evaluate(() => { window.__sel = { col: 16, row: 1, rows: 1048576, cols: 1 } })
@@ -341,10 +381,10 @@ async function page_setSel(p, col) {
   const msg = /未接入追踪/.test(wrote.join(' '))
   pass('H8 未接入船司直接给结论', noTrack && msg, `未发 /track=${noTrack}；写入="${wrote.join(' | ')}"`)
   await ctx.close()
-}
+})
 
 // ---------- H8b S/L 写了 OOCL（已接入）→ 照常查，绝不再出现「暂未接入/需滑块验证」----------
-{
+await seg('H8b', async () => {
   const grid = { '1,15': 'S/L', '1,16': 'MBL', '2,15': 'OOCL', '2,16': 'OOLU1234567890' }
   const { ctx, page } = await open({ grid })
   await page.evaluate(() => { window.__sel = { col: 16, row: 1, rows: 1048576, cols: 1 } })
@@ -362,10 +402,10 @@ async function page_setSel(p, col) {
   pass('H8b OOCL 已接入照常查（旧「未接入/需滑块」文案已清）', tracked && !stale && gotResult,
     `发 /track?carrier=oocl=${tracked}；旧文案残留=${stale}；写入="${wrote.join(' | ')}"`)
   await ctx.close()
-}
+})
 
 // ---------- H9 先点②再点①：全程不该出现红条（点错列只是短暂提示）----------
-{
+await seg('H9', async () => {
   const { ctx, page } = await open()
   await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
   await click(page, /选输出列/)
@@ -380,10 +420,10 @@ async function page_setSel(p, col) {
   pass('H9 先②后①全程无红条', afterOut === '' && afterNum === '' && /② 输出列/.test(steps) && /| R|/.test(steps),
     `点②后横幅="${afterOut || '(无)'}"；点①后横幅="${afterNum || '(无)'}"\n     三步清单="${steps.replace(/\n/g, ' | ')}"`)
   await ctx.close()
-}
+})
 
 // ---------- H10 订舱号/提单号同格：提单号查无 → 自动换订舱号再试 ----------
-{
+await seg('H10', async () => {
   const grid = { '1,15': 'S/L', '1,16': 'MBL', '2,15': 'HPL COC', '2,16': '38095103/HLCTSTU9000026ABFXX' }
   const { ctx, page } = await open({ grid })
   await page.evaluate(() => { window.__sel = { col: 16, row: 1, rows: 1048576, cols: 1 } })
@@ -398,10 +438,10 @@ async function page_setSel(p, col) {
   pass('H10 提单号查无→自动换订舱号', triedBoth && /·/.test(wrote),
     `两次查询=${calls.length}（${calls.map((u) => (u.match(/number=([^&]+)/) || [])[1]).join(' → ')}）；写入="${wrote}"`)
   await ctx.close()
-}
+})
 
 // ---------- H11 里程碑着色：在途蓝 / 到港绿 / 还空灰 ----------
-{
+await seg('H11', async () => {
   const got = {}
   for (const kind of ['at_sea', 'arrived', 'empty']) {
     const grid = {
@@ -425,10 +465,10 @@ async function page_setSel(p, col) {
   const ok = got.at_sea === 0xcfe3fa && got.arrived === 0xd5f0dc && got.empty === 0xe6e6e6
   pass('H11 里程碑着色（蓝/绿/灰）', ok,
     `在途=${hex(got.at_sea)}（应 0xcfe3fa） · 到港=${hex(got.arrived)}（应 0xd5f0dc） · 还空=${hex(got.empty)}（应 0xe6e6e6）`)
-}
+})
 
 // ---------- H12 重启后自动恢复列设置（不再每次重选）----------
-{
+await seg('H12', async () => {
   const grid = { '1,15': 'S/L', '1,16': 'MBL', '1,17': 'V/V', '1,19': '' }
   const savedCfg = { numberCol: 16, outCol: 19, startRow: 1, rows: 6, mode: 'column', carrierCol: 15 }
   const { ctx, page } = await open({ grid, savedCfg })
@@ -437,10 +477,10 @@ async function page_setSel(p, col) {
   const ok = /① 单号列/.test(steps) && /P/.test(steps) && /② 输出列/.test(steps) && /S/.test(steps)
   pass('H12 重启后自动恢复列设置', ok, `未点任何按钮时的三步清单：${steps.replace(/\n/g, ' | ')}`)
   await ctx.close()
-}
+})
 
 // ---------- H13 单行多列 2D 表头（WPS 真实形态）也要认出 POL/POD ----------
-{
+await seg('H13', async () => {
   const grid = { '1,9': 'POL', '1,10': 'POD', '1,14': 'S/L', '1,15': 'MBL',
                  '2,9': 'TIANJIN', '2,10': 'GDANSK', '2,14': 'MSK', '2,15': '900000009' }
   const { ctx, page } = await open({ grid, header2d: true })
@@ -452,10 +492,10 @@ async function page_setSel(p, col) {
   const ok = !!m && /I\s*\/\s*J/.test(m[1])
   pass('H13 单行多列(2D)表头仍能认出 POL/POD', ok, ok ? '起运 I / 目的 J' : String(m ? m[1] : '未找到该行'))
   await ctx.close()
-}
+})
 
 // ---------- H14 没查到结果 → 自动重查 ----------
-{
+await seg('H14', async () => {
   const grid = { '1,14': 'S/L', '1,15': 'MBL', '2,15': 'ONEY0000000001' }
   const { ctx, page } = await open({ grid })
   await page.evaluate(() => {
@@ -477,10 +517,10 @@ async function page_setSel(p, col) {
   pass('H14 查不到→30 分钟后自动重查', calls2 > calls1,
     `请求次数 ${calls1}→${calls2}\n     日志=${afterRetry.slice(-260).replace(/\n/g, ' | ')}`)
   await ctx.close()
-}
+})
 
 // ---------- H15 表格有 ETD/ETA 列 → 用真实船期覆盖 ----------
-{
+await seg('H15', async () => {
   const grid = { '1,14': 'ETD', '1,15': 'ETA', '1,16': 'S/L', '1,17': 'MBL',
                  '2,14': '1-Nov', '2,15': '30-Nov', '2,16': 'HPL', '2,17': 'ONEY0000000002' }
   const { ctx, page } = await open({ grid })
@@ -503,10 +543,10 @@ async function page_setSel(p, col) {
   pass('H15 ETD/ETA 列被真实船期覆盖', /2026-10-03/.test(etd) && /2026-11-01/.test(eta),
     `ETD=${etd} ETA=${eta} 输出列=${outText}\n     尾巴=${bodyTxt}`)
   await ctx.close()
-}
+})
 
 // ---------- H16 选完列不许自己开跑（0.9.23 回归） ----------
-{
+await seg('H16', async () => {
   const grid = { '1,16': 'S/L', '1,17': 'MBL', '2,17': 'ONEY0000000003' }
   const { ctx, page } = await open({ grid })
   await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })
@@ -520,10 +560,10 @@ async function page_setSel(p, col) {
   const calls2 = await page.evaluate(() => (window.__calls || []).filter((u) => u.includes('/track')).length)
   pass('H16 选完两列不自动开跑，按③才查', calls1 === 0 && calls2 > 0, `点②后请求=${calls1}，点③后=${calls2}`)
   await ctx.close()
-}
+})
 
 // ---------- H17 双列：先查提单号，查无再查订舱号 ----------
-{
+await seg('H17', async () => {
   // A：提单号有动态（10-01），订舱号更新的（11-20）→ 仍用提单号，且只发 1 个请求
   const grid = { '1,17': '提单号', '1,19': '订舱号', '2,17': 'ONEY0000000010', '2,19': 'ONEY0000000011' }
   const { ctx, page } = await open({ grid })
@@ -544,8 +584,8 @@ async function page_setSel(p, col) {
   const calls = await page.evaluate(() => (window.__calls || []).filter((u) => u.includes('/track')).length)
   pass('H17 提单号有动态 → 不再查订舱号', /2026-10-01/.test(out) && calls === 1, `输出=${out} 请求=${calls}`)
   await ctx.close()
-}
-{
+})
+await seg('H17b', async () => {
   // B：提单号查无动态，订舱号有 → 自动补查订舱号
   const grid = { '1,17': '提单号', '1,19': '订舱号', '2,17': 'ONEY0000000020', '2,19': 'ONEY0000000021' }
   const { ctx, page } = await open({ grid })
@@ -565,10 +605,10 @@ async function page_setSel(p, col) {
   const calls = await page.evaluate(() => (window.__calls || []).filter((u) => u.includes('/track')).length)
   pass('H17b 提单号查无 → 自动补查订舱号', /2026-11-20/.test(out) && calls >= 2, `输出=${out} 请求=${calls}`)
   await ctx.close()
-}
+})
 
 // ---------- H18 港口列已识别也不能跳过「单号两列」识别 ----------
-{
+await seg('H18', async () => {
   const grid = { '1,3': '起运港', '1,4': '目的港', '1,9': '提单号', '1,11': '订舱号',
                  '2,3': 'SHANGHAI', '2,4': 'GDANSK', '2,9': 'ONEY0000000030', '2,11': '42084242' }
   const { ctx, page } = await open({ grid })
@@ -588,10 +628,10 @@ async function page_setSel(p, col) {
   const calls = await page.evaluate(() => (window.__calls || []).filter((u) => u.includes('/track')).length)
   pass('H18 港口列已认出时仍识别订舱号列并补查', /2026-11-20/.test(out) && calls >= 2, `输出=${out} 请求=${calls}`)
   await ctx.close()
-}
+})
 
 // ---------- H19 桥进程没起：横幅必须说「进程没在跑」并给可复制的启动命令 ----------
-{
+await seg('H19', async () => {
   const { ctx, page } = await open({ bridgeMode: 'down' })
   await page.waitForTimeout(600)
   const b = await banner(page)
@@ -601,25 +641,25 @@ async function page_setSel(p, col) {
     /进程没在跑/.test(b) && /8791/.test(b) && /bridge\.sh start|start-win\.ps1/.test(b) && hasPing > 0 && hasCopy > 0,
     `横幅="${b}" 重连按钮=${hasPing} 复制按钮=${hasCopy}`)
   await ctx.close()
-}
+})
 
 // ---------- H20 桥活着但自报 ok:false → 原样转述桥的原因，不误报「没在跑」 ----------
-{
+await seg('H20', async () => {
   const { ctx, page } = await open({ bridgeMode: 'denied' })
   await page.waitForTimeout(600)
   const b = await banner(page)
   pass('H20 桥返回 ok:false → 转述桥自报原因', /只接受本机页面调用/.test(b) && !/进程没在跑/.test(b), `横幅="${b}"`)
   await ctx.close()
-}
+})
 
 // ---------- H21 端口通但请求被拦 → 说「加载项被拦」，与「没在跑」区分 ----------
-{
+await seg('H21', async () => {
   const { ctx, page } = await open({ bridgeMode: 'blocked' })
   await page.waitForTimeout(600)
   const b = await banner(page)
   pass('H21 端口通但请求被拦 → 说「加载项被拦」', /加载项被拦/.test(b) && !/进程没在跑/.test(b), `横幅="${b}"`)
   await ctx.close()
-}
+})
 
 // ---------- 行身份审计（H22/H23 共用）----------
 // 判据不看读回值，只看「写动作落在哪一格」：每条写入的 row，删行之后该行单号列必须还是它的单号。
@@ -641,7 +681,7 @@ function auditWrites(written, gridAfter, numCol, outCol) {
 }
 
 // ---------- H22 查询跑到一半删掉中间一行 → 绝不许写到单号对不上的行 ----------
-{
+await seg('H22', async () => {
   const grid = { '1,17': 'MBL' }
   const nums = ['TEST-BL-0001', 'TEST-BL-0002', 'TEST-BL-0003', 'TEST-BL-0004', 'TEST-BL-0005', 'TEST-BL-0006']
   nums.forEach((n, i) => { grid[`${i + 2},17`] = n })
@@ -671,10 +711,10 @@ function auditWrites(written, gridAfter, numCol, outCol) {
   pass('H22 查询中删一行 → 不写错位行 + 有错位提示', bad.length === 0 && hint,
     `删行后单号列 ${after}；写入 ${n} 格；冲突 ${bad.length}${bad.length ? '：' + bad.join('；') : ''}\n     横幅="${b}"`)
   await ctx.close()
-}
+})
 
 // ---------- H23 单号列是空行的格 → 无论如何保持空（含跑到一半被清空的行）----------
-{
+await seg('H23', async () => {
   // 第 4 行单号列故意空着（真实表里 115–127 就是这种）；第 3 行跑到一半被清空
   const grid = { '1,17': 'MBL', '2,17': 'TEST-BL-0011', '3,17': 'TEST-BL-0012', '5,17': 'TEST-BL-0013', '6,17': 'TEST-BL-0014' }
   const evBy = {}
@@ -707,13 +747,13 @@ function auditWrites(written, gridAfter, numCol, outCol) {
     bad.length === 0 && hint && emptyRowsTouched.length === 0 && okRows.length >= 2,
     `写入 ${n} 格；空行被写=${JSON.stringify(emptyRowsTouched)}（必须空）；正常行写入=${JSON.stringify(okRows)}；冲突 ${bad.length}${bad.length ? '：' + bad.join('；') : ''}\n     横幅="${b}"`)
   await ctx.close()
-}
+})
 
 // ---------- H24 批量写路径：删中间一行 → 一格都不许写到错位行（且确实走了批量写）----------
 // 和 H22 的区别：H22 只有 1 格合法写入（都在删除点上方），根本走不到批量写。
 // 这条把删除点放在数据区偏下（第 9 行）：前一批（2–5 行）批量写落地，后一批里 6–8 行仍然合法（也批量写），
 // 第 9 行及以下被顶下来的行必须一格不写 —— 批量写如果漏了身份校验，就会整段写错行。
-{
+await seg('H24', async () => {
   const grid = { '1,17': 'MBL' }
   const nums = []
   for (let i = 0; i < 11; i++) nums.push('TEST-BL-' + String(201 + i).padStart(4, '0'))   // 第 2–12 行（补齐 4 位：单号形态筛要求字母≥2、数字≥4）
@@ -754,12 +794,12 @@ function auditWrites(written, gridAfter, numCol, outCol) {
     `批量写 ${batchWrites.length} 次（多行段 ${multi.length} 个，最大段长 ${maxRun}）· 写入 ${n} 格 · 合法行=${JSON.stringify(okRows)} · 删除点及以下被写=${JSON.stringify(touchedAfterDelete)} · 冲突 ${bad.length}${bad.length ? '：' + bad.join('；') : ''}`
       + `\n     写回统计=${JSON.stringify(stats)}\n     横幅="${b}"`)
   await ctx.close()
-}
+})
 
 // ---------- H26 同一工作簿两张表并行：(a) 现场（能写非活动表）----------
 // 爹地 2026-10-29 的原始诉求：A 表在跑，切到 B 表还能再点，两批一起推进、各自进度、互不阻塞。
 // 判据：① 采样到两批同时 running 且都在推进；② 每张表的写入只落在自己的表、且行号与单号对得上（零串表）。
-{
+await seg('H26', async () => {
   const N = 8
   const gridA = { '1,17': 'MBL' }, gridB = { '1,17': 'MBL' }
   const numA = [], numB = [], evBy = {}
@@ -813,11 +853,11 @@ function auditWrites(written, gridAfter, numCol, outCol) {
     + `\n     Sheet1 写入 ${auditA.n} 格、Sheet2 写入 ${auditB.n} 格 · 串表/错位 ${auditA.bad.length + auditB.bad.length}`
     + `${[...auditA.bad, ...auditB.bad].slice(0, 3).join('；')} · 跨表写 ${JSON.stringify({ ok: cross.ok, fail: cross.fail })}`)
   await ctx.close()
-}
+})
 
 // ---------- H27 (b) 现场：非活动表摸不到 → 自动回落「攒着等切回」，切回去自动补 ----------
 // 这是 (a)/(b) 自答的实测口：crossSheetWrite.fail > 0 就说明这个 WPS 版本是 (b)，代码已在保守路径上。
-{
+await seg('H27', async () => {
   const N = 6
   const gridA = { '1,17': 'MBL' }, gridB = { '1,17': 'MBL' }
   const evBy = {}
@@ -864,10 +904,10 @@ function auditWrites(written, gridAfter, numCol, outCol) {
     + ` · 切回后 Sheet1 写入 ${auditA.n} 格 / Sheet2 ${auditB.n} 格 · 残留待补=${pendingAfter} · 串表/错位 ${auditA.bad.length + auditB.bad.length}`
     + `${[...auditA.bad, ...auditB.bad].slice(0, 3).join('；')}`)
   await ctx.close()
-}
+})
 
 // ---------- H28 两批并发 + 中途来回切表 → 零错位、零串表 ----------
-{
+await seg('H28', async () => {
   const N = 6
   const gridA = { '1,17': 'MBL' }, gridB = { '1,17': 'MBL' }
   const evBy = {}
@@ -912,10 +952,10 @@ function auditWrites(written, gridAfter, numCol, outCol) {
     + ` · Sheet1 写入 ${auditA.n} 格 / Sheet2 ${auditB.n} 格 · 串表/错位 ${auditA.bad.length + auditB.bad.length}`
     + `${[...auditA.bad, ...auditB.bad].slice(0, 3).join('；')}`)
   await ctx.close()
-}
+})
 
 // ---------- H29 同一张表两批 → 后写覆盖前写，无重复残留 ----------
-{
+await seg('H29', async () => {
   const N = 4
   const grid = { '1,17': 'MBL' }
   for (let i = 0; i < N; i++) grid[`${i + 2},17`] = 'TEST-BL-A' + String(i + 1).padStart(4, '0')
@@ -941,10 +981,10 @@ function auditWrites(written, gridAfter, numCol, outCol) {
     `批次=${JSON.stringify(final.map((b) => [b.state, b.done + '/' + b.total]))} · 后一批结果全落表=${allNew}（应 true）`
     + ` · 旧值残留=${!noOld}（应 false）· 单号列未被改动=${identity}\n     写回内容=${JSON.stringify(vals.map((v) => v.slice(0, 28)))}`)
   await ctx.close()
-}
+})
 
 // ---------- H30 失败隔离：一批造错，另一批仍然全部成功 ----------
-{
+await seg('H30', async () => {
   const N = 4
   const gridA = { '1,17': 'MBL' }, gridB = { '1,17': 'MBL' }
   for (let i = 0; i < N; i++) {
@@ -986,7 +1026,7 @@ function auditWrites(written, gridAfter, numCol, outCol) {
   pass('H30 一批故意造错，另一批仍全部成功（失败隔离）', bothDone && bAllOk && aNoSuccess && noCross,
     `批次=${JSON.stringify(final.map((b) => [b.doc, b.state, b.done + '/' + b.total]))} · 出错表写入=${JSON.stringify(aCol.map((v) => v.slice(0, 14)))}（不许出现成功文案）· 正常表=${JSON.stringify(bCol.map((v) => v.slice(0, 20)))} · 串表=${!noCross}`)
   await ctx.close()
-}
+})
 
 // ---------- H31 收尾写回：不再停在「97/97 · 剩约 0 秒」，写回有独立进度、主线程会还手 ----------
 // 爹地 2026-10-29 真机截图：97 行查完，进度条停在「97/97 · 剩约 0 秒」，界面像卡住了。
@@ -995,7 +1035,7 @@ function auditWrites(written, gridAfter, numCol, outCol) {
 //   ② 收尾写回阶段真的出现过「写回 x/y」——这条只有主线程让出过才能在屏幕上画出来
 //   ③ 页面心跳（20ms）最大间隔 < 400ms：写回不许独占主线程
 //   ④ 跑完进度条消失，120 行全部按行身份写对
-{
+await seg('H31', async () => {
   const N = 120
   const grid = { '1,17': 'MBL' }
   const evBy = {}
@@ -1076,10 +1116,32 @@ function auditWrites(written, gridAfter, numCol, outCol) {
     + ` · 写入 ${audit.n} 格/错位 ${audit.bad.length}${audit.bad.slice(0, 2).join('；')}`
     + `\n     写回进度采样：${[...writeTexts].slice(0, 8).join(' | ')}`)
   await ctx.close()
+})
+
+// 冒烟：按计划跑（组内并行、组间串行），输出仍按 H 编号顺序分行打印
+if (MODE === 'smoke') {
+  const planned = new Set(SMOKE_PLAN.flat())
+  for (const id of SMOKE_IDS) if (!planned.has(id)) SMOKE_PLAN.push([id])   // 兜底：漏排的单独跑
+  for (const group of SMOKE_PLAN) {
+    const bufs = await Promise.all(group.map(async (id) => {
+      const fn = queued.get(id)
+      if (!fn) return [`⚠ 冒烟计划里的 ${id} 在探针里不存在（检查 SMOKE_IDS / SMOKE_PLAN）`]
+      return await runSeg(id, fn)
+    }))
+    for (const lines of bufs) for (const line of lines) console.log(line)
+  }
 }
 
 await browser.close()
 srv.close()
 const bad = results.filter(([, ok]) => !ok)
-console.log(`\n${results.length - bad.length}/${results.length} 通过`)
+const TAG = MODE === 'smoke' ? 'SMOKE' : 'FULL'
+const wallMs = Date.now() - T_START
+const sumMs = timings.reduce((a, [, ms]) => a + ms, 0)
+console.log(`\n总耗时 ${(wallMs / 1000).toFixed(1)}s`
+  + `（${MODE === 'smoke' ? '组内并行，分段之和 ' : '分段之和 '}${(sumMs / 1000).toFixed(1)}s）：`
+  + (timings.map(([id, ms]) => `${id} ${(ms / 1000).toFixed(1)}s`).join(' · ') || '(无)'))
+if (skipped.length) console.log(`本轮未跑 ${skipped.length} 条（--full 才跑）：${skipped.join(' ')}`)
+if (MODE === 'smoke' && wallMs > 60000) console.log(`⚠ 冒烟总耗时 ${(wallMs / 1000).toFixed(1)}s，超过 60s 目标`)
+console.log(`${TAG} ${results.length - bad.length}/${results.length} 通过`)
 process.exit(bad.length ? 1 : 0)
