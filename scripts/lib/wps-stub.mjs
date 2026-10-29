@@ -1,5 +1,5 @@
 // WPS 表格 API 桩（无头测试共用）：状态机探针与渲染冒烟都用它，避免两套桩行为不一致
-export const STUB = ({ doc = 'A.xlsx', lead = 0, grid = null, evKind = null, savedCfg = null, header2d = false, bridgeMode = 'ok', last = 6 }) => {
+export const STUB = ({ doc = 'A.xlsx', lead = 0, grid = null, evKind = null, savedCfg = null, header2d = false, bridgeMode = 'ok', last = 6, comMs = 0 }) => {
   // header2d: WPS 真实行为 —— 1 行 × N 列的范围，Value2 回的是 [[c1..cN]]（不是列向量）
   const NUM = 15, OUT = 18
   window.__grid = grid || { [`1,${NUM}`]: 'MBL', [`2,${NUM}`]: '276759780', [`3,${NUM}`]: '802735343', [`4,${NUM}`]: '802735426' }
@@ -31,6 +31,18 @@ export const STUB = ({ doc = 'A.xlsx', lead = 0, grid = null, evKind = null, sav
     const a = one(p[0]); return { a, b: p[1] ? one(p[1]) : a }
   }
   window.__fills = []
+  // ★ 0.9.42：每次碰表格 API 都记一笔（__ops），并可注入忙等延迟（__comMs）——
+  //   「写回阶段多少次同步 COM」是这一轮改造的核心指标，桩里必须能数出来。
+  window.__ops = 0
+  window.__comMs = comMs || 0
+  window.__batchWrites = []     // 多格写入（批量写）记录：{ addr, rows, cols, kind }
+  const COM = () => {
+    window.__ops++
+    if (window.__comMs > 0) {
+      const t = (typeof performance !== 'undefined' ? performance.now() : Date.now()) + window.__comMs
+      while ((typeof performance !== 'undefined' ? performance.now() : Date.now()) < t) { /* 忙等：模拟同步 COM */ }
+    }
+  }
   // ★ 0.9.41：真删一行 —— 下方整体上移、末行清掉、UsedRange 跟着缩。
   // 只改行号不改 grid 是假场景：被测代码读回的单号会跟真表一致，bug 就测不出来。
   window.__deleteRow = (n) => {
@@ -47,13 +59,13 @@ export const STUB = ({ doc = 'A.xlsx', lead = 0, grid = null, evKind = null, sav
     window.__last = Math.max(1, lastR - 1)
     return window.__last
   }
-  const interior = (r, c) => ({
+  const interior = (r, c, r2) => ({
     Pattern: 1,
-    set Color(v) { window.__fills.push([r, c, v]) },
-    set ColorIndex(v) { window.__fills.push([r, c, v]) }
+    set Color(v) { COM(); for (let rr = r; rr <= (r2 || r); rr++) window.__fills.push([rr, c, v]) },
+    set ColorIndex(v) { COM(); for (let rr = r; rr <= (r2 || r); rr++) window.__fills.push([rr, c, v]) }
   })
   const cell = (r, c) => ({
-    get Value2() { return window.__grid[`${r},${c}`] ?? '' },
+    get Value2() { COM(); return window.__grid[`${r},${c}`] ?? '' },
     set Value2(v) {
       if (window.__writeBlock) throw new Error('写入被拒绝（模拟保护/只读）')
       window.__grid[`${r},${c}`] = v
@@ -72,12 +84,14 @@ export const STUB = ({ doc = 'A.xlsx', lead = 0, grid = null, evKind = null, sav
     },
     ActiveSheet: {
       Name: 'Sheet1', ProtectContents: false,
-      get UsedRange() { return { Row: 1, Rows: { Count: window.__last }, Columns: { Count: 13 } } },
-      Cells: { Item: (r, c) => cell(r, c) },
+      get UsedRange() { COM(); return { Row: 1, Rows: { Count: window.__last }, Columns: { Count: 13 } } },
+      Cells: { Item: (r, c) => { COM(); return cell(r, c) } },
       Range: (addr) => {
+        COM()
         const { a, b } = parse(addr)
         return {
           get Value2() {
+            COM()
             if (a.row === b.row && a.col === b.col) return window.__grid[`${a.row},${a.col}`] ?? ''
             if (header2d && a.row === b.row && b.col > a.col) {
               // 单行多列：真实 WPS 回 [[c1, c2, ...]]，历史上就是这里把表头读没了
@@ -95,11 +109,42 @@ export const STUB = ({ doc = 'A.xlsx', lead = 0, grid = null, evKind = null, sav
             return o.join('\n')
           },
           set Value2(v) {
+            COM()
             if (window.__writeBlock) throw new Error('写入被拒绝（模拟保护/只读）')
+            const rows = b.row - a.row + 1
+            const cols = b.col - a.col + 1
+            if (rows * cols > 1) {
+              // ★ 0.9.42：多格写入（批量写）。真实 WPS 认二维数组，部分版本只认一维 —— 两种都收，
+              //   形状不对就抛错（正是生产代码要「批量写不可用就退回逐格」的依据）。
+              if (!Array.isArray(v)) throw new Error('多格写入必须传数组')
+              const kind = Array.isArray(v[0]) ? '2D' : '1D'
+              window.__batchWrites.push({ addr, rows, cols, kind })
+              if (kind === '2D') {
+                if (v.length !== rows) throw new Error(`二维数组行数不符 ${v.length}/${rows}`)
+                for (let r = 0; r < rows; r++) {
+                  const line = v[r]
+                  if (!Array.isArray(line) || line.length !== cols) throw new Error(`第 ${r + 1} 行长度不符`)
+                  for (let c = 0; c < cols; c++) {
+                    window.__grid[`${a.row + r},${a.col + c}`] = line[c]
+                    window.__written.push([a.row + r, a.col + c, line[c]])
+                  }
+                }
+              } else {
+                if (v.length !== rows * cols) throw new Error(`一维数组长度不符 ${v.length}/${rows * cols}`)
+                for (let r = 0; r < rows; r++) {
+                  for (let c = 0; c < cols; c++) {
+                    const val = v[r * cols + c]
+                    window.__grid[`${a.row + r},${a.col + c}`] = val
+                    window.__written.push([a.row + r, a.col + c, val])
+                  }
+                }
+              }
+              return
+            }
             window.__grid[`${a.row},${a.col}`] = v
             window.__written.push([a.row, a.col, v])
           },
-          get Interior() { return interior(a.row, a.col) }
+          get Interior() { COM(); return interior(a.row, a.col, b.row) }
         }
       }
     },
@@ -136,8 +181,12 @@ export const STUB = ({ doc = 'A.xlsx', lead = 0, grid = null, evKind = null, sav
     if (mode === 'denied' && s.includes('/health')) body = { ok: false, error: '只接受本机页面调用' }
     else if (s.includes('/health')) body = { ok: true }
     else if (s.includes('/config')) body = { ok: true, cfg: savedCfg, exact: true }
-    else if (s.includes('/carriers')) body = { ok: true, count: 12, liveCount: 11, carriers: [
-      { id: 'hapag', name: 'Hapag-Lloyd', live: true }, { id: 'oocl', name: 'OOCL', live: false }] }
+    // ★ 10-29：OOCL 已接入（engine/tracking/oocl.mjs）→ 夹具不许再谎报「未接入」；
+    //   兜底分支改用真·没有适配器的 SITC 来演练（引擎 identify.mjs 里 SITC 在 KNOWN_UNTRACKED）
+    else if (s.includes('/carriers')) body = { ok: true, count: 3, liveCount: 2, carriers: [
+      { id: 'hapag', name: 'Hapag-Lloyd', live: true },
+      { id: 'oocl', name: 'OOCL', live: true, manualUrl: 'https://pbservice.moc.oocl.com/party/cargotracking/mobile/mobile_ct_search.jsf?ANONYMOUS_BEHAVIOR=BUILD_UP&ENTRY=MCC&ENTRY_TYPE=OOCL' },
+      { id: 'sitc', name: 'SITC', live: false, manualUrl: 'https://www.sitcline.com/' }] }
     else if (s.includes('/identify')) body = { ok: true, carrier: null, candidates: [] }
     else if (s.includes('/track')) {
       const num = new URL(s).searchParams.get('number') || ''
