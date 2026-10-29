@@ -27,4 +27,8 @@ for TAG in wps-latest "wps-v$VER"; do
     && gh release upload "$TAG" "$TMP/wps-version.json" "$TMP/$NEWPKG" --repo "$REPO" --clobber \
     || gh release create "$TAG" "$TMP/wps-version.json" "$TMP/$NEWPKG" --repo "$REPO" --title "$TAG" --notes "${NOTES:-wps addon $VER}"
 done
+
+# 滚动 tag（wps-latest）只留最新一版 + wps-version.json，历史版本包随 wps-v* 归档，不许再堆。
+# 想先看会删什么：scripts/prune-latest.sh --dry-run
+TAG=wps-latest REPO="$REPO" ./scripts/prune-latest.sh
 echo "发布完成：$REPO · wps-latest / wps-v$VER · v$VER"
