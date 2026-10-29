@@ -73,7 +73,7 @@
         <span class="lg green">绿 · 已到目的港</span>
         <span class="lg gray">灰 · 已还空箱</span>
       </div>
-      <div class="muted" v-if="cfg.outCol > 0">上次刷新 {{ lastRunText }} · API 读法 {{ readVia || '—' }} · 写法 {{ writeVia || '—' }}</div>
+      <div class="muted" v-if="cfg.outCol > 0">上次刷新 {{ lastRunText }}<span v-if="misalign" class="stale">（本轮错位 {{ misalign }} 行 → 这个时间与范围行数不可信）</span> · API 读法 {{ readVia || '—' }} · 写法 {{ writeVia || '—' }}</div>
       <div class="muted" v-if="cfg.outCol > 0 && autoOn">已开启：每 24 小时自动刷新（WPS 开着时）</div>
     </div>
 
@@ -88,7 +88,7 @@
       </thead>
       <tbody>
         <template v-for="it in items" :key="it.row">
-          <tr :class="[it.state, { handmade: it.handmade }]">
+          <tr :class="[it.state, { handmade: it.handmade, misalign: it.misaligned }]">
             <td>{{ it.row }}</td>
             <td class="mono">{{ it.number }}</td>
             <td class="ev">
@@ -124,7 +124,7 @@
 </template>
 
 <script>
-const APP_VER = '0.9.40'
+const APP_VER = '0.9.41'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
@@ -157,6 +157,12 @@ const colLetter = (n) => {
   }
   return s
 }
+// 全角 → 半角（用户手打单号常带全角字母/数字/空格）
+const toHalf = (s) => String(s == null ? '' : s)
+  .replace(/[\uFF01-\uFF5E]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))
+  .replace(/\u3000/g, ' ')
+// 单号比对用的唯一归一化口径：全角转半角 + 去空白/连字符 + 大写
+const normNum = (s) => cleanNumber(toHalf(s))
 
 export default {
   name: 'TaskPane',
@@ -191,6 +197,8 @@ export default {
       retryCount: 0,
       aborts: new Set(),
       runSummary: '',
+      misalign: 0,          // ★ 0.9.41：本轮「行身份对不上」跳过写回的行数（界面横幅按它推导）
+      misalignSeen: new Set(),
       lastRun: 0,
       autoOn: true,
       timer: null
@@ -218,6 +226,14 @@ export default {
         }
       }
       if (this.writeErr) return { kind: 'err', text: this.writeErr, action: '' }
+      // ★ 0.9.41：行身份对不上 → 横幅说清「表格行变了」，并明说这一轮的刷新时间/范围不可信
+      if (this.misalign > 0) {
+        return {
+          kind: 'warn',
+          text: `表格行变了（删/插/排序），本轮 ${this.misalign} 行结果对不上，已跳过不写 —— 点③重跑。这时的「上次刷新」时间和范围行数都不可信。`,
+          action: ''
+        }
+      }
       if (this.actionErr) return { kind: 'err', text: this.actionErr, action: '' }
       if (this.cfg.numberCol > 0 && this.scan && this.scan.count === 0) {
         return { kind: 'warn', text: `${this.scan.rows} 行里没识别到提单号 —— 确认选的是 MBL 那一列。`, action: '' }
@@ -481,7 +497,8 @@ export default {
 
     // 用户选什么就用什么；只对「整列/单格」两种极端做收敛，不预设任何列或起始行
     resolveRange(sel, sheet) {
-      const usedLast = this.usedLastRow(sheet)
+      // ★ 0.9.41：整列时末行按「该单号列最后一个非空行」算（别用整表 UsedRange，会把空行也圈进来）
+      const usedLast = this.numberLastRow(sheet, this.usedLastRow(sheet), sel.col)
       const raw = sel.rawRows || sel.rows || 1
       // 「整列/单格」= 跟着表长；明确框选 = 只认这个范围，一次定死
       const wholeColumn = raw <= 1 || raw >= 1000
@@ -491,7 +508,7 @@ export default {
       if (wholeColumn) {
         r1 = 1
         r2 = usedLast
-        how = '整列 → 跟随表格已用区'
+        how = `整列 → 跟随单号列已用末行 ${usedLast}`
       } else if (r2 > usedLast) {
         r2 = usedLast
         how = `按选区 ${sel.rows} 行（收到已用区末行）`
@@ -653,6 +670,30 @@ export default {
       }
     },
 
+    /**
+     * ★ 0.9.41：扫描范围以「单号列最后一个非空行」为准，不再用整表 UsedRange。
+     * 为什么必改：结果列一旦在数据区下面写进过文字（K115/K116 那次就是这样），
+     * 整表 UsedRange 的末行就被顶到那里 —— 下次还扫那一段空行、还可能再写一次。
+     * 错误结果自己把范围撑大，然后再证明自己没错。按单号列收口后，清掉脏文字范围自动缩回。
+     * 取不到 / 读不全 → 退回 UsedRange（宁可多扫几行，也不掐掉真数据）。
+     * 合并单元格：纵向合并只有左上角有值，末行落在最后一个有值的锚点；锚点下面属于同一票，
+     * 本来也没有单号可查，所以不会漏数据。中途的空行无影响（取的是最后一个非空行）。
+     */
+    numberLastRow(sheet, usedLast, col) {
+      const c = Number(col || this.cfg.numberCol || 0)
+      if (!c || !usedLast || usedLast < 1) return usedLast
+      try {
+        const { values } = this.readRangeValues(sheet, c, 1, usedLast)
+        if (!values || !values.length || (usedLast > 1 && values.length !== usedLast)) return usedLast
+        for (let i = values.length - 1; i >= 0; i--) {
+          if (String(values[i] == null ? '' : values[i]).trim()) return i + 1
+        }
+      } catch (e) {
+        this.log('单号列末行探测失败，退回整表已用区: ' + (e.message || e))
+      }
+      return usedLast
+    },
+
     // ---------- 兼容层：不同 WPS 版本 API 可用性不一样，逐个试 ----------
     addr(r, c) {
       return colLetter(c) + r
@@ -766,6 +807,43 @@ export default {
       return false
     },
 
+    /**
+     * ★ 0.9.41 行身份校验 —— 唯一一把尺：writeResult / _flushPending / 自动刷新 / ETD-ETA 写回全走这里。
+     *
+     * 为什么需要它：扫描时记的是行号（r1+i），写回可能要等几秒（实时）到几十分钟（暂存补写）。
+     * 这中间用户删行/插行/排序，行号就指向别的行了 —— 上次修的是「表变了要拦」，这次是「行变了要拦」。
+     * 判据只看这一格：numberCol@row 现在的单号，是不是查询时那个单号。
+     *   · 该行为空（空行/只有备注）→ 返回 false（空行硬保护，不需要第二条规则）
+     *   · 单号列没配 / 查不到 → 返回 false（宁可不写，也不写到不确定的格子里）
+     * 比对前归一化（全角转半角 + 去空白/连字符 + 大写）：用户手打的号常带空格/全角，
+     * 严格比对会把「同一行」误判成错位而少写 —— 那是另一种错。
+     */
+    verifyRowIdentity(sheet, row, number, numCol) {
+      const want = normNum(number)
+      if (!want) return false
+      const col = Number(numCol || this.cfg.numberCol || 0)
+      if (!col) return false
+      let cur
+      try { cur = this.readOne(sheet, row, col) } catch (e) { return false }
+      const have = splitParts(toHalf(cur)).map(normNum).filter(Boolean)
+      if (!have.length) return false
+      // 一格两号（订舱号/提单号同格）时，查询用的可能就是其中之一 → 命中任一即可
+      return have.includes(want)
+    },
+    /** 错位跳过：不写、计数（按行去重）、界面给一句能照着做的提示 */
+    markMisalign(it, row, numCol, why) {
+      this.misalignSeen.add(`${row}|${numCol || this.cfg.numberCol || 0}`)
+      this.misalign = this.misalignSeen.size
+      if (it) {
+        it.state = 'skip'
+        it.misaligned = true
+        it.failReason = 'misaligned'
+        it.text = '错位跳过（该行单号已变或已空，结果没写，点③重跑）'
+      }
+      const c = colLetter(numCol || this.cfg.numberCol)
+      this.log(`R${row} 错位跳过：${why || ''} ${c}${row} 现在不是它 —— 结果不写`)
+    },
+
     writeCell(sheet, r, c, text) {
       const a = this.app()
       const A1 = this.addr(r, c)
@@ -791,6 +869,20 @@ export default {
       }
       // 报第一条失败原因（通常最贴近根因），别把最后一条「API 不存在」当结论
       return { ok: false, error: errs[0] || '写入失败', all: errs }
+    },
+
+    /**
+     * ★ 0.9.41 唯一的写回入口：先核行身份，通不过就跳过，通过才真写。
+     * 写业务单元格的路径（写结果 / 补写暂存 / 写船期）一律走这里或 verifyRowIdentity，
+     * 不许再直接调 writeCell —— 否则下次又只修一处。
+     */
+    writeRowChecked(it, sheet, row, col, text, numCol) {
+      const nc = Number(numCol || (it && it.numCol) || this.cfg.numberCol || 0)
+      if (!this.verifyRowIdentity(sheet, row, it ? it.number : '', nc)) {
+        this.markMisalign(it, row, nc, '写前核对不通过')
+        return { ok: false, skipped: true }
+      }
+      return this.writeCell(sheet, row, col, text)
     },
 
     pickOutputCol() {
@@ -1093,10 +1185,14 @@ export default {
       const r1 = this.cfg.startRow
       let r2 = this.cfg.startRow + this.cfg.rows - 1
       if (this.cfg.mode === 'column') {
-        const last = this.usedLastRow(sheet)
-        if (last > r2) {
-          this.log(`表尾有新数据：范围 ${r1}–${r2} 扩到 ${r1}–${last}`)
-          r2 = last
+        const usedLast = this.usedLastRow(sheet)
+        // ★ 0.9.41：末行按单号列收口（含收缩）——结果列下面的脏文字不该把范围顶大
+        const last = this.numberLastRow(sheet, usedLast, col)
+        if (last !== usedLast) this.log(`范围按单号列收口到第 ${last} 行（整表用到 ${usedLast} 行）`)
+        if (last !== r2) {
+          if (last > r2) this.log(`表尾有新数据：范围 ${r1}–${r2} 扩到 ${r1}–${last}`)
+          else this.log(`范围收缩：${r1}–${r2} → ${r1}–${last}（下面没有单号）`)
+          r2 = Math.max(r1, last)
           this.cfg = { ...this.cfg, rows: r2 - r1 + 1 }
           this.saveCfg()
         }
@@ -1132,9 +1228,12 @@ export default {
       this.items = nums.map((x) => ({
         row: x.row,
         number: x.number || '—',
+        numCol: col,            // ★ 0.9.41：写回时按「这一列」核对行身份（跑动中改配置也不影响本轮）
         text: x.number ? '' : '（空/非单号，跳过）',
         state: x.number ? 'idle' : 'skip'
       }))
+      this.misalign = 0          // 新一轮从零计数：上一轮的错位提示随这次刷新消失，不挂僵尸
+      this.misalignSeen.clear()
       this.busy = true
       this.stopFlag = false
       this.runStart = Date.now()
@@ -1394,7 +1493,7 @@ export default {
           it.stageLabel = st.label
           it.inferred = !!st.inferred   // 港口列读不到 → 用事件瞎猜，猜出来也不许着色
           // 表格里有 ETD/ETA 列 → 用船司返回的真实船期覆盖
-          this.writeScheduleDates(sheet, t.row, r, routePod || pod)
+          this.writeScheduleDates(sheet, t.row, r, routePod || pod, t.number)
         }
       } catch (e) {
         it.text = '查询失败：' + e.message
@@ -1408,10 +1507,15 @@ export default {
      * 表格里有 ETD / ETA 列时，用船司返回的真实船期覆盖
      * 实际发生的优先；没发生的用船司给的计划时间（表格本来就填的计划）
      */
-    writeScheduleDates(sheet, row, r, pod) {
+    writeScheduleDates(sheet, row, r, pod, number) {
       const etdCol = this.cfg.etdCol || 0
       const etaCol = this.cfg.etaCol || 0
       if (!etdCol && !etaCol) return
+      // ★ 0.9.41：船期也是写进这一行 —— 行变了同样不许写（否则日期会写到别人的货上）
+      if (!this.verifyRowIdentity(sheet, row, number, this.cfg.numberCol)) {
+        this.log(`R${row} 船期不写：该行单号已变（防写到别的行）`)
+        return
+      }
       let etd = '', eta = ''
       try { ({ etd, eta } = pickEtdEta(r.events || [], { pod })) } catch (e) { this.log('船期取值失败: ' + (e.message || e)); return }
       const put = (col, val) => {
@@ -1437,10 +1541,15 @@ export default {
     /** ★ 10-28：切表时把这一行的结果攒起来（不写、不丢），切回来一次补齐 */
     deferWrite(it, outCol) {
       if (!it) return
-      const key = `${it.row}|${outCol}`
+      // ★ 0.9.41 去重 key 带上 doc/number/row：只按 row|col 去重时，删行后两条结果可能落到同一个 row，
+      // 后进的把前一条**静默去重**掉（不报错、直接丢一条）。带 number 区分「同号两行」，带 row 区分
+      // 「不同号同一行」——去重是为了幂等，不是为了省存储。
+      const numCol = it.numCol || this.cfg.numberCol
+      const key = `${this.runDoc}|${it.number}|${numCol}|${outCol}|${it.row}`
       this.pendingWrites = this.pendingWrites.filter((x) => x.key !== key)
       this.pendingWrites.push({
         key, row: it.row, outCol, doc: this.runDoc,
+        number: it.number, numCol,
         text: String(it.text || ''), state: it.state,
       })
       it.state = 'pending'
@@ -1483,11 +1592,18 @@ export default {
         this.actionErr = `补不齐：当前是「${nowDoc}」，暂存的 ${this.pendingWrites.length} 条属于「${(other[0] || {}).doc || '—'}」—— 切回那张表再点`
         return
       }
-      let ok = 0, fail = 0
+      let ok = 0, fail = 0, miss = 0
       for (const w of same) {
         // ★ 10-28 硬保护：每写一格前都核一次「还在不在目标表」——
         //   自动补齐是定时器驱动的，写入过程中用户随时可能又切走；一旦切走立刻停，绝不多写一格。
         if (this.docKey() !== w.doc) break
+        // ★ 0.9.41 同一把尺：暂存的 row 可能隔了几十分钟，行被删/插/排过就弃写
+        //   （弃掉而不是留着——留着只会每 2.5 秒重试一次、每次都过不去）
+        if (!this.verifyRowIdentity(sheet, w.row, w.number, w.numCol)) {
+          miss++
+          this.markMisalign(null, w.row, w.numCol, `暂存结果 ${w.number} 对不上号`)
+          continue
+        }
         const r = this.writeCell(sheet, w.row, w.outCol, w.text)
         if (r && r.ok) {
           ok++
@@ -1496,10 +1612,10 @@ export default {
         } else fail++
       }
       this.pendingWrites = other
-      this.actionErr = fail
-        ? `补齐：成功 ${ok} 条、补不进 ${fail} 条（多半是表被保护/只读）`
+      this.actionErr = fail || miss
+        ? `补齐：成功 ${ok} 条、补不进 ${fail} 条、错位跳过 ${miss} 条（表格行变了，点③重跑）`
         : ''
-      this.log(`补齐回填${auto ? '（自动·已回到原表）' : ''}：成功 ${ok} / 失败 ${fail}${other.length ? `，另有 ${other.length} 条在别的表` : ''}`)
+      this.log(`补齐回填${auto ? '（自动·已回到原表）' : ''}：成功 ${ok} / 失败 ${fail} / 错位跳过 ${miss}${other.length ? `，另有 ${other.length} 条在别的表` : ''}`)
     },
 
     // 统一写回：确定结论可以覆盖，暂态失败保留旧值
@@ -1532,10 +1648,11 @@ export default {
         this.log(`R${row} 保留旧值（本次 ${this.shortReason(it.failReason)}）`)
         return
       }
-      const w = this.writeCell(sheet, row, outCol, it.text)
-      if (!w.ok) {
-        this.writeErr = '写入失败：' + w.error
-        this.log(`写 ${colLetter(outCol)}${row} 失败: ${w.error}`)
+      const w = this.writeRowChecked(it, sheet, row, outCol, it.text)
+      if (!w || !w.ok) {
+        if (w && w.skipped) return          // 错位跳过：已经记过账、给过提示，不算写入失败
+        this.writeErr = '写入失败：' + (w ? w.error : '未知')
+        this.log(`写 ${colLetter(outCol)}${row} 失败: ${w ? w.error : '未知'}`)
       } else {
         this.writeVia = w.via
         this.writeErr = ''      // 写成功即清掉上一次的写入失败提示
@@ -1789,5 +1906,8 @@ tr.skip td { color: #aaa; }
 /* ★ 10-28 切表不中止：暂存待补的行 + 补齐按钮 */
 .tbl tr.pending { background: #f2f7ff; }
 .tbl tr.pending td:first-child { box-shadow: inset 3px 0 0 #2f6df6; }
+/* ★ 0.9.41 行身份校验：错位行与「上次刷新不可信」的提示色 */
+.stale { color: #a15c00; }
+.tbl tr.misalign td { color: #a15c00; text-decoration: line-through; }
 .pending-btn { background: #2f6df6 !important; color: #fff !important; border-color: #2f6df6 !important; font-weight: 700; }
 </style>

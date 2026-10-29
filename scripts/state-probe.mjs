@@ -555,6 +555,94 @@ async function page_setSel(p, col) {
   await ctx.close()
 }
 
+// ---------- 行身份审计（H22/H23 共用）----------
+// 判据不看读回值，只看「写动作落在哪一格」：每条写入的 row，删行之后该行单号列必须还是它的单号。
+const normNum = (s) => String(s == null ? '' : s).replace(/[^A-Z0-9]/gi, '').toUpperCase()
+function auditWrites(written, gridAfter, numCol, outCol) {
+  const bad = []
+  let n = 0
+  for (const [row, col, val] of written) {
+    if (col !== outCol) continue
+    n++
+    const have = normNum(gridAfter[`${row},${numCol}`])
+    const m = String(val).match(/TESTBL\d{4}/)
+    const want = m ? m[0] : ''
+    if (!have) { bad.push(`第 ${row} 行单号列是空的，却写了「${String(val).slice(0, 26)}」`); continue }
+    if (!want) { bad.push(`第 ${row} 行写的内容没带单号标记，无法核对：${String(val).slice(0, 26)}`); continue }
+    if (have !== want) bad.push(`第 ${row} 行写的是 ${want} 的结果，可这行单号现在是 ${have}`)
+  }
+  return { n, bad }
+}
+
+// ---------- H22 查询跑到一半删掉中间一行 → 绝不许写到单号对不上的行 ----------
+{
+  const grid = { '1,17': 'MBL' }
+  const nums = ['TEST-BL-0001', 'TEST-BL-0002', 'TEST-BL-0003', 'TEST-BL-0004', 'TEST-BL-0005', 'TEST-BL-0006']
+  nums.forEach((n, i) => { grid[`${i + 2},17`] = n })
+  const evBy = {}
+  nums.forEach((n) => { const k = n.replace(/-/g, ''); evBy[k] = [{ time: '2026-10-01T00:00:00Z', activity: 'Departure From', city: k }] })
+  const { ctx, page } = await open({ grid, lead: 3000, last: 7 })
+  await page.evaluate((e) => { window.__evByNumber = e }, evBy)
+  await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选单号列/)
+  await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选输出列/)
+  await tryRun(page)
+  for (let i = 0; i < 60; i++) {
+    await page.waitForTimeout(100)
+    if (await page.evaluate(() => !!document.querySelector('.bar'))) break
+  }
+  await page.waitForTimeout(700)
+  // 删掉第 3 行（TEST-BL-0002）：下面整体上移，第 7 行空出来 —— 真删，不是只改行号
+  await page.evaluate(() => window.__deleteRow(3))
+  await waitIdle(page, 40000)
+  const gridAfter = await page.evaluate(() => window.__grid)
+  const written = await page.evaluate(() => window.__written)
+  const { n, bad } = auditWrites(written, gridAfter, 17, 18)
+  const b = await banner(page)
+  const hint = /错位|表格行变了/.test(b)
+  const after = [2, 3, 4, 5, 6, 7].map((r) => `${r}:${String(gridAfter[`${r},17`] || '(空)')}`).join(' ')
+  pass('H22 查询中删一行 → 不写错位行 + 有错位提示', bad.length === 0 && hint,
+    `删行后单号列 ${after}；写入 ${n} 格；冲突 ${bad.length}${bad.length ? '：' + bad.join('；') : ''}\n     横幅="${b}"`)
+  await ctx.close()
+}
+
+// ---------- H23 单号列是空行的格 → 无论如何保持空（含跑到一半被清空的行）----------
+{
+  // 第 4 行单号列故意空着（真实表里 115–127 就是这种）；第 3 行跑到一半被清空
+  const grid = { '1,17': 'MBL', '2,17': 'TEST-BL-0011', '3,17': 'TEST-BL-0012', '5,17': 'TEST-BL-0013', '6,17': 'TEST-BL-0014' }
+  const evBy = {}
+  ;['0011', '0012', '0013', '0014'].forEach((k) => {
+    evBy[`TESTBL${k}`] = [{ time: '2026-10-02T00:00:00Z', activity: 'Departure From', city: `TESTBL${k}` }]
+  })
+  const { ctx, page } = await open({ grid, lead: 3000, last: 6 })
+  await page.evaluate((e) => { window.__evByNumber = e }, evBy)
+  await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选单号列/)
+  await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选输出列/)
+  await tryRun(page)
+  for (let i = 0; i < 60; i++) {
+    await page.waitForTimeout(100)
+    if (await page.evaluate(() => !!document.querySelector('.bar'))) break
+  }
+  await page.waitForTimeout(700)
+  await page.evaluate(() => { delete window.__grid['3,17'] })   // 第 3 行单号被清空（行号不变）
+  await waitIdle(page, 40000)
+  const gridAfter = await page.evaluate(() => window.__grid)
+  const written = await page.evaluate(() => window.__written)
+  const { n, bad } = auditWrites(written, gridAfter, 17, 18)
+  const b = await banner(page)
+  const hint = /错位|表格行变了/.test(b)
+  const emptyRowsTouched = written.filter(([r, c]) => c === 18 && !normNum(gridAfter[`${r},17`])).map(([r]) => r)
+  // 反向断言：该写的（单号还在的行）必须真写到了，证明校验没变成「一律不写」
+  const okRows = written.filter(([r, c]) => c === 18 && normNum(gridAfter[`${r},17`])).map(([r]) => r)
+  pass('H23 单号列为空的行保持空（范围里的空行 + 跑到一半被清空的行）',
+    bad.length === 0 && hint && emptyRowsTouched.length === 0 && okRows.length >= 2,
+    `写入 ${n} 格；空行被写=${JSON.stringify(emptyRowsTouched)}（必须空）；正常行写入=${JSON.stringify(okRows)}；冲突 ${bad.length}${bad.length ? '：' + bad.join('；') : ''}\n     横幅="${b}"`)
+  await ctx.close()
+}
+
 await browser.close()
 srv.close()
 const bad = results.filter(([, ok]) => !ok)

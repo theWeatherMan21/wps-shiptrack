@@ -1,8 +1,9 @@
 // WPS 表格 API 桩（无头测试共用）：状态机探针与渲染冒烟都用它，避免两套桩行为不一致
-export const STUB = ({ doc = 'A.xlsx', lead = 0, grid = null, evKind = null, savedCfg = null, header2d = false, bridgeMode = 'ok' }) => {
+export const STUB = ({ doc = 'A.xlsx', lead = 0, grid = null, evKind = null, savedCfg = null, header2d = false, bridgeMode = 'ok', last = 6 }) => {
   // header2d: WPS 真实行为 —— 1 行 × N 列的范围，Value2 回的是 [[c1..cN]]（不是列向量）
-  const NUM = 15, OUT = 18, LAST = 6
+  const NUM = 15, OUT = 18
   window.__grid = grid || { [`1,${NUM}`]: 'MBL', [`2,${NUM}`]: '276759780', [`3,${NUM}`]: '802735343', [`4,${NUM}`]: '802735426' }
+  window.__last = last      // UsedRange 的末行（真删行时要跟着缩，见 __deleteRow）
   window.__calls = []
   window.__evKind = evKind
   window.__written = []
@@ -30,6 +31,22 @@ export const STUB = ({ doc = 'A.xlsx', lead = 0, grid = null, evKind = null, sav
     const a = one(p[0]); return { a, b: p[1] ? one(p[1]) : a }
   }
   window.__fills = []
+  // ★ 0.9.41：真删一行 —— 下方整体上移、末行清掉、UsedRange 跟着缩。
+  // 只改行号不改 grid 是假场景：被测代码读回的单号会跟真表一致，bug 就测不出来。
+  window.__deleteRow = (n) => {
+    const lastR = window.__last
+    const cols = 40
+    for (let r = n; r < lastR; r++) {
+      for (let c = 1; c <= cols; c++) {
+        const v = window.__grid[`${r + 1},${c}`]
+        if (v === undefined) delete window.__grid[`${r},${c}`]
+        else window.__grid[`${r},${c}`] = v
+      }
+    }
+    for (let c = 1; c <= cols; c++) delete window.__grid[`${lastR},${c}`]
+    window.__last = Math.max(1, lastR - 1)
+    return window.__last
+  }
   const interior = (r, c) => ({
     Pattern: 1,
     set Color(v) { window.__fills.push([r, c, v]) },
@@ -55,7 +72,7 @@ export const STUB = ({ doc = 'A.xlsx', lead = 0, grid = null, evKind = null, sav
     },
     ActiveSheet: {
       Name: 'Sheet1', ProtectContents: false,
-      UsedRange: { Row: 1, Rows: { Count: LAST }, Columns: { Count: 13 } },
+      get UsedRange() { return { Row: 1, Rows: { Count: window.__last }, Columns: { Count: 13 } } },
       Cells: { Item: (r, c) => cell(r, c) },
       Range: (addr) => {
         const { a, b } = parse(addr)
