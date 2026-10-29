@@ -17,6 +17,17 @@ alive() { curl -sS -m 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; }
 case "${1:-start}" in
   start)
     if alive; then echo "已在跑: http://127.0.0.1:$PORT"; exit 0; fi
+    # 装了守护就别手工 nohup：手工起的实例不受 launchd 管，下次崩溃就没人重拉
+    PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+    if [ -f "$PLIST" ]; then
+      launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 || launchctl bootstrap "$DOMAIN" "$PLIST" >/dev/null 2>&1 || true
+      echo "守护已装（${LABEL}）→ 交给 launchd 拉起，不手工起"
+      launchctl kickstart -k "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
+      for _ in $(seq 1 20); do alive && break; sleep 0.5; done
+      if alive; then echo "✓ 已拉起 · http://127.0.0.1:$PORT · 日志 $HOME/Library/Logs/wps-shiptrack-bridge.log";
+      else echo "✗ 拉不起来，看日志：$HOME/Library/Logs/wps-shiptrack-bridge.log"; tail -20 "$HOME/Library/Logs/wps-shiptrack-bridge.log" 2>/dev/null; exit 1; fi
+      exit 0
+    fi
     cd "$ROOT"
     # 更新源等配置放 ~/.hermes/.env（不写进仓库）
     if [ -f "$HOME/.hermes/.env" ]; then set -a; . "$HOME/.hermes/.env"; set +a; fi
@@ -27,6 +38,12 @@ case "${1:-start}" in
     else echo "✗ 起不来，看日志：$LOG"; tail -20 "$LOG"; exit 1; fi
     ;;
   stop)
+    # 装了守护的话，单纯 kill 会被 launchd 10 秒内重拉回来 → 先卸掉守护再停
+    if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+      launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
+      echo "已卸下守护（${LABEL}）—— 要恢复常驻请再跑一次 scripts/install-launchagent.sh"
+      sleep 1
+    fi
     [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null || true
     pkill -f "bridge/server.mjs" 2>/dev/null || true
     rm -f "$PIDFILE"
