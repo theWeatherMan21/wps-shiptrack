@@ -33,19 +33,41 @@
       <button @click="pickOutputCol">② 选输出列</button>
       <button @click="pickCarrierCol" class="mini-btn">船司列（可选）</button>
       <button @click="refresh(true)" :disabled="busy || !ready">③ 立即刷新</button>
-      <button v-if="busy && ready" class="mini-btn" title="同一张表也能再开一批（两批并行，写回按批次先后，后写覆盖前写）" @click="refresh(true, { force: true })">再开一批</button>
       <button @click="stop" :disabled="!hasRunning">停止</button>
       <button v-if="pendingWrites.length" class="mini-btn pending-btn" :title="`暂存了 ${pendingWrites.length} 行结果：查询中切走的那几张表，切回来点这里一次写回`" @click="flushPending">补齐回填 {{ pendingWrites.length }}</button>
     </div>
 
-    <!-- ★ 0.9.43 批次条：同一工作簿里多张表各跑各的；点一下切到那一批看明细 -->
+    <!-- ★ 0.9.45 批次条：主区域只留「在跑 / 当前」那一条；跑完的（完成 / 已停）收进「历史 N」默认折叠；
+         「再开一批」挪到条尾，不再和 ①②③ 挤在主操作区 -->
     <div class="bchips" v-if="showChips">
-      <div v-for="b in batches" :key="b.id" class="bchip" :class="[b.state, { on: b.id === viewBatchId }]"
+      <div v-if="mainBatch" class="bchip main" :class="[mainBatch.state, { on: mainBatch.id === viewBatchId }]"
+           :title="batchTitle(mainBatch)" @click="showBatch(mainBatch.id)">
+        <span class="bname">{{ batchLabel(mainBatch) }}</span>
+        <span class="bmeta">{{ batchMeta(mainBatch) }}</span>
+        <span class="bst">{{ stateLabel(mainBatch.state) }}</span>
+        <span class="bnum">{{ mainBatch.done }}/{{ mainBatch.total }}</span>
+      </div>
+      <button v-if="queuedCount" class="bchip queued more-btn" :title="`${queuedCount} 批排在后面，空出一格就开跑`" @click="toggleHist">排队 {{ queuedCount }}</button>
+      <button v-if="historyCount" class="bchip hist more-btn" :class="{ open: histOpen }" :title="histOpen ? '收起历史批次' : '展开最近 5 批（完成 / 已停）'" @click="toggleHist">历史 {{ historyCount }}{{ histOpen ? ' ▴' : ' ▾' }}</button>
+      <button v-if="busy && ready" class="bchip add" title="同一张表也能再开一批（两批并行，写回按批次先后，后写覆盖前写）" @click="refresh(true, { force: true })">＋ 再开一批</button>
+    </div>
+    <!-- 展开后才看到的：排队中 + 最近 5 条历史（都带 sheet · 起止行 · 开始时间 · 状态） -->
+    <div class="bchips more" v-if="histOpen && (queuedBatches.length || historyShown.length)">
+      <div v-for="b in queuedBatches" :key="b.id" class="bchip queued" :class="{ on: b.id === viewBatchId }"
            :title="batchTitle(b)" @click="showBatch(b.id)">
         <span class="bname">{{ batchLabel(b) }}</span>
-        <span class="bnum">{{ b.done }}/{{ b.total }}</span>
+        <span class="bmeta">{{ batchMeta(b) }}</span>
         <span class="bst">{{ stateLabel(b.state) }}</span>
+        <span class="bnum">{{ b.done }}/{{ b.total }}</span>
       </div>
+      <div v-for="b in historyShown" :key="b.id" class="bchip hist" :class="[b.state, { on: b.id === viewBatchId }]"
+           :title="batchTitle(b)" @click="showBatch(b.id)">
+        <span class="bname">{{ batchLabel(b) }}</span>
+        <span class="bmeta">{{ batchMeta(b) }}</span>
+        <span class="bst">{{ stateLabel(b.state) }}</span>
+        <span class="bnum">{{ b.done }}/{{ b.total }}</span>
+      </div>
+      <span v-if="historyCount > historyShown.length" class="hist-more muted">只显示最近 {{ historyShown.length }} 条（共 {{ historyCount }}）</span>
     </div>
 
     <!-- 三步清单：永远显示每一步选没选，不靠「报错」告诉用户下一步 -->
@@ -129,13 +151,14 @@
       <summary>诊断 / 日志</summary>
       <pre>{{ diag }}</pre>
       <button class="mini" @click="diagDump">重新体检</button>
+      <button class="mini" @click="exportWriteFails" :title="`最近 ${writeFailLog.length} 条真写不进的格子（行 / 列 / 原因 / 写法 / 时间），导出成 JSON`">导出写入失败{{ writeFailLog.length ? '（' + writeFailLog.length + '）' : '' }}</button>
       <button class="mini" @click="resetCfg">清空配置</button>
     </details>
   </div>
 </template>
 
 <script>
-const APP_VER = '0.9.44'
+const APP_VER = '0.9.45'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
@@ -190,6 +213,9 @@ export default {
       viewBatchId: '',     // 当前正在看的是哪一批（批次条上点一下就切）
       seq: 0,              // 批次序号（写回顺序按它排：先跑的批次先写）
       docNow: '',          // 活动表（轮询得到，用于「切表就看那一批」这类推导）
+      histOpen: false,     // ★ 0.9.45 历史批次是否展开（默认折叠，主条只留「在跑 / 当前」）
+      clock: Date.now(),   // ★ 0.9.45 相对时间（「3 分钟前」）的刷新节拍，30s 一次
+      writeFailLog: [],    // ★ 0.9.45 真写不进的格子（环形缓冲，最近 200 条，可导出）
       panelErr: '',        // 面板级错误（选列失败 / 配置异常 / 补齐结果）；批次自己的错误在 batch.errs 里
       flushing: false,
       pendingWrites: [],   // ★ 10-28：切表期间查到的结果先攒着，切回来点「补齐回填」再写，不整轮作废
@@ -253,7 +279,32 @@ export default {
       return this.panelErr || (this.vb && this.vb.errs ? this.vb.errs.action : '') || ''
     },
     writeErr() {
-      return (this.vb && this.vb.errs ? this.vb.errs.write : '') || ''
+      const n = this.writeNote
+      return n ? n.text : ''
+    },
+    /**
+     * ★ 0.9.45 写回三态各一句，别再用「写入失败 N 格（批量写不可用，退回逐格也没写进）」
+     * 把三种完全不同的病根糊成一句（爹地 10-29 截图那条就是它）：
+     *   fail  → 真写不进（表保护 / 只读 / 读回不一致）→ 红色，指向「诊断」
+     *   defer → 跨表暂时攒着，切回原表自动补 → 黄色，不当错误
+     *   fallback → 批量写路径不认，已逐格写进去了 → 黄色，只是交代路径
+     * defer 的条数直接读「活着」的 pendingWrites，补齐了就自动消失，不留僵尸红条。
+     */
+    writeNote() {
+      const b = this.vb
+      const note = b && b.writeNote
+      if (note && note.fail > 0) {
+        return { kind: 'err', text: `${note.fail} 格补不进去（表可能被保护/只读）—— 点「诊断」看具体行` }
+      }
+      const pend = this.pendingWrites.length
+      if (pend > 0) {
+        return { kind: 'warn', text: `已有 ${pend} 格结果暂存，切回原表自动补` }
+      }
+      if (note && note.fbRows > 0) {
+        return { kind: 'warn', text: `批量写不认，已逐格写入（成功 ${note.fbOk}）` }
+      }
+      const legacy = (b && b.errs ? b.errs.write : '') || ''
+      return legacy ? { kind: 'err', text: legacy } : null
     },
     capErr() {
       return this.vb ? (this.vb.capErr || '') : ''
@@ -268,7 +319,49 @@ export default {
       return this.batches.some((b) => b.state === 'queued')
     },
     showChips() {
-      return this.hasRunning || this.hasQueued || this.batches.filter((b) => b.kind !== 'retry').length > 1
+      return !!(this.mainBatch || this.queuedCount || this.historyCount)
+    },
+    /**
+     * ★ 0.9.45 主条只留一条：优先「正在看的 / 在跑的」，都没有就当前表最近一批，再没有就最后一批。
+     * 跑完的批次一律进历史折叠区 —— 爹地 10-29 截图里堆了两条「已停」chip，散就是散在这。
+     */
+    mainBatch() {
+      const list = this.batches.filter((b) => b.kind !== 'retry')
+      const running = list.filter((b) => b.state === 'running')
+      if (running.length) {
+        const viewed = running.filter((b) => b.id === this.viewBatchId)[0]
+        return viewed || running[running.length - 1]
+      }
+      const d = this.docNow || ''
+      const finished = (arr) => arr.filter((b) => b.state === 'done' || b.state === 'stopped' || b.state === 'error')
+      const mine = list.filter((b) => b.doc === d)
+      const fm = finished(mine)
+      if (fm.length) return fm[fm.length - 1]
+      if (mine.length) return mine[mine.length - 1]
+      const fa = finished(list)
+      if (fa.length) return fa[fa.length - 1]
+      return list.length ? list[list.length - 1] : null
+    },
+    /** 排队中的批次（自动重查不算，它不占批次条） */
+    queuedBatches() {
+      return this.batches.filter((b) => b.state === 'queued' && b.kind !== 'retry')
+    },
+    queuedCount() {
+      return this.queuedBatches.length
+    },
+    /** 跑完的（完成 / 已停 / 出错）→ 历史，最近的在最前 */
+    historyBatches() {
+      return this.batches
+        .filter((b) => b.kind !== 'retry' && (b.state === 'done' || b.state === 'stopped' || b.state === 'error'))
+        .slice()
+        .reverse()
+    },
+    historyCount() {
+      return this.historyBatches.length
+    },
+    /** 历史最多显示最近 5 条 */
+    historyShown() {
+      return this.historyBatches.slice(0, 5)
     },
     // 提示语只从状态推导：不存在「设置了却没人清」的字符串
     banner() {
@@ -290,7 +383,7 @@ export default {
           action: 'ping'
         }
       }
-      if (this.writeErr) return { kind: 'err', text: this.writeErr, action: '' }
+      if (this.writeNote) return { kind: this.writeNote.kind, text: this.writeNote.text, action: '' }
       // ★ 0.9.41：行身份对不上 → 横幅说清「表格行变了」，并明说这一轮的刷新时间/范围不可信
       if (this.misalign > 0) {
         return {
@@ -419,6 +512,8 @@ export default {
     this.flushTimer = setInterval(() => this.autoFlushWhenBack(), 2500)
     // ★ 0.9.43：切到别的工作表要按那张表载入自己的列设置（不然多表并行会用错的列写错的表）
     this.docTimer = setInterval(() => this.watchDocChange(), 900)
+    // ★ 0.9.45 批次条上的「3 分钟前」得自己走：30s 一个节拍就够（只重算文案，不碰 COM）
+    this.clockTimer = setInterval(() => { this.clock = Date.now() }, 30000)
   },
   beforeUnmount() {
     try { clearTimeout(this.retryTimer) } catch (e) { /* ignore */ }
@@ -426,6 +521,7 @@ export default {
     if (this.timer) clearInterval(this.timer)
     if (this.flushTimer) clearInterval(this.flushTimer)
     if (this.docTimer) clearInterval(this.docTimer)
+    if (this.clockTimer) clearInterval(this.clockTimer)
   },
   methods: {
     app() {
@@ -475,9 +571,44 @@ export default {
       const sh = String(b.doc || '').split('|')[1] || '—'
       return (b.kind === 'retry' ? '重查·' : '') + sh
     },
+    /** 相对时间：批次条上的「3 分钟前」 */
+    relTime(ts) {
+      const t = Number(ts || 0)
+      if (!t) return ''
+      const d = Math.max(0, Number(this.clock || Date.now()) - t)
+      if (d < 60000) return '刚刚'
+      const m = Math.floor(d / 60000)
+      if (m < 60) return `${m} 分钟前`
+      const h = Math.floor(m / 60)
+      if (h < 24) return `${h} 小时前`
+      return `${Math.floor(h / 24)} 天前`
+    },
+    /** ★ 0.9.45 批次标签的上下文：`起止行 · 开始时间(相对)`（工作表名和状态由模板另外两块显示） */
+    batchMeta(b) {
+      if (!b) return ''
+      const c = b.cfg || {}
+      const from = Number(c.startRow || 0)
+      const n = Number(c.rows || 0)
+      let range = ''
+      if (from > 0) range = n > 0 ? `第${from}–${from + n - 1}行` : `第${from}行起`
+      const when = b.start ? this.relTime(b.start) : (b.created ? `${this.relTime(b.created)}建的` : '')
+      return [range, when].filter(Boolean).join(' · ')
+    },
+    /** 历史条目的展开/收起（完了一律默认折叠，别占主区域） */
+    toggleHist() {
+      this.histOpen = !this.histOpen
+    },
     batchTitle(b) {
       const bits = [b.doc]
+      if (b.cfg && b.cfg.startRow > 0) {
+        const to = b.cfg.rows > 0 ? b.cfg.startRow + b.cfg.rows - 1 : ''
+        bits.push(to ? `第 ${b.cfg.startRow}–${to} 行` : `第 ${b.cfg.startRow} 行起`)
+      }
+      if (b.start) bits.push('开始 ' + new Date(b.start).toLocaleString())
+      else if (b.created) bits.push('建于 ' + new Date(b.created).toLocaleString())
       if (b.errs && b.errs.action) bits.push(b.errs.action)
+      const note = this.writeNoteFor(b)
+      if (note) bits.push(note)
       if (b.xsheet && (b.xsheet.ok || b.xsheet.fail)) bits.push(`跨表写 成功 ${b.xsheet.ok} / 回落 ${b.xsheet.fail}`)
       return bits.join(' · ')
     },
@@ -512,10 +643,14 @@ export default {
         cfg: { ...cfg },
         items, queue: queue.slice(),
         done: 0, total: queue.length,
-        start: 0, state: 'queued', stop: false,
+        start: 0, state: 'queued',
+        created: Date.now(),              // ★ 0.9.45 批次条上的「x 分钟前建的」（排队时还没 start）
+        stop: false,
         errs: { action: '', write: '' },
         misalign: 0, misalignSeen: new Set(),
         writeStats: null, writeMs: 0,
+        // ★ 0.9.45 写回三态账：fail=真写不进 / defer=跨表暂存 / fb=退回逐格（批量写不认）
+        writeNote: { fail: 0, defer: 0, fbRows: 0, fbOk: 0 },
         colSnap: null, outSnap: null,
         capErr: '', summary: '',
         xsheet: { ok: 0, fail: 0, dead: false }
@@ -535,11 +670,11 @@ export default {
       this.viewBatchId = live.id
       return live
     },
-    /** 跑完/停止的批次不用永远留着：只留最近 6 批，免得状态栏越来越长 */
+    /** 跑完/停止的批次不用永远留着：历史只留最近 5 批（界面默认折叠，够回看） */
     pruneBatches() {
       const done = this.batches.filter((b) => b.state === 'done' || b.state === 'stopped')
-      if (done.length <= 6) return
-      const drop = new Set(done.slice(0, done.length - 6).map((b) => b.id))
+      if (done.length <= 5) return
+      const drop = new Set(done.slice(0, done.length - 5).map((b) => b.id))
       this.batches = this.batches.filter((b) => !drop.has(b.id))
       this.publishBatches()
       if (drop.has(this.viewBatchId)) this.viewBatchId = ''
@@ -1385,6 +1520,7 @@ export default {
             if (b) b.writeProg = null       // 这张表写完了 → 进度条上的「写回 x/y」收掉
           }
           bst.ms = Math.round(this.nowMs() - bt0)
+          bst.deferred = deferred          // ★ 0.9.45：跨表暂存也算三态之一（不进 fail）
           if (b && cross) { b.xsheet.ok += bst.ok; b.xsheet.fail += deferred }
           this._accWriteStats(b, bst)
           for (const k of ['ok', 'fail', 'miss', 'runs', 'cells', 'fills', 'ms']) st[k] += bst[k]
@@ -1429,8 +1565,70 @@ export default {
         via: bst.via || prev.via, ms: prev.ms + bst.ms
       }
       b.writeMs = (b.writeMs || 0) + bst.ms
-      if (bst.fail) b.errs.write = `写入失败 ${bst.fail} 格（批量写不可用，退回逐格也没写进）`
-      else if (bst.cells) b.errs.write = ''
+      // ★ 0.9.45：三态分开记账。别再往 errs.write 里塞「批量写不可用，退回逐格也没写进」——
+      //   那句话把「跨表暂存」「批量路径不认但逐格写成了」「真写不进」糊成一条，害人。
+      const note = b.writeNote || (b.writeNote = { fail: 0, defer: 0, fbRows: 0, fbOk: 0 })
+      note.fail += Number(bst.fail || 0)
+      note.defer += Number(bst.deferred || 0)
+      if (bst.fbRows) {
+        note.fbRows += Number(bst.fbRows || 0)
+        note.fbOk += Number(bst.fbOk || 0)
+      }
+      if (bst.cells && !bst.fail) b.errs.write = ''
+    },
+    /** 某一批的写回三态文案（条上的 tooltip 用；横幅走 writeNote） */
+    writeNoteFor(b) {
+      const n = b && b.writeNote
+      if (!n) return ''
+      if (n.fail > 0) return `${n.fail} 格补不进去（表可能被保护/只读）`
+      if (n.defer > 0) return `${n.defer} 格结果暂存，切回原表自动补`
+      if (n.fbRows > 0) return `批量写不认，已逐格写入（成功 ${n.fbOk}）`
+      return ''
+    },
+    /**
+     * ★ 0.9.45 真写不进的格子记一条（环形缓冲，最近 200 条，可导出）：
+     *   {row, col, error, via, ts} + 单号/批次/是否后来改成跨表暂存 —— 事后归因就靠这个。
+     */
+    _recordWriteFail(w, r, viaHint) {
+      if (!w) return
+      const rec = {
+        ts: Date.now(),
+        doc: String(w.doc || ''),
+        sheet: String(w.doc || '').split('|')[1] || '',
+        row: Number(w.row || 0),
+        col: colLetter(Number(w.col || 0)),
+        colNum: Number(w.col || 0),
+        number: String(w.number == null ? '' : w.number),
+        error: String((r && r.error) || '写入失败'),
+        via: String(viaHint || (r && r.via) || '逐格'),
+        batchId: String(w.batchId || ''),
+        resolved: 'fail'      // fail | deferred（跨表被搬进待补队列时改掉）
+      }
+      w.errRec = rec
+      this.writeFailLog.push(rec)
+      if (this.writeFailLog.length > 200) this.writeFailLog.splice(0, this.writeFailLog.length - 200)
+      try { window.__SHIPTRACK_WRITE_FAILS__ = this.writeFailLog.slice() } catch (e) {}
+      this.log(`写不进 ${colLetter(rec.colNum)}${rec.row}（${rec.via}）：${rec.error}`)
+    },
+    /** 导出写入失败明细（复制到剪贴板 + 落到日志，WPS 里剪贴板不给就手工复制 pre 里的 JSON） */
+    exportWriteFails() {
+      const rows = this.writeFailLog.map((r) => ({ ...r }))
+      const json = JSON.stringify(rows, null, 1)
+      try { window.__SHIPTRACK_WRITE_FAILS__ = rows } catch (e) {}
+      const head = rows.length
+        ? rows.slice(-30).map((r) => `R${r.row} ${r.col}  ${r.error}  · ${r.via} · ${new Date(r.ts).toLocaleTimeString()} · ${r.resolved}`).join('\n')
+        : '（还没有真写不进的格子）'
+      this.log(`写入失败明细 ${rows.length} 条（最多留 200 条）\n${head}`)
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(json)
+          this.flash(`已复制 ${rows.length} 条写入失败明细（JSON）`)
+        } else {
+          this.flash('剪贴板不可用：明细已写进下面的日志，手工复制', 12000)
+        }
+      } catch (e) {
+        this.flash('剪贴板不可用：明细已写进下面的日志，手工复制', 12000)
+      }
     },
     /** 非活动表的 Worksheet 对象还摸得到吗（只读一次取值，不写不建不删） */
     _sheetUsable(b, sheet) {
@@ -1459,6 +1657,8 @@ export default {
           text: w.text, state: (it && it.state) || 'ok'
         })
         w.result = 'deferred'
+        // ★ 0.9.45：这条 fail 其实是跨表暂存（后面会自动补齐）→ 环形缓冲里改标记，别事后当成本真失败
+        if (w.errRec) w.errRec.resolved = 'deferred'
         if (it) {
           it.state = 'pending'
           if (!/待回填/.test(String(it.text))) it.text = String(it.text || '') + '（待回填）'
@@ -1620,14 +1820,18 @@ export default {
       }
       // ③ 批量写不可用 → 逐格定位；每格重新核身份（不因为「刚核过」就省）
       this.log(`批量写 ${addr} 不可用（${errs[0] || '未知'}）→ 退回逐格写`)
-      for (const w of run) this._writeOneChecked(batch, sheet, w, st, true, '退回逐格时核对不通过')
+      // ★ 0.9.45：这是第三种状态 —— 批量路径不认，但逐格写进去了（不是失败，别报成失败）
+      const ok0 = st.ok
+      for (const w of run) this._writeOneChecked(batch, sheet, w, st, true, '退回逐格时核对不通过', '逐格(批量写不认)')
+      st.fbRows = (st.fbRows || 0) + run.length
+      st.fbOk = (st.fbOk || 0) + (st.ok - ok0)
       return false
     },
     /**
      * 逐格写（批量写的唯一旁路：整个文件里只有这一处调 writeCell）。
      * 单行段、以及批量写不可用时的逐格定位都走它：先核身份（needCheck=true 时），再写，写内置读回校验。
      */
-    _writeOneChecked(batch, sheet, w, st, needCheck = true, why = '写前核对不通过') {
+    _writeOneChecked(batch, sheet, w, st, needCheck = true, why = '写前核对不通过', viaHint = '') {
       if (needCheck) {
         const cur = w.numCol ? this.readOne(sheet, w.row, w.numCol) : ''
         if (w.numCol && !this.sameNumber(w.number, cur)) {
@@ -1649,6 +1853,8 @@ export default {
       st.fail++
       w.result = 'fail'
       w.error = r && r.error
+      // ★ 0.9.45：真写不进才记——{row, col, error, via, ts} 进环形缓冲，供事后归因
+      this._recordWriteFail(w, r, viaHint)
       return false
     },
 
@@ -2814,4 +3020,16 @@ tr.skip td { color: #aaa; }
 .bchip.done { background: #f2fbf4; border-color: #cfe9d9; color: #1f6f43; }
 .bchip.stopped { background: #fafafa; border-color: #ddd; color: #777; }
 .bchip.on { box-shadow: 0 0 0 2px rgba(47, 109, 246, .35); }
+/* ★ 0.9.45 批次条收口：主条一条 + 历史折叠 + 「再开一批」挪到条尾 */
+.bchip .bmeta { color: #7a8290; font-size: 10px; }
+.bchip .bnum { font-variant-numeric: tabular-nums; }
+.bchip.main { padding: 4px 10px; }
+.bchip.hist { background: #fafbfc; border-color: #dfe3ea; color: #666; }
+.bchip.hist .bst { color: #8a9099; }
+.bchip.hist.open { border-color: #b9c3d4; background: #f4f6f9; }
+.bchip.add { background: #fff; border-style: dashed; border-color: #9dbdf7; color: #1b4ea8; }
+.bchip.add:hover { background: #eef3ff; }
+button.bchip { font-family: inherit; line-height: 1.4; }
+.bchips.more { margin-top: -2px; padding-left: 8px; border-left: 2px solid #e6e9ef; }
+.hist-more { font-size: 10px; align-self: center; }
 </style>
