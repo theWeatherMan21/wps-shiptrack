@@ -90,7 +90,7 @@
 
     <div class="bar" v-if="busy">
       <div class="bar-in" :style="{ width: progress + '%' }"></div>
-      <span class="bar-t">{{ done }}/{{ total }}{{ etaText ? ' · ' + etaText : '' }}</span>
+      <span class="bar-t">{{ done }}/{{ total }}{{ etaText ? ' · ' + etaText : '' }}{{ writeProgText ? ' · ' + writeProgText : '' }}</span>
     </div>
 
     <table v-if="items.length" class="tbl">
@@ -135,7 +135,7 @@
 </template>
 
 <script>
-const APP_VER = '0.9.43'
+const APP_VER = '0.9.44'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
@@ -354,9 +354,22 @@ export default {
     },
     etaText() {
       if (!this.busy || !this.done || !this.runStart) return ''
+      // ★ 0.9.44：跑完了不许再拼「剩约 0 秒」（爹地 97/97 截图里那行就是它）
+      const left = Math.max(0, this.total - this.done)
+      if (left <= 0) return ''
       const per = (Date.now() - this.runStart) / this.done
-      const left = Math.max(0, this.total - this.done) * per
-      return left >= 60000 ? `剩约 ${Math.round(left / 60000)} 分钟` : `剩约 ${Math.round(left / 1000)} 秒`
+      const msLeft = left * per
+      if (msLeft < 1000) return ''
+      return msLeft >= 60000 ? `剩约 ${Math.round(msLeft / 60000)} 分钟` : `剩约 ${Math.round(msLeft / 1000)} 秒`
+    },
+    /** ★ 0.9.44：写回是独立阶段（查询 97/97 ≠ 写完了）—— 进度条上单独报「写回 43/97」 */
+    writeProgText() {
+      const b = this.vb
+      const w = b && b.writeProg
+      // 只在这一轮「查询已经跑完、正在收尾写回」时显示 —— 查询中途边查边写是常态，不必刷这条
+      if (!w || !w.total) return ''
+      if (!this.total || this.done < this.total) return ''
+      return `写回 ${Math.min(w.done || 0, w.total)}/${w.total}`
     },
     progress() {
       return this.total ? Math.round((this.done / this.total) * 100) : 0
@@ -383,6 +396,7 @@ export default {
     this.writeQ = []                    // 待写队列（入队 → 一顿攒 → 按批次一次批量写）
     this.wqTimer = null                 // 攒批定时器
     this.writing = false                // 防重入
+    this.flushChain = Promise.resolve() // ★ 0.9.44 写回串行链（分段异步写回，后来的排队）
     this.flushingDocs = new Set()       // ★ 0.9.43 按表的写锁：同一张表同一时刻只许一批在写
     this.ourColor = new Map()           // `${doc}|${row}` → 我们刷的底色（清色只清自己的）
     this.inflight = 0                   // ★ 0.9.43 面板侧全局在飞请求数（硬上限，不只靠桥排队）
@@ -1288,23 +1302,38 @@ export default {
       // 攒批窗口 400ms（人眼看不出滞后）；队列一旦够 10 行就立刻写，不必等满窗口 ——
       // 每段写回都有固定开销（核身份读 + 写 + 读回 ≈ 3~4 次 COM），段越少越省。
       const ms = Number(window.__SHIPTRACK_FLUSH_MS__ || 0) || 400
-      if (!this.wqTimer && this.writeQ.length >= 10) { this.flushWrites(); return }
+      if (!this.wqTimer && this.writeQ.length >= 10) { this.flushWrites().catch(() => {}); return }
       if (this.wqTimer) return
       this.wqTimer = setTimeout(() => {
         this.wqTimer = null
-        this.flushWrites()
+        this.flushWrites().catch(() => {})
       }, ms)
     },
     flushWrites() {
       if (this.wqTimer) { clearTimeout(this.wqTimer); this.wqTimer = null }
-      return this._flushWriteQueue()
+      // ★ 0.9.44：写回改成分段异步（每 N 行让出主线程）→ 必须自己串行化：
+      //   以前同步执行天然互斥，现在两次 flush 不许同时摸 COM，后来的排在前一次后面。
+      const run = () => this._flushWriteQueue()
+      const prev = this.flushChain || Promise.resolve()
+      const p = prev.then(run, run)
+      this.flushChain = p.catch(() => {})
+      return p
+    },
+    /** 写回一段就让出一帧：主线程先重绘（进度条/写回计数），再接着写 —— 不许一次卡死几百毫秒 */
+    _yieldToUI() {
+      return new Promise((r) => setTimeout(r, 0))
+    },
+    /** 每段写多少行（测试可用 window.__SHIPTRACK_WRITE_CHUNK__ 压小） */
+    _writeChunkRows() {
+      const n = Number(window.__SHIPTRACK_WRITE_CHUNK__ || 0)
+      return n > 0 ? n : 30
     },
     /**
      * 队列落盘：按 (输出列, 单号列) 分组 → 行排序 → 连续区段 → 段内批量核身份 → 批量写 → 批量读回校验。
      * 中间有洞就断开：只对连续区段批量写，「不写的格」一个都不碰。
      * （整段覆盖会把洞里的公式/用户内容替换成死值 —— 这是最隐蔽的一种数据损坏，所以宁可按段写。）
      */
-    _flushWriteQueue() {
+    async _flushWriteQueue() {
       const st = { ok: 0, fail: 0, miss: 0, runs: 0, cells: 0, fills: 0, via: '', ms: 0 }
       if (this.writing || !this.writeQ.length) return st
       const a = this.app()
@@ -1335,12 +1364,14 @@ export default {
           const bt0 = this.nowMs()
           let deferred = 0
           this.flushingDocs.add(doc)
+          // ★ 0.9.44：写回独立进度（查询跑完 ≠ 写完了）——「查询 97/97」之后显示「写回 43/97」
+          if (b) b.writeProg = { done: 0, total: list.length }
           try {
             if (cross && !this._sheetUsable(b, sheet)) {
               // (b) 现场：这个 WPS 版本摸不到非活动表 → 老实攒着，切回去再写，绝不去猜
               deferred = this._deferEntries(list, b, '跨表写不可用（这个 WPS 版本摸不到非活动表）')
             } else {
-              this._writeList(sheet, list, bst, b)
+              await this._writeList(sheet, list, bst, b)
               if (cross) {
                 const failed = list.filter((w) => w.result === 'fail')
                 if (failed.length) {
@@ -1351,6 +1382,7 @@ export default {
             }
           } finally {
             this.flushingDocs.delete(doc)
+            if (b) b.writeProg = null       // 这张表写完了 → 进度条上的「写回 x/y」收掉
           }
           bst.ms = Math.round(this.nowMs() - bt0)
           if (b && cross) { b.xsheet.ok += bst.ok; b.xsheet.fail += deferred }
@@ -1367,6 +1399,9 @@ export default {
       } finally {
         this.writing = false
         if (later.length) this.writeQ.push(...later)   // 这一轮没写的（表被占/别的表）留着下一轮
+        // ★ 0.9.44：写回期间新进来的结果 / 被表锁挡下的条目要接着写 —— 但只在「这一轮真写进去了」时才重排，
+        //   否则碰上永久写不进去的表（表被占）会每 400ms 空转一次。
+        if (this.writeQ.length && !this.wqTimer && (st.cells || st.fail)) this._armWriteFlush()
       }
       st.ms = Math.round(this.nowMs() - t0)
       if (st.via) this.writeVia = st.via
@@ -1434,7 +1469,7 @@ export default {
       return n
     },
     /** 一批的待写队列 → 按 (输出列, 单号列) 分组 → 行排序 → 连续区段 */
-    _writeList(sheet, list, st, batch) {
+    async _writeList(sheet, list, st, batch) {
       // ★ 0.9.43「后写覆盖前写」的硬保证：同一张表同一格，如果序号更大的批次已经写过，
       //   序号小的批次就不许再往回写（否则谁先 flush 谁就赢，结果取决于网络快慢，不是直觉）。
       //   同一格里出现多次（重查）只留最后一条。
@@ -1457,6 +1492,11 @@ export default {
         groups.get(k).push(w)
       }
       const paints = []
+      // ★ 0.9.44：写回分段 + 独立进度
+      //   每格 ≥2 次同步 COM（核身份读 + 写 + 读回），一次写几十行主线程就是几百毫秒不重绘 ——
+      //   爹地的 97 行截图正是停在「97/97 · 剩约 0 秒」。现在每 N 行让出一帧，并顺手报「写回 x/y」。
+      const chunk = this._writeChunkRows()
+      let sinceYield = 0
       for (const colList of groups.values()) {
         colList.sort((x, y) => x.row - y.row)
         let i = 0
@@ -1465,10 +1505,20 @@ export default {
           while (j + 1 < colList.length && colList[j + 1].row === colList[j].row + 1) j++   // 连续行号
           const seg = colList.slice(i, j + 1)
           i = j + 1
-          this._writeSeg(batch, sheet, seg, st, paints)
+          // 区段再按 chunk 切：身份校验与批量写都按小段走，段内仍是批量写（不多花 COM）
+          for (let k = 0; k < seg.length; k += chunk) {
+            const part = seg.slice(k, k + chunk)
+            this._writeSeg(batch, sheet, part, st, paints)
+            if (batch && batch.writeProg) {
+              batch.writeProg.done = Math.min(batch.writeProg.total, (batch.writeProg.done || 0) + part.length)
+            }
+            sinceYield += part.length
+            if (sinceYield >= chunk) { sinceYield = 0; await this._yieldToUI() }
+          }
         }
       }
       if (paints.length) st.fills = this.paintRows(sheet, paints, batch && batch.doc, batch && batch.cfg.outCol)
+      if (sinceYield) await this._yieldToUI()   // 收尾也让一帧，最后一格进度能画出来
     },
     _cellValueOf(w) {
       return w.value === undefined ? w.text : w.value
@@ -2046,11 +2096,20 @@ export default {
         this.log('刷新异常终止: ' + (e.message || e))
         b.errs.action = '刷新异常终止：' + (e.message || e)
       } finally {
-        // ★ 0.9.42：本轮剩余的写回队列立刻落盘（一次批量写 + 一次读回），
-        //   然后再统计——不然「查询跑完了但结果还堆在队列里」会把汇总算错。
-        this.flushWrites()
+        // ★ 0.9.42：本轮剩余的写回队列立刻落盘（分段批量写 + 读回），然后再统计——
+        //   不然「查询跑完了但结果还堆在队列里」会把汇总算错。
+        // ★ 0.9.44：写回是「await 的异步收尾」，busy 必须等它写完才复位（避免面板先松手、
+        //   主线程还在写，画面停在最后一帧）。收尾自己抛异常也绝不能把面板锁死 →
+        //   内层 try/finally 保证 finishBatch 一定跑得到。
+        try {
+          await this.flushWrites()
+        } catch (e) {
+          b.errs.write = '收尾写回异常：' + String((e && e.message) || e).slice(0, 80)
+          this.log(b.errs.write)
+        } finally {
+          this.finishBatch(b)
+        }
       }
-      this.finishBatch(b)
     },
 
     /** 一批的收尾：把没跑完的行标清楚、汇总、落重查队列、放行排队的批次（提前退出也走这里） */
@@ -2188,7 +2247,8 @@ export default {
       } catch (e) {
         this.log('自动重查异常：' + (e.message || e))
       } finally {
-        this.flushWrites()
+        // ★ 0.9.44：写回是异步分段收尾，必须等它写完再判「这一批完成」
+        try { await this.flushWrites() } catch (e) { this.log('重查收尾写回异常：' + ((e && e.message) || e)) }
       }
       b.state = 'done'
       b.summary = summarizeFails(b.items)
@@ -2443,7 +2503,7 @@ export default {
         }
         handles.push({ w, pb, h: this.writeRowChecked(pb, sheet, w.row, w.outCol, w.text, w.number, w.numCol, pseudo) })
       }
-      this.flushWrites()          // 补齐是用户明确要的动作 → 立刻落盘，不等攒批
+      await this.flushWrites()          // 补齐是用户明确要的动作 → 立刻落盘，不等攒批
       for (const { w, pb, h } of handles) {
         const res = h && h.entry ? h.entry.result : 'fail'
         if (res === 'ok') {
