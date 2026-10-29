@@ -67,6 +67,30 @@ const banner = (p) => p.evaluate(() => {
   const el = document.querySelector('.err, .warn')
   return el ? el.innerText.replace(/\n/g, ' ') : ''
 })
+// ★ 0.9.43 批次队列：等所有批次跑完（探针靠面板自己暴露的 __SHIPTRACK_BATCHES__ 判断）
+const waitBatches = async (p, ms = 90000) => {
+  const t0 = Date.now()
+  while (Date.now() - t0 < ms) {
+    const st = await p.evaluate(() => window.__SHIPTRACK_BATCHES__ || [])
+    if (st.length && st.every((b) => b.state === 'done' || b.state === 'stopped' || b.state === 'error')) return st
+    await p.waitForTimeout(250)
+  }
+  return await p.evaluate(() => window.__SHIPTRACK_BATCHES__ || [])
+}
+// 单表写入审计：每条写入的行号，在该表「单号列」上必须还是这条结果的单号（零串表/零错位）
+const checkSheet = (writes, grid, numCol, outCol) => {
+  const bad = []
+  let n = 0
+  for (const [row, col, val] of writes || []) {
+    if (col !== outCol) continue
+    n++
+    const have = String(grid[`${row},${numCol}`] || '').replace(/[^A-Z0-9]/gi, '').toUpperCase()
+    const m = String(val).match(/TESTBL[A-Z]?\d{3,4}/)
+    if (!m) { bad.push(`R${row} 写入内容没带单号标记：${String(val).slice(0, 24)}`); continue }
+    if (have !== m[0]) bad.push(`R${row} 写的是 ${m[0]}，该行单号现在是 ${have || '(空)'}`)
+  }
+  return { n, bad }
+}
 
 // ---------- H1 写入被拒：横幅说明 + 不丢数据 ----------
 {
@@ -118,9 +142,12 @@ const banner = (p) => p.evaluate(() => {
   await ctx.close()
 }
 
-// ---------- H4 运行时切表 → 不中止、不写错表、切回点「补齐回填」一次补完 ----------
+// ---------- H4 (b) 现场：非活动表摸不到 → 不中止、不写错表、切回自动补齐 ----------
+// ★ 0.9.43：多表并行后「切表能不能继续写」取决于 WPS 版本（(a)/(b)）。
+// 这条专测保守路径：__crossSheetBlock = true（写非活动表抛错）→ 必须自动回落「攒着等切回」。
 {
   const { ctx, page } = await open({ lead: 3000 })
+  await page.evaluate(() => { window.__crossSheetBlock = true })
   const doc0 = await page.evaluate(() => window.__doc)
   await click(page, /选单号列/)
   await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
@@ -142,10 +169,11 @@ const banner = (p) => p.evaluate(() => {
   const wrSettled = await page.evaluate(() => window.__written.length)
   const hasFlushBtn = await page.evaluate(() => /补齐回填\s*\d/.test(document.body.innerText))
   const pendingRows = await page.evaluate(() => document.querySelectorAll('tr.pending').length)
-  // 切回原表 → 点补齐
+  // 切回原表 → 点补齐（没按钮就说明自动补齐已经干完了）
   await page.evaluate((d) => { window.__doc = d }, doc0)
-  await click(page, /补齐回填/)
-  await page.waitForTimeout(800)
+  const canFlush = await page.evaluate(() => !![...document.querySelectorAll('button')].find((x) => /补齐回填/.test(x.textContent)))
+  if (canFlush) { try { await click(page, /补齐回填/) } catch (e) { /* 已被自动补齐清掉 */ } }
+  await page.waitForTimeout(1500)
   const wrFlushed = await page.evaluate(() => window.__written.length)
   const stillPending = await page.evaluate(() => document.querySelectorAll('tr.pending').length)
   // 按钮不再是必经路径（0.9.39 起回原表全自动）：有按钮=还在等，没按钮但已补完=更理想
@@ -166,6 +194,7 @@ const banner = (p) => p.evaluate(() => {
                 '280815902', '280816103', '280817204', '280818305', '280819406', '280820507', '280821608', '280822709']
   nums.forEach((n, i) => { grid[`${i + 2},17`] = n })
   const { ctx, page } = await open({ grid, lead: 4000 })
+  await page.evaluate(() => { window.__crossSheetBlock = true })   // (b) 现场：写非活动表抛错
   const doc0 = await page.evaluate(() => window.__doc)
   await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })   // 单号在 Q 列
   await page.evaluate(() => { window.__grid['1,17'] = 'MBL' })                                  // 表头，避免被当单号
@@ -179,14 +208,30 @@ const banner = (p) => p.evaluate(() => {
   }
   await page.waitForTimeout(600)                                    // 刚开跑就切走（第一批还在飞）
   await page.evaluate(() => { window.__doc = 'A.xlsx|Sheet2' })
-  await page.waitForTimeout(9000)                                   // 等前两批完成 → defer 进 pending，后两批还在跑
-  const pendingBefore = await page.evaluate(() => document.querySelectorAll('tr.pending').length)
+  // ★ 0.9.43：切走时不再显示别的表的行（表格是空的），待补条数从「补齐回填 N」按钮读
+  const pendingBtn = async () => {
+    const t = await page.evaluate(() => {
+      const b = [...document.querySelectorAll('button')].find((x) => /补齐回填/.test(x.textContent))
+      return b ? b.textContent : ''
+    })
+    const m = String(t).match(/(\d+)/)
+    return m ? Number(m[1]) : 0
+  }
+  // 等到「切走之后有结果攒起来（待补>0）且整轮还没跑完」——这正是 H4b 的场景，不能靠死等
+  let pendingBefore = 0
+  let stillRunningBefore = false
+  for (let i = 0; i < 120; i++) {
+    pendingBefore = await pendingBtn()
+    stillRunningBefore = await page.evaluate(() => (window.__SHIPTRACK_BATCHES__ || []).some((b) => b.state === 'running'))
+    if (pendingBefore > 0 && stillRunningBefore) break
+    await page.waitForTimeout(250)
+  }
   const wrBeforeBack = await page.evaluate(() => window.__written.length)
   await page.evaluate((d) => { window.__doc = d }, doc0)            // 切回，什么都不点
   await page.waitForTimeout(3400)                                   // 等 2.5s 定时器
   const wrAfterAuto = await page.evaluate(() => window.__written.length)
-  const pendingAfter = await page.evaluate(() => document.querySelectorAll('tr.pending').length)
-  const stillRunning = await page.evaluate(() => !!document.querySelector('.bar'))
+  const pendingAfter = await pendingBtn()
+  const stillRunning = await page.evaluate(() => (window.__SHIPTRACK_BATCHES__ || []).some((b) => b.state === 'running'))
   // 判据核心 = pending 队列被清掉（只有 autoFlush 会清）+ 写入数涨 + 整轮没结束。
   // 只看「写入数涨」不够：新到期的行也会正常写，分不清是补齐还是新行。
   const ok = pendingBefore > 0 && pendingAfter < pendingBefore && wrAfterAuto > wrBeforeBack && stillRunning
@@ -708,6 +753,238 @@ function auditWrites(written, gridAfter, numCol, outCol) {
     firstBatch && multi.length >= 1 && maxRun >= 2 && bad.length === 0 && hint && okRows.length >= 3,
     `批量写 ${batchWrites.length} 次（多行段 ${multi.length} 个，最大段长 ${maxRun}）· 写入 ${n} 格 · 合法行=${JSON.stringify(okRows)} · 删除点及以下被写=${JSON.stringify(touchedAfterDelete)} · 冲突 ${bad.length}${bad.length ? '：' + bad.join('；') : ''}`
       + `\n     写回统计=${JSON.stringify(stats)}\n     横幅="${b}"`)
+  await ctx.close()
+}
+
+// ---------- H26 同一工作簿两张表并行：(a) 现场（能写非活动表）----------
+// 爹地 2026-10-29 的原始诉求：A 表在跑，切到 B 表还能再点，两批一起推进、各自进度、互不阻塞。
+// 判据：① 采样到两批同时 running 且都在推进；② 每张表的写入只落在自己的表、且行号与单号对得上（零串表）。
+{
+  const N = 8
+  const gridA = { '1,17': 'MBL' }, gridB = { '1,17': 'MBL' }
+  const numA = [], numB = [], evBy = {}
+  for (let i = 0; i < N; i++) {
+    const a = 'TEST-BL-4' + String(i + 1).padStart(3, '0')
+    const b = 'TEST-BL-5' + String(i + 1).padStart(3, '0')
+    numA.push(a); numB.push(b)
+    gridA[`${i + 2},17`] = a
+    gridB[`${i + 2},17`] = b
+    evBy[a.replace(/-/g, '')] = [{ time: '2026-10-02T00:00:00Z', activity: 'Departure From', city: a.replace(/-/g, '') }]
+    evBy[b.replace(/-/g, '')] = [{ time: '2026-10-03T00:00:00Z', activity: 'Departure From', city: b.replace(/-/g, '') }]
+  }
+  const { ctx, page } = await open({ sheets: [{ name: 'Sheet1', grid: gridA }, { name: 'Sheet2', grid: gridB }], lead: 1500, last: N + 1 })
+  await page.evaluate((e) => { window.__evByNumber = e }, evBy)
+  await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选单号列/)
+  await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选输出列/)
+  await tryRun(page)                                     // 第一批发车（Sheet1）
+  await page.waitForTimeout(400)
+  await page.evaluate(() => window.__setSheet('Sheet2')) // 切到第二张表
+  await page.waitForTimeout(1400)                        // 等面板认出切表（900ms 轮询）并载入该表配置
+  await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选单号列/)
+  await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选输出列/)
+  await tryRun(page)                                     // 第二批发车（Sheet2）—— 第一轮还在跑
+  // 采样：两批有没有同时在跑、并且都在推进
+  let both = false, peak = 0
+  for (let i = 0; i < 40; i++) {
+    const st = await page.evaluate(() => window.__SHIPTRACK_BATCHES__ || [])
+    const run = st.filter((b) => b.state === 'running')
+    peak = Math.max(peak, run.length)
+    if (run.length >= 2 && run.every((b) => b.done > 0)) { both = true; break }
+    await page.waitForTimeout(150)
+  }
+  const final = await waitBatches(page, 90000)
+  const grids = await page.evaluate(() => window.__grids)
+  const bySheet = await page.evaluate(() => window.__writesBySheet || {})
+  const cross = await page.evaluate(() => window.__SHIPTRACK_CROSS__ || {})
+  const auditA = checkSheet(bySheet.Sheet1, grids.Sheet1, 17, 18)
+  const auditB = checkSheet(bySheet.Sheet2, grids.Sheet2, 17, 18)
+  const doneA = final.filter((b) => b.doc === 'A.xlsx|Sheet1' && b.state === 'done')
+  const doneB = final.filter((b) => b.doc === 'A.xlsx|Sheet2' && b.state === 'done')
+  const ok = both && peak >= 2 && doneA.length === 1 && doneB.length === 1
+    && doneA[0].done === N && doneB[0].done === N
+    && auditA.bad.length === 0 && auditB.bad.length === 0
+    && auditA.n >= N && auditB.n >= N
+  pass('H26 同工作簿两张表并行（各跑各的进度、零串表）', ok,
+    `同时在跑峰值=${peak} · 两批都在推进=${both} · 批次=${JSON.stringify(final.map((b) => [b.doc, b.state, b.done + '/' + b.total]))}`
+    + `\n     Sheet1 写入 ${auditA.n} 格、Sheet2 写入 ${auditB.n} 格 · 串表/错位 ${auditA.bad.length + auditB.bad.length}`
+    + `${[...auditA.bad, ...auditB.bad].slice(0, 3).join('；')} · 跨表写 ${JSON.stringify({ ok: cross.ok, fail: cross.fail })}`)
+  await ctx.close()
+}
+
+// ---------- H27 (b) 现场：非活动表摸不到 → 自动回落「攒着等切回」，切回去自动补 ----------
+// 这是 (a)/(b) 自答的实测口：crossSheetWrite.fail > 0 就说明这个 WPS 版本是 (b)，代码已在保守路径上。
+{
+  const N = 6
+  const gridA = { '1,17': 'MBL' }, gridB = { '1,17': 'MBL' }
+  const evBy = {}
+  for (let i = 0; i < N; i++) {
+    const a = 'TEST-BL-6' + String(i + 1).padStart(3, '0')
+    const b = 'TEST-BL-7' + String(i + 1).padStart(3, '0')
+    gridA[`${i + 2},17`] = a
+    gridB[`${i + 2},17`] = b
+    evBy[a.replace(/-/g, '')] = [{ time: '2026-10-02T00:00:00Z', activity: 'Departure From', city: a.replace(/-/g, '') }]
+    evBy[b.replace(/-/g, '')] = [{ time: '2026-10-03T00:00:00Z', activity: 'Departure From', city: b.replace(/-/g, '') }]
+  }
+  const { ctx, page } = await open({ sheets: [{ name: 'Sheet1', grid: gridA }, { name: 'Sheet2', grid: gridB }], lead: 900, last: N + 1 })
+  await page.evaluate(() => { window.__crossSheetBlock = true })
+  await page.evaluate((e) => { window.__evByNumber = e }, evBy)
+  await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选单号列/)
+  await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选输出列/)
+  await tryRun(page)                                        // Sheet1 开跑
+  await page.waitForTimeout(300)
+  await page.evaluate(() => window.__setSheet('Sheet2'))    // 切走：Sheet1 后面的结果只能攒着
+  await page.waitForTimeout(1500)
+  await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选单号列/)
+  await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选输出列/)
+  await tryRun(page)                                        // Sheet2 开跑（活着的表不受影响）
+  let final = await waitBatches(page, 90000)
+  const crossMid = await page.evaluate(() => window.__SHIPTRACK_CROSS__ || {})
+  const pendingMid = await page.evaluate(() => document.querySelectorAll('tr.pending').length)
+  const bySheetMid = await page.evaluate(() => window.__writesBySheet || {})
+  // 切回 Sheet1 → 自动补齐（不点按钮）
+  await page.evaluate(() => window.__setSheet('Sheet1'))
+  await page.waitForTimeout(3600)
+  const bySheet = await page.evaluate(() => window.__writesBySheet || {})
+  const grids = await page.evaluate(() => window.__grids)
+  const auditA = checkSheet(bySheet.Sheet1, grids.Sheet1, 17, 18)
+  const auditB = checkSheet(bySheet.Sheet2, grids.Sheet2, 17, 18)
+  const pendingAfter = await page.evaluate(() => document.querySelectorAll('tr.pending').length)
+  const ok = (crossMid.fail || 0) > 0 && auditA.bad.length === 0 && auditB.bad.length === 0
+    && auditA.n >= N && auditB.n >= N && pendingAfter === 0
+  pass('H27 (b) 现场：跨表写不可用 → 自动回落攒着，切回升效补齐', ok,
+    `跨表写计数 ${JSON.stringify({ ok: crossMid.ok, fail: crossMid.fail })} · 切走期间待补行=${pendingMid}`
+    + ` · 切回后 Sheet1 写入 ${auditA.n} 格 / Sheet2 ${auditB.n} 格 · 残留待补=${pendingAfter} · 串表/错位 ${auditA.bad.length + auditB.bad.length}`
+    + `${[...auditA.bad, ...auditB.bad].slice(0, 3).join('；')}`)
+  await ctx.close()
+}
+
+// ---------- H28 两批并发 + 中途来回切表 → 零错位、零串表 ----------
+{
+  const N = 6
+  const gridA = { '1,17': 'MBL' }, gridB = { '1,17': 'MBL' }
+  const evBy = {}
+  for (let i = 0; i < N; i++) {
+    const a = 'TEST-BL-8' + String(i + 1).padStart(3, '0')
+    const b = 'TEST-BL-9' + String(i + 1).padStart(3, '0')
+    gridA[`${i + 2},17`] = a
+    gridB[`${i + 2},17`] = b
+    evBy[a.replace(/-/g, '')] = [{ time: '2026-10-02T00:00:00Z', activity: 'Departure From', city: a.replace(/-/g, '') }]
+    evBy[b.replace(/-/g, '')] = [{ time: '2026-10-03T00:00:00Z', activity: 'Departure From', city: b.replace(/-/g, '') }]
+  }
+  const { ctx, page } = await open({ sheets: [{ name: 'Sheet1', grid: gridA }, { name: 'Sheet2', grid: gridB }], lead: 1200, last: N + 1 })
+  await page.evaluate((e) => { window.__evByNumber = e }, evBy)
+  await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选单号列/)
+  await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选输出列/)
+  await tryRun(page)
+  await page.waitForTimeout(300)
+  await page.evaluate(() => window.__setSheet('Sheet2'))
+  await page.waitForTimeout(1400)
+  await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选单号列/)
+  await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选输出列/)
+  await tryRun(page)
+  // 两批都在跑的时候来回切三次
+  for (const sh of ['Sheet1', 'Sheet2', 'Sheet1', 'Sheet2']) {
+    await page.waitForTimeout(700)
+    await page.evaluate((s) => window.__setSheet(s), sh)
+  }
+  await waitBatches(page, 90000)
+  await page.waitForTimeout(3600)          // 给自动补齐留时间
+  const bySheet = await page.evaluate(() => window.__writesBySheet || {})
+  const grids = await page.evaluate(() => window.__grids)
+  const auditA = checkSheet(bySheet.Sheet1, grids.Sheet1, 17, 18)
+  const auditB = checkSheet(bySheet.Sheet2, grids.Sheet2, 17, 18)
+  const final = await page.evaluate(() => window.__SHIPTRACK_BATCHES__ || [])
+  const ok = auditA.bad.length === 0 && auditB.bad.length === 0 && auditA.n >= N && auditB.n >= N
+  pass('H28 两批并发 + 中途来回切表 → 零错位零串表', ok,
+    `批次=${JSON.stringify(final.map((b) => [b.doc, b.state, b.done + '/' + b.total]))}`
+    + ` · Sheet1 写入 ${auditA.n} 格 / Sheet2 ${auditB.n} 格 · 串表/错位 ${auditA.bad.length + auditB.bad.length}`
+    + `${[...auditA.bad, ...auditB.bad].slice(0, 3).join('；')}`)
+  await ctx.close()
+}
+
+// ---------- H29 同一张表两批 → 后写覆盖前写，无重复残留 ----------
+{
+  const N = 4
+  const grid = { '1,17': 'MBL' }
+  for (let i = 0; i < N; i++) grid[`${i + 2},17`] = 'TEST-BL-A' + String(i + 1).padStart(4, '0')
+  const { ctx, page } = await open({ grid, lead: 1500, last: N + 1 })
+  await page.evaluate(() => { window.__evKind = 'at_sea' })     // 第一批：QINGDAO（离港）
+  await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选单号列/)
+  await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选输出列/)
+  await tryRun(page)
+  await page.waitForTimeout(350)                                 // 第一批的 4 个请求已经在飞
+  await page.evaluate(() => { window.__evKind = 'arrived' })      // 第二批：ISTANBUL（到港）
+  await click(page, /再开一批/)                                   // 同一张表再开一批
+  const final = await waitBatches(page, 90000)
+  await page.waitForTimeout(600)
+  const vals = await page.evaluate((n) => { const o = []; for (let r = 2; r <= n + 1; r++) o.push(String(window.__grid[`${r},18`] || '')); return o }, N)
+  const wrote = await page.evaluate((n) => { const o = []; for (let r = 2; r <= n + 1; r++) o.push(String(window.__grid[`${r},17`] || '')); return o }, N)
+  const allNew = vals.every((v) => /ISTANBUL/.test(v))
+  const noOld = vals.every((v) => !/QINGDAO/.test(v))
+  const identity = wrote.every((n, i) => n === 'TEST-BL-A' + String(i + 1).padStart(4, '0'))
+  const two = final.filter((b) => b.doc === 'A.xlsx|Sheet1').length >= 2
+  pass('H29 同表两批 → 后写覆盖前写、无重复残留', two && allNew && noOld && identity,
+    `批次=${JSON.stringify(final.map((b) => [b.state, b.done + '/' + b.total]))} · 后一批结果全落表=${allNew}（应 true）`
+    + ` · 旧值残留=${!noOld}（应 false）· 单号列未被改动=${identity}\n     写回内容=${JSON.stringify(vals.map((v) => v.slice(0, 28)))}`)
+  await ctx.close()
+}
+
+// ---------- H30 失败隔离：一批造错，另一批仍然全部成功 ----------
+{
+  const N = 4
+  const gridA = { '1,17': 'MBL' }, gridB = { '1,17': 'MBL' }
+  for (let i = 0; i < N; i++) {
+    gridA[`${i + 2},17`] = 'TEST-BL-C' + String(i + 1).padStart(4, '0')
+    gridB[`${i + 2},17`] = 'TEST-BL-D' + String(i + 1).padStart(4, '0')
+  }
+  const { ctx, page } = await open({ sheets: [{ name: 'Sheet1', grid: gridA }, { name: 'Sheet2', grid: gridB }], lead: 300 })
+  await page.evaluate(() => {
+    // Sheet1 的号全部打挂（站点报错），Sheet2 正常
+    window.__trackFail = {}
+    for (let i = 0; i < 4; i++) window.__trackFail['TESTBLC000' + (i + 1)] = 'HTTP 500 站点错误'
+  })
+  await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选单号列/)
+  await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选输出列/)
+  await tryRun(page)
+  await page.waitForTimeout(200)
+  await page.evaluate(() => window.__setSheet('Sheet2'))
+  await page.waitForTimeout(1400)
+  await page.evaluate(() => { window.__sel = { col: 17, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选单号列/)
+  await page.evaluate(() => { window.__sel = { col: 18, row: 1, rows: 1048576, cols: 1 } })
+  await click(page, /选输出列/)
+  await tryRun(page)
+  const final = await waitBatches(page, 60000)
+  const grids = await page.evaluate(() => window.__grids)
+  const aCol = [], bCol = []
+  for (let r = 2; r <= N + 1; r++) { aCol.push(String(grids.Sheet1[`${r},18`] || '')); bCol.push(String(grids.Sheet2[`${r},18`] || '')) }
+  const bAllOk = bCol.every((v) => /QINGDAO|ISTANBUL|离港|到港/.test(v))
+  // 出错那批：写进去的只能是「失败：…」这类结论（不许出现成功文案），而且绝不能影响另一批
+  const aNoSuccess = aCol.every((v) => !/QINGDAO|ISTANBUL|离港|到港/.test(v))
+  const bySheet = await page.evaluate(() => window.__writesBySheet || {})
+  const noCross = Object.entries(bySheet).every(([sh, list]) => list.every(([, , val]) => {
+    if (sh === 'Sheet1') return !/TESTBLD\d{4}/.test(String(val))
+    return !/TESTBLC\d{4}/.test(String(val))
+  }))
+  const bothDone = final.length >= 2 && final.every((b) => b.state === 'done')
+  pass('H30 一批故意造错，另一批仍全部成功（失败隔离）', bothDone && bAllOk && aNoSuccess && noCross,
+    `批次=${JSON.stringify(final.map((b) => [b.doc, b.state, b.done + '/' + b.total]))} · 出错表写入=${JSON.stringify(aCol.map((v) => v.slice(0, 14)))}（不许出现成功文案）· 正常表=${JSON.stringify(bCol.map((v) => v.slice(0, 20)))} · 串表=${!noCross}`)
   await ctx.close()
 }
 
