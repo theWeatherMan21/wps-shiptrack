@@ -34,6 +34,17 @@ const CLI = path.join(REPO, 'engine/tracking/cli.mjs');
 const PORT = Number(process.env.WPS_TRACK_PORT || 8791);
 const HOST = process.env.WPS_TRACK_HOST || '127.0.0.1';
 const DEFAULT_TIMEOUT = Number(process.env.WPS_TRACK_TIMEOUT_MS || 90000);
+// 调用方可显式指定更长超时（慢站），但要有硬上限防手滑传 1e9 把连接挂死。
+// 以前上限直接复用 DEFAULT_TIMEOUT → 只能调低不能调高（语义错），慢站想放宽没有口子。
+const MAX_TIMEOUT = Number(process.env.WPS_TRACK_MAX_TIMEOUT_MS || 180000);
+// 统一夹取：非法/缺省 → 默认值；正常值夹进 [3s, MAX]。
+// 以前写成 Number(x || DEFAULT) —— 传 "abc" 时 Number("abc")=NaN 会被原样放行，
+// 一路传进 runCli 变成 setTimeout(…, NaN) 立刻判超时、--timeout NaN 引擎报错。
+function clampTimeout(raw) {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_TIMEOUT;
+  return Math.min(Math.max(n, 3000), MAX_TIMEOUT);
+}
 const CACHE_TTL = Number(process.env.WPS_TRACK_CACHE_MS || 10 * 60 * 1000);
 // 插件配置落盘：WPS 的 PluginStorage 在开发模式加载项里不保证持久，走本地文件最稳
 const CFG_DIR = process.env.WPS_TRACK_CONFIG_DIR || path.join(os.homedir(), '.hermes', 'wps-shiptrack');
@@ -275,7 +286,7 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/track') {
     const number = clean(url.searchParams.get('number'));
     const carrier = clean(url.searchParams.get('carrier')) || '';
-    const timeoutMs = Math.min(Math.max(Number(url.searchParams.get('timeout') || DEFAULT_TIMEOUT), 3000), DEFAULT_TIMEOUT);
+    const timeoutMs = clampTimeout(url.searchParams.get('timeout'));
     if (!number) return send(res, 400, { ok: false, error: '缺 number' });
     const key = number + '|' + carrier;
     const hit = cacheGet(key, url.searchParams.get('fresh') === '1');
@@ -329,7 +340,7 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/track-batch') {
     const numbers = (url.searchParams.get('numbers') || '').split(/[,\s]+/).map(clean).filter(Boolean).slice(0, 200);
     if (!numbers.length) return send(res, 400, { ok: false, error: '缺 numbers' });
-    const timeoutMs = Math.min(Math.max(Number(url.searchParams.get('timeout') || DEFAULT_TIMEOUT), 3000), DEFAULT_TIMEOUT);
+    const timeoutMs = clampTimeout(url.searchParams.get('timeout'));
     res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8', ...CORS });
     for (const n of numbers) {
       const key = n + '|';
