@@ -24,6 +24,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import os from 'node:os';
+import { resolveTimeouts, makeClampTimeout, resolvePort, resolveCacheTtl } from './timeouts.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // Windows 上不能直接 import('C:\\a\\b.mjs')（ESM 只认 file:// URL）——统一走这个
@@ -31,21 +32,16 @@ const dynImport = (p) => import(pathToFileURL(p).href);
 const REPO = process.env.SSH_REPO
   || path.resolve(os.homedir(), 'Documents', 'trae_projects', 'ShipScheduleHub');
 const CLI = path.join(REPO, 'engine/tracking/cli.mjs');
-const PORT = Number(process.env.WPS_TRACK_PORT || 8791);
+// ★ 数值配置统一走 ./timeouts.mjs（纯函数、可单测）：
+//   环境变量是手写的，裸 Number() 遇错字会得 NaN 并一路静默变形
+//   （setTimeout(…, NaN) 立刻超时 / --timeout NaN / listen(NaN) 随机端口连不上）。
+const PORT = resolvePort();
 const HOST = process.env.WPS_TRACK_HOST || '127.0.0.1';
-const DEFAULT_TIMEOUT = Number(process.env.WPS_TRACK_TIMEOUT_MS || 90000);
+const { defaultTimeout: DEFAULT_TIMEOUT, maxTimeout: MAX_TIMEOUT } = resolveTimeouts();
 // 调用方可显式指定更长超时（慢站），但要有硬上限防手滑传 1e9 把连接挂死。
 // 以前上限直接复用 DEFAULT_TIMEOUT → 只能调低不能调高（语义错），慢站想放宽没有口子。
-const MAX_TIMEOUT = Number(process.env.WPS_TRACK_MAX_TIMEOUT_MS || 180000);
-// 统一夹取：非法/缺省 → 默认值；正常值夹进 [3s, MAX]。
-// 以前写成 Number(x || DEFAULT) —— 传 "abc" 时 Number("abc")=NaN 会被原样放行，
-// 一路传进 runCli 变成 setTimeout(…, NaN) 立刻判超时、--timeout NaN 引擎报错。
-function clampTimeout(raw) {
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) return DEFAULT_TIMEOUT;
-  return Math.min(Math.max(n, 3000), MAX_TIMEOUT);
-}
-const CACHE_TTL = Number(process.env.WPS_TRACK_CACHE_MS || 10 * 60 * 1000);
+const clampTimeout = makeClampTimeout({ defaultTimeout: DEFAULT_TIMEOUT, maxTimeout: MAX_TIMEOUT });
+const CACHE_TTL = resolveCacheTtl();
 // 插件配置落盘：WPS 的 PluginStorage 在开发模式加载项里不保证持久，走本地文件最稳
 const CFG_DIR = process.env.WPS_TRACK_CONFIG_DIR || path.join(os.homedir(), '.hermes', 'wps-shiptrack');
 // 并发：默认 4（实测 2 时一批 96 单要十几分钟）。可用 WPS_TRACK_CONCURRENCY 覆盖。
