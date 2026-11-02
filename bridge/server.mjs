@@ -18,6 +18,7 @@
 // 约定：一律 200 + {ok:false,...} 表达业务失败；4xx 只用于参数错。
 import http from 'node:http';
 import { makeKeyedMutex } from './sched.mjs';
+import { Ledger, toRecord, isCooldownKind, COOLDOWN_DEFAULT_MS } from './ledger.mjs';
 import { checkUpdate, applyUpdate } from './update.mjs';
 import { profile as netProfile, childEnv, isConnectionLevel } from './net.mjs';
 import { spawn } from 'node:child_process';
@@ -103,6 +104,12 @@ function slot() {
 // 实现放在 ./sched.mjs（纯函数、可单测）。
 const carrierSched = makeKeyedMutex();
 const withCarrierMutex = (carrier, fn) => carrierSched.run(carrier, fn);
+
+// ---------- 断点续查账本（卡 t_03fc348f）----------
+// 失败行落盘 + 撞盾整家冷却。落盘在 ~/.hermes/wps-shiptrack/ledger/，冷却到点自动解封。
+const LEDGER_DIR = process.env.WPS_TRACK_LEDGER_DIR || path.join(os.homedir(), '.hermes', 'wps-shiptrack');
+const ledger = new Ledger(LEDGER_DIR);
+const COOLDOWN_MS = Math.max(60000, Number(process.env.WPS_TRACK_COOLDOWN_MS || COOLDOWN_DEFAULT_MS));
 
 // ---------- 查询缓存 ----------
 const cache = new Map(); // key -> {at, value}
@@ -384,10 +391,37 @@ const server = http.createServer(async (req, res) => {
     } catch (e) { return send(res, 200, { ok: false, error: String(e.message || e) }); }
   }
 
+  // ★ 卡 t_03fc348f：断点续查 —— 拿到某个文档上次失败、要补查的行
+  if (url.pathname === '/pending') {
+    const docKey = String(url.searchParams.get('doc') || '').trim() || '_default';   // 不能过 clean()：会大写化、删空格
+    const rows = ledger.pending(docKey).map((r) => ({
+      number: r.number, doc: r.doc, sheet: r.sheet, row: r.row,
+      carrier: r.carrier, kind: r.kind, err: r.err, at: r.at,
+      cooldownLeftMs: r.carrier ? ledger.cooldownLeft(r.carrier) : 0,
+    }));
+    return send(res, 200, { ok: true, doc: docKey, count: rows.length, rows });
+  }
+
+  // 清账本（用户点「重头查」时）—— 只删这一份文档的记录，不动别的表
+  if (url.pathname === '/ledger/clear') {
+    const docKey = String(url.searchParams.get('doc') || '').trim() || '_default';   // 不能过 clean()：会大写化、删空格
+    ledger.clear(docKey);
+    return send(res, 200, { ok: true, doc: docKey, cleared: true });
+  }
+
   if (url.pathname === '/track-batch') {
     const numbers = (url.searchParams.get('numbers') || '').split(/[,\s]+/).map(clean).filter(Boolean).slice(0, 200);
     if (!numbers.length) return send(res, 400, { ok: false, error: '缺 numbers' });
     const timeoutMs = clampTimeout(url.searchParams.get('timeout'));
+    // ★ 卡 t_03fc348f：断点续查的两个入参（都可选，不带就是原来的行为）
+    //   doc  文档 key（插件传 "工作簿|工作表"），分账本用
+    //   rows 可选 JSON [{number, doc, sheet, row}]，带上才能落 doc/sheet/row 三字段
+    const docKey = String(url.searchParams.get('doc') || '').trim() || '_default';   // 不能过 clean()：会大写化、删空格
+    const rowMeta = {};
+    try {
+      const raw = url.searchParams.get('rows');
+      if (raw) for (const it of JSON.parse(raw)) if (it && it.number) rowMeta[String(it.number)] = it;
+    } catch (e) { console.error('[track-batch] rows 参数解析失败:', String(e.message || e).slice(0, 120)); }
     // ★ 卡 t_8a6689dc：批量接口也认 plugin 版本 —— 太旧的插件逐行回降级桩（不查、不给字段）
     const bj = CONTRACT.judgePlugin(url.searchParams.get('schema'));
     if (bj.tooOld) {
@@ -402,20 +436,50 @@ const server = http.createServer(async (req, res) => {
     //   全局并发仍由 runCli 里的 slot() 管，这里只负责「同船司排队」——不另造信号量。
     let d = null;
     try { d = await detector(); } catch (e) { console.error('[track-batch] 识别器不可用，按未识别串行:', String(e.message || e).slice(0, 120)); }
-    const jobs = numbers.map((n) => {
-      let carrier = '';
-      try { const id = d && d.detectCarrier(n); if (id && id.ok && id.carrier) carrier = id.carrier; } catch (e) {}
-      return { n, carrier };
-    });
+    // ★ 卡 t_03fc348f：断点续查 —— doc 分账本，rows 带行号，only=pending 只补上次失败的
+    let pendingSet = null;
+    if (url.searchParams.get('only') === 'pending') {
+      pendingSet = new Set(ledger.pending(docKey).map((r) => String(r.number)));
+      console.error(`[track-batch] 断点续查：${numbers.length} 单里上次失败 ${[...numbers].filter((n) => pendingSet.has(n)).length} 单`);
+    }
+    const jobs = numbers
+      .filter((n) => !pendingSet || pendingSet.has(String(n)))
+      .map((n) => {
+        let carrier = '';
+        try { const id = d && d.detectCarrier(n); if (id && id.ok && id.carrier) carrier = id.carrier; } catch (e) {}
+        const meta = rowMeta[String(n)] || {};
+        return { n, carrier, doc: meta.doc ?? null, sheet: meta.sheet ?? null, row: meta.row ?? null };
+      });
     // 每行单独 write —— Node 的 write 是原子的，并发写不会把两条结果拼成半行；
     // 插件按 number 匹配行，不依赖返回顺序，所以按完成顺序回传是安全的。
-    await Promise.all(jobs.map(({ n, carrier }) => withCarrierMutex(carrier, async () => {
+    await Promise.all(jobs.map(({ n, carrier, doc, sheet, row }) => withCarrierMutex(carrier, async () => {
+      const meta = { doc, sheet, row };
       try {
+        // ① 冷却检查（拿锁之后做，避免并发抢同一家）
+        const left = ledger.cooldownLeft(carrier);
+        if (left > 0) {
+          const r = withSchema({
+            ok: false, number: n, carrier, errorKind: 'cooling',
+            error: `${carrier || '该船司'} 冷却中（还剩 ${Math.ceil(left / 60000)} 分钟），到点自动重试`,
+            coolingLeftMs: left,
+          });
+          ledger.append(docKey, [toRecord({ ...meta, number: n, result: r })]);
+          if (!res.writableEnded) res.write(JSON.stringify(r) + '\n');
+          return;
+        }
+        // ② 正常查询
         const key = n + '|' + carrier;
         const hit = cacheGet(key);
         const r0 = hit ? { ...hit, cached: true } : await runCli({ number: n, carrier, timeoutMs });
         const r = withSchema(r0);
         if (!hit && r.ok) cacheSet(key, r);
+        // ③ 落盘（成功也记：下次刷新才知道这行已经查过了）
+        ledger.append(docKey, [toRecord({ ...meta, number: n, result: r })]);
+        // ④ 撞盾 → 整家冷却，本轮剩余该家不再发请求
+        if (!r.ok && isCooldownKind(r.errorKind)) {
+          ledger.cool(carrier, COOLDOWN_MS);
+          console.error(`[track-batch] ${carrier} 命中 ${r.errorKind} → 整家冷却 ${Math.round(COOLDOWN_MS / 60000)} 分钟`);
+        }
         if (!res.writableEnded) res.write(JSON.stringify(r) + '\n');
       } catch (e) {
         // 客户端中断 / 写失败：不能让一个任务炸掉整批
