@@ -25,6 +25,7 @@ import fs from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import os from 'node:os';
 import { resolveTimeouts, makeClampTimeout, resolvePort, resolveCacheTtl } from './timeouts.mjs';
+import { makeContract } from './schema.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // Windows 上不能直接 import('C:\\a\\b.mjs')（ESM 只认 file:// URL）——统一走这个
@@ -59,6 +60,9 @@ try {
 } catch (e) {
   console.error('[bridge] 读不到引擎 SCHEMA_VERSION:', String(e.message || e).slice(0, 120));
 }
+// ★ 契约（schemaVersion）的判定逻辑全在 ./schema.mjs（纯函数、可单测）。
+//   桥只做两件事：/health 摊开支持区间；/track 收到插件上报的版本后决定「照常回」还是「只回降级桩」。
+const CONTRACT = makeContract(ENGINE_SCHEMA_VERSION);
 // 插件配置落盘：WPS 的 PluginStorage 在开发模式加载项里不保证持久，走本地文件最稳
 const CFG_DIR = process.env.WPS_TRACK_CONFIG_DIR || path.join(os.homedir(), '.hermes', 'wps-shiptrack');
 // 并发：默认 4（实测 2 时一批 96 单要十几分钟）。可用 WPS_TRACK_CONCURRENCY 覆盖。
@@ -230,6 +234,9 @@ const server = http.createServer(async (req, res) => {
       // ★ 插件按这两个字段校验：不认识这个版本就别猜字段，降级 + 提示更新加载项
       schemaVersion: ENGINE_SCHEMA_VERSION,
       supportedSchemaVersions: ENGINE_SCHEMA_VERSION ? [ENGINE_SCHEMA_VERSION] : [],
+      // ★ 卡 t_8a6689dc：最低/最高支持区间（curl 一条命令就能看见）——
+      //   插件太旧时桥会降级回「只有单号 + 一句人话」，所以区间必须是桥自己说的，不是猜的
+      ...CONTRACT.health(),
     });
   }
 
@@ -307,6 +314,17 @@ const server = http.createServer(async (req, res) => {
     const carrier = clean(url.searchParams.get('carrier')) || '';
     const timeoutMs = clampTimeout(url.searchParams.get('timeout'));
     if (!number) return send(res, 400, { ok: false, error: '缺 number' });
+    // ★ 卡 t_8a6689dc：插件上报它自己认得的契约版本（?schema=N），桥记到日志里，
+    //   事后能一眼看出「这一票是哪个年代的插件问的」。太旧 → 只回降级桩。
+    const pj = CONTRACT.judgePlugin(url.searchParams.get('schema'));
+    if (!pj.known) {
+      console.error(`[track] ${number} 插件未上报契约版本（旧插件）· 桥支持 v${CONTRACT.version ?? '?'}`);
+    } else if (pj.tooOld) {
+      console.error(`[track] ${number} 拒绝：插件契约 v${pj.version} < 桥 v${CONTRACT.min} → 降级桩`);
+      return send(res, 200, CONTRACT.refusal(number, carrier));
+    } else {
+      console.error(`[track] ${number} 插件契约 v${pj.version}${pj.tooNew ? `（比桥新，桥只回 v${CONTRACT.version}）` : ''}`);
+    }
     const key = number + '|' + carrier;
     const hit = cacheGet(key, url.searchParams.get('fresh') === '1');
     if (hit) return send(res, 200, { ...hit, cached: true });
@@ -361,6 +379,14 @@ const server = http.createServer(async (req, res) => {
     const numbers = (url.searchParams.get('numbers') || '').split(/[,\s]+/).map(clean).filter(Boolean).slice(0, 200);
     if (!numbers.length) return send(res, 400, { ok: false, error: '缺 numbers' });
     const timeoutMs = clampTimeout(url.searchParams.get('timeout'));
+    // ★ 卡 t_8a6689dc：批量接口也认 plugin 版本 —— 太旧的插件逐行回降级桩（不查、不给字段）
+    const bj = CONTRACT.judgePlugin(url.searchParams.get('schema'));
+    if (bj.tooOld) {
+      console.error(`[track-batch] 拒绝 ${numbers.length} 单：插件契约 v${bj.version} < 桥 v${CONTRACT.min} → 降级桩`);
+      res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8', ...CORS });
+      for (const n of numbers) res.write(JSON.stringify(CONTRACT.refusal(n, '')) + '\n');
+      return res.end();
+    }
     res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8', ...CORS });
     for (const n of numbers) {
       const key = n + '|';

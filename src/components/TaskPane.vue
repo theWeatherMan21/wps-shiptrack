@@ -18,6 +18,12 @@
       <button v-if="banner.action === 'ping'" class="mini" @click="ping">重连</button>
     </div>
 
+    <!-- ★ 卡 t_8a6689dc：契约对不上时的顶部横幅 —— 不许悄悄渲染错字段 -->
+    <div v-if="schemaAlert" class="err schema-alert">
+      <div><b>{{ schemaAlert.short }}</b></div>
+      <div class="muted">{{ schemaAlert.detail }}</div>
+    </div>
+
     <!-- 在线更新：只在真的有新版时出现（检查失败一律静默，不打扰） -->
     <div v-if="upd.has || upd.msg" class="upd">
       <template v-if="upd.has">
@@ -169,19 +175,15 @@ const AUTO_MAX_ROWS = 50          // 自动刷新单次最多查 50 行，其余
 
 import { markRaw } from 'vue'
 import { cleanNumber, looksLikeNumber, splitParts, carrierFromSl, looksLikeCarrierToken } from '../lib/cellparse.js'
-import { zhEvent, cleanCity, formatEventLine } from '../lib/events.js'
-import { isPlanned } from '../lib/truth.js'
+import { zhEvent, cleanCity } from '../lib/events.js'
 import { stageOf, STAGE_COLOR, NO_FILL, STAGE_LABEL } from '../lib/milestone.js'
-import { notFoundText } from '../lib/retention.js'
 import { matchPortHeaders, matchDateHeaders, matchNumberHeaders } from '../lib/headers.js'
 import { pickEtdEta } from '../lib/dates.js'
 import { summarize as summarizeFails, classifyFail } from '../lib/fail.js'
+// ★ 卡 t_8a6689dc：canonical 契约（schemaVersion）闸门 + 单元格文案的唯一实现
+import { checkResultSchema, PLUGIN_SCHEMA_VERSION } from '../lib/contract.js'
+import { renderLatest, CARRIER_NAME } from '../lib/render.js'
 
-const CARRIER_NAME = {
-  hapag: 'HPL', maersk: 'MSK', zim: 'ZIM', cosco: 'COSCO', cma: 'CMA',
-  oocl: 'OOCL', one: 'ONE', hmm: 'HMM', evergreen: 'EMC', yangming: 'YML',
-  akkon: 'AKK'
-}
 const colLetter = (n) => {
   let s = ''
   let x = Number(n)
@@ -207,6 +209,9 @@ export default {
       pinged: false,
       bridgeState: '',   // '' | ok | down | blocked | degraded —— 横幅文案按它分支（10-29）
       bridgeWhy: '',     // 桥自报 / 页面侧的真实原因，直接给人看
+      // ★ 卡 t_8a6689dc：桥自报的 canonical 契约版本 + 认不了结果时的横幅（null=没有横幅）
+      bridgeSchema: null,
+      schemaAlert: null,
       // ★ 0.9.43：busy / items / done / total … 全部下沉到「批次」里（同一工作簿多张表可以各跑各的）。
       //   这里只剩面板级状态；批次级的读写一律走 batches[] 里那一个对象。
       batches: [],         // 批次队列：{id, seq, doc, sheet, cfg 快照, items, done, total, state, stop, errs, …}
@@ -2045,6 +2050,9 @@ export default {
           this.bridge = true
           this.bridgeState = 'ok'
           this.bridgeWhy = ''
+          // ★ 卡 t_8a6689dc：桥自报的契约区间（老桥没有 → null，按 v1 兼容渲染）
+          this.bridgeSchema = Number.isInteger(h.schemaVersion) ? h.schemaVersion : null
+          this.log(`契约：桥 v${this.bridgeSchema == null ? '未上报（老桥）' : this.bridgeSchema} · 本插件 v${PLUGIN_SCHEMA_VERSION}`)
           this.log('bridge: ' + JSON.stringify(h))
           if (!was) this.log('桥已重新连上')
           // 桥通了 → 之前因连接失败留下的批次级写入错误自动失效（横幅不会挂僵尸）
@@ -2136,6 +2144,8 @@ export default {
 
     async refresh(manual, opts = {}) {
       this.panelErr = ''
+      // ★ 卡 t_8a6689dc：契约横幅按「这一轮」算 —— 这轮里没有契约不符就自动消失，不挂僵尸提示
+      this.schemaAlert = null
       // ★ 快照必须在任何 await 之前取：桥慢/重连时 await 一次，用户可能已经切到别的表了
       const a = this.app()
       const sheet = a && a.ActiveSheet
@@ -2529,7 +2539,8 @@ export default {
           try {
             return await this.httpGet(
               // 单条 90s：绝大多数成功查询 <15s；跑飞的（站点卡住）不能占着 worker 两分钟
-              '/track?number=' + encodeURIComponent(num) + (override ? '&carrier=' + override : '') + '&timeout=90000', 95000)
+              // ★ 卡 t_8a6689dc：带上本插件认得的契约版本 → 桥太新/太旧都能当场拒绝（日志里也能定位是谁旧）
+              '/track?number=' + encodeURIComponent(num) + (override ? '&carrier=' + override : '') + '&timeout=90000' + '&schema=' + PLUGIN_SCHEMA_VERSION, 95000)
           } finally {
             this.releaseSlot()
           }
@@ -2565,6 +2576,18 @@ export default {
           }
         }
         it.usedNumber = usedNum
+        // ★ 卡 t_8a6689dc：先问「这份结果本插件认不认得」，答不上来就**不碰任何业务字段**。
+        //   字段名/含义变了还照原样渲染 = 把 A 的文案静默写到 B 的位置，比报错危险得多。
+        const gate = checkResultSchema(r, this.bridgeSchema)
+        if (!gate.ok) {
+          it.schemaBlocked = true
+          it.text = `${usedNum} · ${gate.short}`
+          it.state = 'error'
+          it.failReason = gate.detail || gate.short
+          this.raiseSchemaAlert(gate)
+          this.log(`R${t.row} ${usedNum} 契约不符（${gate.code}）→ 已降级，不猜字段`)
+          return this.writeResult(b, it, sheet, t.row, outCol, true)   // 确定结论：必须写进去，别保留旧值
+        }
         it.text = this.formatLatest(r)
         it.state = r && r.ok === false ? 'error' : 'ok'
         if (it.state === 'error') {
@@ -2877,57 +2900,16 @@ export default {
         this.upd.busy = false
       }
     },
+    /** 顶部横幅：只在第一次碰到契约不符时挂上（同一轮不刷屏），成功后由 refresh 清掉 */
+    raiseSchemaAlert(gate) {
+      if (this.schemaAlert && this.schemaAlert.code === gate.code) return
+      this.schemaAlert = { code: gate.code, short: gate.short, detail: gate.detail || '' }
+    },
+
     formatLatest(r) {
-      if (!r) return '空响应'
-      if (r.ok === false) {
-        const raw = String(r.error || '查询失败')
-        if (/Cannot tell which carrier|unknown-prefix|未识别/i.test(raw)) return '未识别承运人（可能是货代单）'
-        // 官网只保留近 12 个月 / 单号不存在 → 统一按「查无」处理
-        if (/仅保留 12 个月|DOCUMENT does not exist/i.test(raw)) {
-          return notFoundText(r.carrier, CARRIER_NAME[r.carrier])
-        }
-        if (/官网当前不可用|site-unavailable|maintenance work/i.test(raw)) {
-          return `${CARRIER_NAME[r.carrier] || '船司'} 官网当前不可用（地区限制/维护中，换网络或手工查）`
-        }
-        if (/需要 14 位提单号|Akkon 未找到/i.test(raw)) {
-          return 'AKK 查无此单（需 14 位提单号，箱号不能单独查）'
-        }
-        if (/no tracking module|not wired up for/i.test(raw)) {
-          return `${this.carrierLabel(r.carrier) || '该船司'} 未接入追踪（请手工查）`
-        }
-        if (/超时|timeout/i.test(raw)) return '查询超时（网络慢，稍后重试）'
-        // ★ 10-29：OOCL 匿名端点有 QF8 限流（连查 6-8 次会被封一阵）→ 如实说，别叫人反复重试
-        if (/限流|throttled|too many requests|访问过于频繁/i.test(raw)) {
-          return `${this.carrierLabel(r.carrier) || '船司'} 站方限流（过几分钟再查，别连续重试）`
-        }
-        if (/HTTP 404|No tracking data found/i.test(raw)) {
-          return notFoundText(r.carrier, CARRIER_NAME[r.carrier])
-        }
-        if (/DOCUMENT does not exist|Shipment not found/i.test(raw)) {
-          // 只说事实：官网对这两个号都没有记录。不猜「你用错了号」——工具分不清就该两个都试过再说
-          return notFoundText(r.carrier, CARRIER_NAME[r.carrier])
-        }
-        const short = raw.split('\n')[0].slice(0, 40)
-        return '失败：' + short
-      }
-      const evs = r.events || []
-      // 只有「已发生」的事件才算最新动态；计划/预计的（EXPECTED）不能当成事实报出来
-      // 爹地 2026-10-27：900000012 连柜都没装，却被写成「12-12 到港 · GDANSK」
-      const isPlan = (e) => isPlanned(e)   // 与里程碑判定同一口径（truth.js）
-      const actuals = evs.filter((e) => !isPlan(e))
-      const cur = (r.current && !isPlan(r.current)) ? r.current : (actuals.length ? actuals[actuals.length - 1] : null)
-      const plans = evs.filter(isPlan)
-      const plan = plans.length ? plans[plans.length - 1] : null
-      if (!cur) {
-        return plan
-          ? `还没发货（预计 ${formatEventLine(plan.time, plan.activity, plan.city)}）`
-          : (r.phase ? `暂无动态（${r.phase}）` : '暂无动态')
-      }
-      const line = formatEventLine(cur.time, cur.activity, cur.city)
-      // 有比它更晚的计划事件 → 附在后面，但明确写「预计」
-      return plan && String(plan.time || '') > String(cur.time || '')
-        ? `${line}；预计 ${formatEventLine(plan.time, plan.activity, plan.city)}`
-        : line
+      // ★ 卡 t_8a6689dc：文案逻辑搬到 ../lib/render.js —— 回归脚本喂 183 单台账时走的是**同一份代码**，
+      //   不是抄一份逻辑去测（抄一份就永远测不出真代码变了）。
+      return renderLatest(r, { carrierLabel: (c) => this.carrierLabel(c) })
     }
   }
 }

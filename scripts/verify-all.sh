@@ -43,6 +43,11 @@ run "单测：里程碑/颜色"     "$ADDON" node scripts/milestone-test.mjs
 run "不变量：计划≠事实"      "$ADDON" node scripts/invariants-test.mjs
 run "单测：表头识别"        "$ADDON" node scripts/headers-test.mjs
 run "单测：ribbon"          "$ADDON" node scripts/ribbon-test.mjs
+# ★ 卡 t_8a6689dc：canonical 契约（schemaVersion）—— 闸门纯函数 + 桥真进程端到端
+run "单测：契约闸门"        "$ADDON" node test/schema.test.mjs
+run "探针：桥契约接口（/health 区间 + 降级桩）" "$ADDON" node test/schema-e2e.mjs
+# 台账回归：拿本机真实台账（183 单那批）按新代码重渲染一遍，字段错位就红
+run "回归：台账重渲染（183 单）" "$ADDON" node test/ledger-regress.mjs
 if [ -n "$PROBE_ARG" ]; then
 run "探针：状态机冒烟（H3/H4b/H22/H23/H31）" "$ADDON" node scripts/state-probe.mjs "$PROBE_ARG"
 else
@@ -52,6 +57,8 @@ if [ "$FAST" -eq 0 ]; then
 run "探针：审计 A-G"        "$ADDON" node scripts/audit-probe.mjs all
 fi
 run "渲染冒烟（无 pageerror / 按钮齐全）" "$ROOT" node scripts/render-smoke.mjs
+# ★ 卡 t_8a6689dc：面板级契约探针（正常/新契约/桥拒绝/老桥 四种现场，真看格子写了什么）
+run "探针：契约面板（四现场）" "$ROOT" node scripts/schema-probe.mjs
 
 printf '\n\033[1m===== 汇总 =====\033[0m\n'
 for r in "${RESULTS[@]}"; do echo "$r"; done
