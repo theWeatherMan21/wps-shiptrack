@@ -19,6 +19,7 @@
 import http from 'node:http';
 import { makeKeyedMutex } from './sched.mjs';
 import { Ledger, toRecord, isCooldownKind, COOLDOWN_DEFAULT_MS } from './ledger.mjs';
+import { JobQueue } from './jobs.mjs';
 import { checkUpdate, applyUpdate } from './update.mjs';
 import { profile as netProfile, childEnv, isConnectionLevel } from './net.mjs';
 import { spawn } from 'node:child_process';
@@ -111,6 +112,32 @@ const withCarrierMutex = (carrier, fn) => carrierSched.run(carrier, fn);
 const LEDGER_DIR = process.env.WPS_TRACK_LEDGER_DIR || path.join(os.homedir(), '.hermes', 'wps-shiptrack');
 const ledger = new Ledger(LEDGER_DIR);
 const COOLDOWN_MS = Math.max(60000, Number(process.env.WPS_TRACK_COOLDOWN_MS || COOLDOWN_DEFAULT_MS));
+
+// ---------- 派活队列（卡 t_aa0674a9）----------
+// App --POST /jobs--> 桥 <--GET /jobs/next-- 插件（2.5s 心跳领活）
+// 落盘在 ~/.hermes/wps-shiptrack/jobs-queue/，桥重启/App 关掉任务都不丢。
+const JOBS_DIR = process.env.WPS_TRACK_JOBS_DIR || path.join(os.homedir(), '.hermes', 'wps-shiptrack', 'jobs-queue');
+const jobs = new JobQueue(JOBS_DIR);
+try {
+  const re = jobs.requeueStale();
+  if (re.length) console.error(`[jobs] 上次未跑完的任务已放回队列: ${re.join(', ')}`);
+} catch (e) { console.error('[jobs] requeue 失败:', String(e.message || e).slice(0, 120)); }
+
+// POST body 读取（限 64KB，防误发大包）
+function readJsonBody(req, res, cb) {
+  let body = '';
+  req.on('data', (b) => {
+    body += b;
+    if (body.length > 64 * 1024) {
+      try { req.destroy(); } catch (e) {}
+      send(res, 413, { ok: false, error: 'body 太大' });
+    }
+  });
+  req.on('end', () => {
+    try { cb(JSON.parse(body || '{}')); }
+    catch (e) { send(res, 200, { ok: false, error: 'body 不是合法 JSON: ' + String(e.message || e) }); }
+  });
+}
 
 // 引擎来不及出 canonical 时的最小兜底（超时/进程启动失败）。
 // 字段与引擎 canonical 对齐，插件只认字段、不认来源。
@@ -421,6 +448,57 @@ const server = http.createServer(async (req, res) => {
         raw: events.length ? undefined : text.slice(0, 4000),   // 解析不出就把原文交回，插件原样显示
       });
     } catch (e) { return send(res, 200, { ok: false, error: String(e.message || e) }); }
+  }
+
+  // ---------- 派活（卡 t_aa0674a9 第一步）----------
+  // App --POST /jobs--> 桥 <--GET /jobs/next-- 插件心跳领活 --POST /jobs/:id/report--> 桥
+  // 为什么在桥里做而不加 Rust 命令：WebView 前端本来就能 fetch 127.0.0.1（CORS 已开），
+  // 多一层 Rust 转发只是多一道要维护的墙。
+
+  // ① 建任务
+  if (url.pathname === '/jobs' && req.method === 'POST') {
+    return readJsonBody(req, res, (j) => {
+      if (!j || !j.doc) return send(res, 400, { ok: false, error: '缺 doc（"工作簿|工作表"）' });
+      const job = jobs.create(j);
+      console.error(`[jobs] 建任务 ${job.jobId} doc=${job.doc} rows=${job.rows} mode=${job.mode}`);
+      return send(res, 200, { ok: true, jobId: job.jobId, job });
+    });
+  }
+
+  // ② 列表（App 进度面板轮询用）
+  if (url.pathname === '/jobs' && req.method === 'GET') {
+    const doc = String(url.searchParams.get('doc') || '').trim();
+    const list = jobs.list(doc);
+    return send(res, 200, { ok: true, count: list.length, jobs: list });
+  }
+
+  // ③ 插件领活：原子把 queued → running（同一张表不能两个实例同时写）
+  //    注意必须排在 /jobs/:id 之前，否则 "next" 会被当成任务 id
+  if (url.pathname === '/jobs/next') {
+    const doc = String(url.searchParams.get('doc') || '').trim();
+    const got = jobs.next(doc);
+    if (!got) return send(res, 200, { ok: true, jobId: null });
+    console.error(`[jobs] 领活 ${got.jobId} doc=${got.spec.doc} rows=${got.spec.rows}`);
+    return send(res, 200, { ok: true, jobId: got.jobId, spec: got.spec });
+  }
+
+  // ④ 插件上报进度/结果
+  const mReport = url.pathname.match(/^\/jobs\/([\w.-]+)\/report$/);
+  if (mReport && req.method === 'POST') {
+    return readJsonBody(req, res, (body) => {
+      const job = jobs.report(mReport[1], body || {});
+      if (!job) return send(res, 404, { ok: false, error: '没有这个任务: ' + mReport[1] });
+      console.error(`[jobs] 上报 ${job.jobId} ${job.progress.ok}/${job.progress.total} 失败 ${job.progress.failed} state=${job.state}`);
+      return send(res, 200, { ok: true, jobId: job.jobId, state: job.state, progress: job.progress });
+    });
+  }
+
+  // ⑤ 单任务状态
+  const mJob = url.pathname.match(/^\/jobs\/([\w.-]+)$/);
+  if (mJob && req.method === 'GET') {
+    const job = jobs.get(mJob[1]);
+    if (!job) return send(res, 404, { ok: false, error: '没有这个任务: ' + mJob[1] });
+    return send(res, 200, { ok: true, job });
   }
 
   // ★ 卡 t_03fc348f：断点续查 —— 拿到某个文档上次失败、要补查的行
