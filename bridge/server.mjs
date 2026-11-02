@@ -13,10 +13,11 @@
 //   GET /carriers                      -> 支持哪些船司（识别规则表 + 已装适配器）
 //   GET /identify?number=XXX           -> 只做离线识别（船司归属），不联网
 //   GET /track?number=XXX[&carrier=]   -> 真查询，返回归一化结果；[&timeout=120000]
-//   GET /track-batch?numbers=a,b,c     -> 顺序查（并发 1），NDJSON 流式回传每行结果
+//   GET /track-batch?numbers=a,b,c     -> 批量查（同船司串行 / 跨船司并行），NDJSON 流式回传每行结果
 //
 // 约定：一律 200 + {ok:false,...} 表达业务失败；4xx 只用于参数错。
 import http from 'node:http';
+import { makeKeyedMutex } from './sched.mjs';
 import { checkUpdate, applyUpdate } from './update.mjs';
 import { profile as netProfile, childEnv, isConnectionLevel } from './net.mjs';
 import { spawn } from 'node:child_process';
@@ -94,6 +95,14 @@ function slot() {
     tryRun();
   });
 }
+
+// ---------- 按船司的互斥（同船司串行，跨船司并行）----------
+// 为什么：OOCL 连查 6–8 次就锁 45 分钟，同一船司并发只会把出口打进冷却；
+// 而不同船司之间并行是安全的（各自独立的站点和限流）。
+// 互斥压在 slot() 之外：先拿船司锁，再进全局槽位 —— 不另造信号量，全局并发仍由 slot() 管。
+// 实现放在 ./sched.mjs（纯函数、可单测）。
+const carrierSched = makeKeyedMutex();
+const withCarrierMutex = (carrier, fn) => carrierSched.run(carrier, fn);
 
 // ---------- 查询缓存 ----------
 const cache = new Map(); // key -> {at, value}
@@ -388,14 +397,31 @@ const server = http.createServer(async (req, res) => {
       return res.end();
     }
     res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8', ...CORS });
-    for (const n of numbers) {
-      const key = n + '|';
-      const hit = cacheGet(key);
-      const r0 = hit ? { ...hit, cached: true } : await runCli({ number: n, carrier: '', timeoutMs });
-      const r = withSchema(r0);
-      if (!hit && r.ok) cacheSet(key, r);
-      res.write(JSON.stringify(r) + '\n');
-    }
+    // ★ 卡 t_228d289b：跨船司并行 + 同船司串行。
+    //   船司先本地识别（纯同步、不联网），拿到 carrier 才能分组；识别不出的归 '_unknown' 一起串。
+    //   全局并发仍由 runCli 里的 slot() 管，这里只负责「同船司排队」——不另造信号量。
+    let d = null;
+    try { d = await detector(); } catch (e) { console.error('[track-batch] 识别器不可用，按未识别串行:', String(e.message || e).slice(0, 120)); }
+    const jobs = numbers.map((n) => {
+      let carrier = '';
+      try { const id = d && d.detectCarrier(n); if (id && id.ok && id.carrier) carrier = id.carrier; } catch (e) {}
+      return { n, carrier };
+    });
+    // 每行单独 write —— Node 的 write 是原子的，并发写不会把两条结果拼成半行；
+    // 插件按 number 匹配行，不依赖返回顺序，所以按完成顺序回传是安全的。
+    await Promise.all(jobs.map(({ n, carrier }) => withCarrierMutex(carrier, async () => {
+      try {
+        const key = n + '|' + carrier;
+        const hit = cacheGet(key);
+        const r0 = hit ? { ...hit, cached: true } : await runCli({ number: n, carrier, timeoutMs });
+        const r = withSchema(r0);
+        if (!hit && r.ok) cacheSet(key, r);
+        if (!res.writableEnded) res.write(JSON.stringify(r) + '\n');
+      } catch (e) {
+        // 客户端中断 / 写失败：不能让一个任务炸掉整批
+        if (!res.writableEnded) res.write(JSON.stringify(withSchema({ ok: false, number: n, carrier, error: String(e.message || e) })) + '\n');
+      }
+    })));
     return res.end();
   }
 
