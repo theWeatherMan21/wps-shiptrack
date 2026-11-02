@@ -182,7 +182,9 @@ import { pickEtdEta } from '../lib/dates.js'
 import { summarize as summarizeFails, classifyFail } from '../lib/fail.js'
 // ★ 卡 t_8a6689dc：canonical 契约（schemaVersion）闸门 + 单元格文案的唯一实现
 import { checkResultSchema, PLUGIN_SCHEMA_VERSION } from '../lib/contract.js'
-import { CARRIER_NAME } from '../lib/render.js'   // ★ t_cec031c1：只借船司短名表，文案逻辑已搬进引擎
+import { CARRIER_NAME } from '../lib/render.js'
+// ★ 卡 t_aa0674a9：派活的三条护栏（doc 校验 / 战果汇总 / 该不该领活）——纯函数，可单测
+import { decideBeforeRun, summarizeRun, shouldClaim } from '../lib/jobguard.js'   // ★ t_cec031c1：只借船司短名表，文案逻辑已搬进引擎
 
 const colLetter = (n) => {
   let s = ''
@@ -240,7 +242,9 @@ export default {
       lastRun: 0,
       autoOn: true,
       timer: null,
-      xsheetProbe: null    // ★ 0.9.43 启动时对别的工作表做一次只读探针（不写不建不删）
+      xsheetProbe: null,   // ★ 0.9.43 启动时对别的工作表做一次只读探针（不写不建不删）
+      jobBusy: false,      // ★ t_aa0674a9：App 派下来的任务正在跑（同一面板只跑一个）
+      jobIdNow: ''         // 正在跑的任务 id（日志/界面用）
     }
   },
   computed: {
@@ -2686,7 +2690,127 @@ export default {
       this.log(`R${it.row}: 当前不在目标表 → 结果暂存，切回原表点「补齐回填」`)
     },
     /** ★ 10-28：回到原表就自动补齐（不用点按钮）；不在原表就什么都不做，绝不写错表 */
+    // ---------- ★ 卡 t_aa0674a9 第二步：App 派活 / 插件领活 → 查询 → 回填 → 上报 ----------
+
+    async httpPost(path, body, timeoutMs = 8000) {
+      const url = this.base() + path
+      try {
+        if (typeof fetch !== 'function') throw new Error('no-fetch')
+        const ctl = typeof AbortController === 'function' ? new AbortController() : null
+        const timer = ctl ? setTimeout(() => ctl.abort(), timeoutMs) : null
+        try {
+          const r = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body || {}),
+            ...(ctl ? { signal: ctl.signal } : {}),
+          })
+          return await r.json()
+        } finally { if (timer) clearTimeout(timer) }
+      } catch (e) {
+        return { ok: false, error: String((e && e.message) || e) }
+      }
+    },
+
+    /**
+     * 心跳里领一次活。**静默**：桥不通/没活/用户正在跑自己的批次 → 什么都不做，
+     * 下个心跳（2.5s）再来。绝不弹窗打断用户编辑。
+     */
+    async claimJobOnce() {
+      const doc = this.docNow || this.docKey()
+      // ③ 静默原则：任何一条不满足就跳过，不打扰用户（判据在 jobguard，可单测）
+      if (!shouldClaim({ jobBusy: this.jobBusy, userBusy: this.busy, flushing: this.flushing, bridgeUp: !!this.bridge, currentDoc: doc })) return
+      let got = null
+      try {
+        got = await this.httpGet('/jobs/next?doc=' + encodeURIComponent(doc), 4000)
+      } catch (e) { return }                        // 桥不通 → 静默重试
+      if (!got || !got.ok || !got.jobId) return
+      await this.runClaimedJob(got.jobId, got.spec || {})
+    },
+
+    /**
+     * 跑一个派活。三条验收条件（知澜 2026-11-02 定的）：
+     *   ① 领到活但表已经不是那个 doc → 一行不写，直接 report failed（别把数据填进别人的表）
+     *   ② 回填中途报错 → 已写的行保留，report 里报 written 实际数，剩余算 failed
+     *   ③ 领活失败静默重试（见 claimJobOnce），不弹窗、不打断用户编辑
+     */
+    async runClaimedJob(jobId, spec) {
+      this.jobBusy = true
+      this.jobIdNow = jobId
+      const docAtClaim = String(spec.doc || '')
+      const report = (extra) => this.httpPost(`/jobs/${jobId}/report`, extra)
+      const rows = Math.max(0, Number(spec.rows) || 0)
+      const cols = spec.cols || {}
+      const total = rows
+      let ok = 0, failed = 0, written = 0
+      try {
+        // ① 表被切走 / 列没配 → 一行不写（判据在 jobguard，可单测）
+        const gate = decideBeforeRun({ currentDoc: this.docKey(), specDoc: docAtClaim, cols })
+        if (!gate.proceed) {
+          this.log(`派活 ${jobId}：${gate.reason}（当前 ${this.docKey()}，派给 ${docAtClaim}）→ 一行不写`)
+          await report({ ...gate.report, ok: 0, failed: total || 1, written: 0, total: total || 1 })
+          return
+        }
+        const a = this.app()
+        const sheet = a.ActiveSheet
+        const outCol = Number(cols.out)
+        this.log(`派活 ${jobId}：${docAtClaim} 第 ${spec.startRow} 行起 ${rows} 行 → 写 ${colLetter(outCol)} 列`)
+
+        for (let i = 0; i < rows; i++) {
+          const row = (Number(spec.startRow) || 2) + i
+          if (this.docKey() !== docAtClaim) {       // 中途切表 → 停手，已写的保留
+            this.log(`派活 ${jobId}：跑到第 ${i + 1} 行时表被切走 → 停手（已写 ${written} 行保留）`)
+            break
+          }
+          let num = ''
+          try { num = cleanNumber(String(this.readColCached(null, cols.number, row) || '')) } catch (e) { num = '' }
+          if (!num) continue                          // 空行 / 不是单号 → 跳过，不算失败
+
+          let r = null
+          try {
+            const q = [
+              'number=' + encodeURIComponent(num),
+              'timeout=90000',
+              'schema=' + PLUGIN_SCHEMA_VERSION,
+              'doc=' + encodeURIComponent(docAtClaim),
+              'row=' + row,
+            ]
+            if (cols.pol) { const v = String(this.readColCached(null, cols.pol, row) || '').trim(); if (v) q.push('pol=' + encodeURIComponent(v)) }
+            if (cols.pod) { const v = String(this.readColCached(null, cols.pod, row) || '').trim(); if (v) q.push('pod=' + encodeURIComponent(v)) }
+            r = await this.httpGet('/track?' + q.join('&'), 95000)
+          } catch (e) {
+            r = { ok: false, error: String((e && e.message) || e), canonical: null }
+          }
+
+          // 文案只认引擎 canonical（插件的格式化逻辑已删，这里不许再自己拼）
+          const text = (r && r.canonical && r.canonical.shortText) || (r && r.ok === false ? '查询失败' : '查询完成')
+          try {
+            const w = this.writeCell(sheet, row, outCol, text)
+            if (w && w.ok) { written++; if (r && r.ok !== false) ok++; else failed++ }
+            else failed++
+          } catch (e) { failed++ }
+
+          if ((i + 1) % 5 === 0) await report({ ok, failed, written, total })   // 中途只报进度，不带 state
+        }
+
+        const fin = summarizeRun({ ok, failed, written, total })
+        await report(fin)
+        this.log(`派活 ${jobId} 完成：成功 ${fin.ok} · 失败 ${fin.failed} · 写入 ${fin.written}/${fin.total}`)
+      } catch (e) {
+        // ② 中途炸了：已写的不动，如实报
+        const fin = summarizeRun({ ok, failed, written, total, interrupted: true, error: String((e && e.message) || e) })
+        await report(fin)
+        this.log(`派活 ${jobId} 异常：${fin.error}（已写 ${fin.written} 行保留，未跑完的记为失败）`)
+      } finally {
+        this.jobBusy = false
+        this.jobIdNow = ''
+      }
+    },
+
     autoFlushWhenBack() {
+      // ★ 卡 t_aa0674a9：顺手领一次派活（挂在现成心跳上，不新起定时器）。
+      //   放在最前面：暂存补写要等切回原表，别让派活被它挡住。
+      this.claimJobOnce()
       // ★ 0.9.43：判据从「整轮的 runDoc」改成「暂存队列里有没有当前这张表的」——
       //   多批并行时不再依赖某一个批次的归属。
       if (!this.pendingWrites.length) return
