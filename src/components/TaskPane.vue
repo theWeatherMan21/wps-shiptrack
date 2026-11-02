@@ -182,7 +182,7 @@ import { pickEtdEta } from '../lib/dates.js'
 import { summarize as summarizeFails, classifyFail } from '../lib/fail.js'
 // ★ 卡 t_8a6689dc：canonical 契约（schemaVersion）闸门 + 单元格文案的唯一实现
 import { checkResultSchema, PLUGIN_SCHEMA_VERSION } from '../lib/contract.js'
-import { renderLatest, CARRIER_NAME } from '../lib/render.js'
+import { CARRIER_NAME } from '../lib/render.js'   // ★ t_cec031c1：只借船司短名表，文案逻辑已搬进引擎
 
 const colLetter = (n) => {
   let s = ''
@@ -1988,14 +1988,14 @@ export default {
       return !!c && !c.live
     },
     /** 展示名：优先插件自己的短名表，其次桥给的 name（没适配器的船司如 SITC 只有桥知道名字） */
-    carrierLabel(carrier) {
+    shortName(carrier) {
       if (!carrier) return ''
       if (CARRIER_NAME[carrier]) return CARRIER_NAME[carrier]
       const c = ((this.carriers && this.carriers.carriers) || []).find((x) => x.id === carrier)
       return (c && c.name) || carrier
     },
     /** ★ 10-28：该船司的官网页（桥从 identify.mjs 直出，插件不维护第二份 URL 表） */
-    manualUrlOf(carrier) {
+    officialUrl(carrier) {
       if (!carrier || !this.carriers || !this.carriers.carriers) return ''
       const c = this.carriers.carriers.find((x) => x.id === carrier)
       return (c && c.manualUrl) || ''
@@ -2504,7 +2504,7 @@ export default {
             const raw = String(sl == null ? '' : sl).trim()
             if (looksLikeCarrierToken(raw)) {
               it.state = 'error'
-              it.text = `${raw} 未接入追踪（请手工查）`
+              it.text = `${raw} 未接入（手工查）`
               it.failReason = 'not-wired'
               this.log(`R${t.row} S/L「${raw}」未接入，跳过`)
               return this.writeResult(b, it, sheet, t.row, outCol, true)
@@ -2525,22 +2525,27 @@ export default {
           this.log(`${t.number}: identify 失败 ${e.message}`)
         }
         if (override && this.knownNotLive(override)) {
-          it.text = `${this.carrierLabel(override) || override} 未接入追踪（请手工查）`
+          it.text = `${this.shortName(override) || override} 未接入（手工查）`
           it.state = 'error'
           it.failReason = 'not-wired'
-          it.manualUrl = this.manualUrlOf(override)          // ★ 10-28：没接入也要给一条能点的路
-          it.manualLabel = this.carrierLabel(override) || override
+          it.manualUrl = this.officialUrl(override)          // ★ 10-28：没接入也要给一条能点的路
+          it.manualLabel = this.shortName(override) || override
           return this.writeResult(b, it, sheet, t.row, outCol, true)
         }
         // ★ 0.9.43：真正的查询走「面板全局槽位」——多批并行时在飞请求数有硬上限，
         //   超了就在这儿等（不是让桥去排队，桥那边是浏览器实例，占了就是占了）。
+        // ★ 卡 t_cec031c1：pol/pod 必须传给桥 —— 里程碑判定搬进引擎后，
+        //   只有插件知道用户选了哪两列港口；不传就等于让引擎瞎猜阶段。
+        const rowPol = cfg.polCol ? String(this.readColCached(b, cfg.polCol, t.row) || '') : ''
+        const rowPod = cfg.podCol ? String(this.readColCached(b, cfg.podCol, t.row) || '') : ''
         const call = async (num) => {
           await this.acquireSlot()
           try {
             return await this.httpGet(
               // 单条 90s：绝大多数成功查询 <15s；跑飞的（站点卡住）不能占着 worker 两分钟
               // ★ 卡 t_8a6689dc：带上本插件认得的契约版本 → 桥太新/太旧都能当场拒绝（日志里也能定位是谁旧）
-              '/track?number=' + encodeURIComponent(num) + (override ? '&carrier=' + override : '') + '&timeout=90000' + '&schema=' + PLUGIN_SCHEMA_VERSION, 95000)
+              '/track?number=' + encodeURIComponent(num) + (override ? '&carrier=' + override : '') + '&timeout=90000' + '&schema=' + PLUGIN_SCHEMA_VERSION
+              + (rowPol ? '&pol=' + encodeURIComponent(rowPol) : '') + (rowPod ? '&pod=' + encodeURIComponent(rowPod) : ''), 95000)
           } finally {
             this.releaseSlot()
           }
@@ -2588,7 +2593,8 @@ export default {
           this.log(`R${t.row} ${usedNum} 契约不符（${gate.code}）→ 已降级，不猜字段`)
           return this.writeResult(b, it, sheet, t.row, outCol, true)   // 确定结论：必须写进去，别保留旧值
         }
-        it.text = this.formatLatest(r)
+        // ★ 卡 t_cec031c1：「说人话」只在引擎定义一次 —— 插件照字段渲染，不再自己算
+        it.text = (r && r.canonical && r.canonical.shortText) || ('查询完成' + (r && r.ok === false ? '（失败）' : ''))
         it.state = r && r.ok === false ? 'error' : 'ok'
         if (it.state === 'error') {
           it.failReason = String((r && r.error) || '查询失败')
@@ -2604,10 +2610,11 @@ export default {
           const cityOf = (v) => String(v || '').split('(')[0].trim()
           const routePol = cityOf(r.origin)
           const routePod = cityOf(r.destination)
-          const st = stageOf(r.events || [], {
-            pol: routePol || pol,
-            pod: routePod || pod,
-          })
+          // ★ 卡 t_cec031c1：阶段由引擎算（canonical），插件不再自己判；
+          //   老桥/老引擎没给 canonical 时才退回本地判定，保证不断档。
+          const st = (r.canonical && typeof r.canonical.stage === 'number')
+            ? { stage: r.canonical.stage, label: r.canonical.stageLabel, inferred: !!r.canonical.stageInferred }
+            : stageOf(r.events || [], { pol: routePol || pol, pod: routePod || pod })
           it.stage = st.stage
           it.stageLabel = st.label
           it.inferred = !!st.inferred   // 港口列读不到 → 用事件瞎猜，猜出来也不许着色
@@ -2766,8 +2773,8 @@ export default {
         this.clearOurColor(sheet, row, b && b.doc, outCol)
         it.keptOld = true
         it.text = oldStr
-        it.note = '本次' + this.shortReason(it.failReason) + '，保留旧值'
-        this.log(`R${row} 保留旧值（本次 ${this.shortReason(it.failReason)}）`)
+        it.note = '本次' + (classifyFail(it.failReason).label) + '，保留旧值'
+        this.log(`R${row} 保留旧值（本次 ${classifyFail(it.failReason).label}）`)
         return
       }
       // ★ 0.9.42 唯一写回入口：入队 → 批量核身份 → 批量写 → 批量读回；
@@ -2850,14 +2857,6 @@ export default {
     isTransient(text) {
       return /超时|timeout|查询失败|网络|连接|ECONN|ERR_|空响应/i.test(String(text || ''))
     },
-    shortReason(s) {
-      const t = String(s || '失败').split('\n')[0]
-      if (/超时|timeout/i.test(t)) return '超时'
-      if (/ECONN|连接|网络|ERR_|page\.goto|net::|Failed to fetch/i.test(t)) return '网络错误'
-      if (/404|not found|does not exist/i.test(t)) return '查无此单'
-      return t.replace(/^Error:\s*/i, '').slice(0, 14)
-    },
-
     // 网络环境体检：代理开没开、几家船司能不能连通 —— 查询失败时先看这行
     async checkNet() {
       try {
@@ -2906,11 +2905,6 @@ export default {
       this.schemaAlert = { code: gate.code, short: gate.short, detail: gate.detail || '' }
     },
 
-    formatLatest(r) {
-      // ★ 卡 t_8a6689dc：文案逻辑搬到 ../lib/render.js —— 回归脚本喂 183 单台账时走的是**同一份代码**，
-      //   不是抄一份逻辑去测（抄一份就永远测不出真代码变了）。
-      return renderLatest(r, { carrierLabel: (c) => this.carrierLabel(c) })
-    }
   }
 }
 </script>
