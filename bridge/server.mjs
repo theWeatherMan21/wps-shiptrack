@@ -34,7 +34,8 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const dynImport = (p) => import(pathToFileURL(p).href);
 const REPO = process.env.SSH_REPO
   || path.resolve(os.homedir(), 'Documents', 'trae_projects', 'ShipScheduleHub');
-const CLI = path.join(REPO, 'engine/tracking/cli.mjs');
+// 可用 WPS_TRACK_CLI 覆盖 —— 端到端测试要注入假 CLI，验证「参数从入口到出口」真的传下去了
+const CLI = process.env.WPS_TRACK_CLI || path.join(REPO, 'engine/tracking/cli.mjs');
 // ★ 数值配置统一走 ./timeouts.mjs（纯函数、可单测）：
 //   环境变量是手写的，裸 Number() 遇错字会得 NaN 并一路静默变形
 //   （setTimeout(…, NaN) 立刻超时 / --timeout NaN / listen(NaN) 随机端口连不上）。
@@ -111,17 +112,37 @@ const LEDGER_DIR = process.env.WPS_TRACK_LEDGER_DIR || path.join(os.homedir(), '
 const ledger = new Ledger(LEDGER_DIR);
 const COOLDOWN_MS = Math.max(60000, Number(process.env.WPS_TRACK_COOLDOWN_MS || COOLDOWN_DEFAULT_MS));
 
+// 引擎来不及出 canonical 时的最小兜底（超时/进程启动失败）。
+// 字段与引擎 canonical 对齐，插件只认字段、不认来源。
+function fallbackCanonical({ carrier = null, failKind = 'other', shortText = '查询失败', error = '' } = {}) {
+  const LABEL = { expired: '已过期', blocked: '站点拦截', format: '号码格式', network: '网络', notfound: '官网查无', notwired: '未接入', other: '其他' };
+  return {
+    schemaVersion: 1, ok: false,
+    shortText: String(shortText).slice(0, 24),
+    failKind, kindLabel: LABEL[failKind] || '其他',
+    stage: 0, stageLabel: '未离起运港', stageColor: -4142, stageHits: [], stageInferred: true, feeder: false,
+    pol: null, pod: null, latestEvent: null, eventCount: 0,
+    manualUrl: null, carrier, carrierLabel: null, eta: null,
+    queriedAt: new Date().toISOString(),
+    fallback: true, error: String(error).slice(0, 200),
+  };
+}
+
 // ---------- 查询缓存 ----------
 const cache = new Map(); // key -> {at, value}
 const cacheGet = (k, skip = false) => { if (skip) return null; const e = cache.get(k); if (e && Date.now() - e.at < CACHE_TTL) return e.value; return null; };
 const cacheSet = (k, v) => { cache.set(k, { at: Date.now(), value: v }); if (cache.size > 500) cache.delete(cache.keys().next().value); };
 
 // ---------- 跑一次 CLI，收 NDJSON ----------
-function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = null }) {
+function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = null, pol = '', pod = '' }) {
   return new Promise(async (resolve) => {
     const release = await slot();
     const args = [CLI, '--number', number];
     if (carrier) args.push('--carrier', carrier);
+    // ★ 卡 t_cec031c1：里程碑判定在引擎里，pol/pod 只有调用方知道（用户选了哪两列港口）。
+    //   不往引擎传 = buildCanonical 收到空串 → 阶段退回纯事件推断，中转港会被当目的港。
+    if (pol) args.push('--pol', String(pol).slice(0, 64));
+    if (pod) args.push('--pod', String(pod).slice(0, 64));
     // 让引擎比桥的硬上限早 8s 自己收尾：这样超时能带回 steps（诊断用），而不是被 SIGKILL
     args.push('--timeout', String(Math.max(10000, timeoutMs - 8000)));
     const t0 = Date.now();
@@ -178,12 +199,21 @@ function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = nul
       const exit = evts.find((e) => e.type === 'track-exit');
       const ms = Date.now() - t0;
 
-      if (killed) return finish({ ok: false, number, carrier: carrier || started?.carrier || null, error: `超时（${Math.round(timeoutMs / 1000)}s 未出结果）`, timeout: true, ms });
+      // ★ 卡 t_cec031c1：超时是桥这一层杀的进程，引擎来不及出 canonical —— 本地造一个最小的，
+      //   否则插件又得自己拼文案（「同一票两个界面文案不同」就是这么来的）。
+      if (killed) return finish({
+        ok: false, number, carrier: carrier || started?.carrier || null,
+        error: `超时（${Math.round(timeoutMs / 1000)}s 未出结果）`, timeout: true, ms,
+        canonical: fallbackCanonical({ carrier: carrier || started?.carrier || null, failKind: 'network', shortText: '查询超时（稍后重试）', error: 'timeout' }),
+      });
       // ★ 10-28：原来只挑 msg/code，把引擎带出的 manualUrl/manualLabel 丢了 → 插件就没法给「手工查」链接
+      // ★ 卡 t_cec031c1：同理，引擎算好的 canonical 必须原样透传，不能在这一层重建对象把它丢掉
       if (error) return finish({
         ok: false, number, carrier: carrier || null,
         error: error.msg || '追踪器报错', code: error.code, ms,
         ...(error.manualUrl ? { manualUrl: error.manualUrl, manualLabel: error.manualLabel || null } : {}),
+        ...(error.canonical ? { canonical: error.canonical } : {}),
+        ...(error.schemaVersion ? { schemaVersion: error.schemaVersion } : {}),
       });
       if (!result) return finish({ ok: false, number, carrier: carrier || started?.carrier || null, error: `没有结果（exit ${code}）${err ? ': ' + err.trim().slice(0, 200) : ''}`, ms });
       finish({ ...result, detected: started?.detected || null, ms, exitCode: code });
@@ -345,8 +375,10 @@ const server = http.createServer(async (req, res) => {
     const hit = cacheGet(key, url.searchParams.get('fresh') === '1');
     if (hit) return send(res, 200, { ...hit, cached: true });
     const t0 = Date.now();
+    const pol = String(url.searchParams.get('pol') || '').trim();
+    const pod = String(url.searchParams.get('pod') || '').trim();
     let r = await runCli({
-      number, carrier, timeoutMs,
+      number, carrier, timeoutMs, pol, pod,
       onSpawn: (kill) => req.on('close', () => { if (!res.writableEnded) { console.error(`[bridge] 客户端中断 ${number} → 杀子进程`); kill(); } }),
     });
     const elapsed = Date.now() - t0;
@@ -448,11 +480,15 @@ const server = http.createServer(async (req, res) => {
         let carrier = '';
         try { const id = d && d.detectCarrier(n); if (id && id.ok && id.carrier) carrier = id.carrier; } catch (e) {}
         const meta = rowMeta[String(n)] || {};
-        return { n, carrier, doc: meta.doc ?? null, sheet: meta.sheet ?? null, row: meta.row ?? null };
+        // ★ 卡 t_cec031c1：每行港口各不相同（同一批里两条船起运港可能不一样），
+        //   所以 pol/pod 必须按行走 rows，不能整批用同一个。
+        const rpol = String(meta.pol || url.searchParams.get('pol') || '').trim();
+        const rpod = String(meta.pod || url.searchParams.get('pod') || '').trim();
+        return { n, carrier, doc: meta.doc ?? null, sheet: meta.sheet ?? null, row: meta.row ?? null, pol: rpol, pod: rpod };
       });
     // 每行单独 write —— Node 的 write 是原子的，并发写不会把两条结果拼成半行；
     // 插件按 number 匹配行，不依赖返回顺序，所以按完成顺序回传是安全的。
-    await Promise.all(jobs.map(({ n, carrier, doc, sheet, row }) => withCarrierMutex(carrier, async () => {
+    await Promise.all(jobs.map(({ n, carrier, doc, sheet, row, pol, pod }) => withCarrierMutex(carrier, async () => {
       const meta = { doc, sheet, row };
       try {
         // ① 冷却检查（拿锁之后做，避免并发抢同一家）
@@ -470,7 +506,7 @@ const server = http.createServer(async (req, res) => {
         // ② 正常查询
         const key = n + '|' + carrier;
         const hit = cacheGet(key);
-        const r0 = hit ? { ...hit, cached: true } : await runCli({ number: n, carrier, timeoutMs });
+        const r0 = hit ? { ...hit, cached: true } : await runCli({ number: n, carrier, timeoutMs, pol, pod });
         const r = withSchema(r0);
         if (!hit && r.ok) cacheSet(key, r);
         // ③ 落盘（成功也记：下次刷新才知道这行已经查过了）
