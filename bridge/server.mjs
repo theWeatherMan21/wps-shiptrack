@@ -42,6 +42,23 @@ const { defaultTimeout: DEFAULT_TIMEOUT, maxTimeout: MAX_TIMEOUT } = resolveTime
 // 以前上限直接复用 DEFAULT_TIMEOUT → 只能调低不能调高（语义错），慢站想放宽没有口子。
 const clampTimeout = makeClampTimeout({ defaultTimeout: DEFAULT_TIMEOUT, maxTimeout: MAX_TIMEOUT });
 const CACHE_TTL = resolveCacheTtl();
+// ── 引擎 canonical 契约版本（★ 10-30，卡 t_8a6689dc）────────────────────
+// 单一来源在引擎 engine/tracking/normalize.mjs 的 SCHEMA_VERSION，桥只读一次并对外报出，
+// **绝不在这里再写一个数字**——两处各写一份就会慢慢漂移，正是本版本号要防的事。
+// 读不到就报 null（不让 /health 崩），插件据此降级。
+let ENGINE_SCHEMA_VERSION = null;
+// 兜底：引擎早退路径（如号码格式不符）可能没带版本号，插件靠它校验 → 通讯层补齐。
+// 只在缺失时补，**不覆盖**引擎给的值（引擎才是单一来源）。
+const withSchema = (r) => (r && typeof r === 'object' && r.schemaVersion === undefined && ENGINE_SCHEMA_VERSION !== null)
+  ? { ...r, schemaVersion: ENGINE_SCHEMA_VERSION }
+  : r;
+try {
+  const norm = await dynImport(path.join(REPO, 'engine/tracking/normalize.mjs'));
+  if (Number.isInteger(norm.SCHEMA_VERSION)) ENGINE_SCHEMA_VERSION = norm.SCHEMA_VERSION;
+  else console.error('[bridge] 引擎没有导出 SCHEMA_VERSION，契约版本报 null');
+} catch (e) {
+  console.error('[bridge] 读不到引擎 SCHEMA_VERSION:', String(e.message || e).slice(0, 120));
+}
 // 插件配置落盘：WPS 的 PluginStorage 在开发模式加载项里不保证持久，走本地文件最稳
 const CFG_DIR = process.env.WPS_TRACK_CONFIG_DIR || path.join(os.homedir(), '.hermes', 'wps-shiptrack');
 // 并发：默认 4（实测 2 时一批 96 单要十几分钟）。可用 WPS_TRACK_CONCURRENCY 覆盖。
@@ -207,7 +224,13 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204, CORS); return res.end(); }
 
   if (url.pathname === '/health') {
-    return send(res, 200, { ok: true, service: 'wps-shiptrack-bridge', repo: REPO, port: PORT, concurrency: MAX_CONCURRENT, busy: running, cached: cache.size });
+    return send(res, 200, {
+      ok: true, service: 'wps-shiptrack-bridge', repo: REPO, port: PORT,
+      concurrency: MAX_CONCURRENT, busy: running, cached: cache.size,
+      // ★ 插件按这两个字段校验：不认识这个版本就别猜字段，降级 + 提示更新加载项
+      schemaVersion: ENGINE_SCHEMA_VERSION,
+      supportedSchemaVersions: ENGINE_SCHEMA_VERSION ? [ENGINE_SCHEMA_VERSION] : [],
+    });
   }
 
   if (url.pathname === '/net') {
@@ -293,6 +316,7 @@ const server = http.createServer(async (req, res) => {
       onSpawn: (kill) => req.on('close', () => { if (!res.writableEnded) { console.error(`[bridge] 客户端中断 ${number} → 杀子进程`); kill(); } }),
     });
     const elapsed = Date.now() - t0;
+    r = withSchema(r);
     console.error(`[track] ${number} ${carrier || 'auto'} ${r.ok ? 'ok' : 'FAIL'} ${elapsed}ms ${r.ok ? '' : String(r.error || '').slice(0, 80)}`);
     const hardDown = r.error && /ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET|ERR_NAME_NOT_RESOLVED|ENOTFOUND|EAI_AGAIN/i.test(String(r.error));
     // 连接不上（断网 / 代理没开）→ 立刻重试毫无意义，只是再开一个浏览器空烧
@@ -341,7 +365,8 @@ const server = http.createServer(async (req, res) => {
     for (const n of numbers) {
       const key = n + '|';
       const hit = cacheGet(key);
-      const r = hit ? { ...hit, cached: true } : await runCli({ number: n, carrier: '', timeoutMs });
+      const r0 = hit ? { ...hit, cached: true } : await runCli({ number: n, carrier: '', timeoutMs });
+      const r = withSchema(r0);
       if (!hit && r.ok) cacheSet(key, r);
       res.write(JSON.stringify(r) + '\n');
     }
