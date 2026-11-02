@@ -127,7 +127,7 @@ const bannerText = (p) => p.evaluate(() => {
   await runOnce(page)
   const c = await cell(page)
   const b = await bannerText(page)
-  pass('B 新契约 → 格子只写「单号 · 插件版本旧，请更新加载项」', c === '900000009 · 插件版本旧，请更新加载项', `格子="${c}"`)
+  pass('B 新契约 → 格子只写「单号 · 插件版本旧，请更新加载项」', c === 'TEST-BL-0001 · 插件版本旧，请更新加载项', `格子="${c}"`)
   pass('B 不许出现任何业务字段（事件/港口/日期）', !/QINGDAO|离港|2026-10/.test(c), `格子="${c}"`)
   pass('B 顶部有契约横幅', /插件版本旧/.test(b), `横幅="${b}"`)
   pass('B 横幅说清双方版本', /v99/.test(b) && /v1/.test(b), `横幅="${b}"`)
@@ -153,7 +153,7 @@ const bannerText = (p) => p.evaluate(() => {
   await runOnce(page)
   const c = await cell(page)
   const b = await bannerText(page)
-  pass('C 桥降级桩 → 格子只有单号 + 更新提示', c === '900000009 · 插件版本旧，请更新加载项', `格子="${c}"`)
+  pass('C 桥降级桩 → 格子只有单号 + 更新提示', c === 'TEST-BL-0001 · 插件版本旧，请更新加载项', `格子="${c}"`)
   pass('C 顶部有横幅', /插件版本旧/.test(b), `横幅="${b}"`)
   await ctx.close()
 }
