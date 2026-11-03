@@ -87,6 +87,16 @@ export function dateCellIsClean(cur, val) {
 }
 
 /**
+ * 这个格子现在装的像不像「日期/数字」（= 可以安全被船期覆盖）。
+ * 非空**文本**一律当别人的数据（代理名/备注/联系方式），绝不覆盖。
+ */
+export function isDateish(v) {
+  if (v instanceof Date) return true
+  if (typeof v === 'number') return true
+  return /^\d{4}[-/]\d{1,2}[-/]\d{1,2}/.test(String(v == null ? '' : v).trim())
+}
+
+/**
  * @param {Array} events 船司事件
  * @param {{pod?:string}} opt 目的港（用于挑「到目的港」的那次到达）
  * @returns {{etd:string, eta:string, etdPlanned:boolean, etaPlanned:boolean}}

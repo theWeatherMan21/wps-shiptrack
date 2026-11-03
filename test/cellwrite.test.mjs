@@ -14,7 +14,7 @@
 // 跑：node test/cellwrite.test.mjs
 
 import { judgeReadback, cellMatches, writeCellCore, fmtDate } from '../src/lib/cellwrite.js'
-import { ymdToSerial, serialToYmd, dateCellWriteValue, dateCellIsClean } from '../src/lib/dates.js'
+import { ymdToSerial, serialToYmd, dateCellWriteValue, dateCellIsClean, isDateish } from '../src/lib/dates.js'
 
 let pass = 0
 let fail = 0
@@ -212,6 +212,11 @@ console.log('⑧ 红-绿：日期格写进去的必须是不带时间的整数�
   ok(dateCellIsClean(new Date(2026, 9, 7, 16, 0), VAL) === false, '前一天 16:00 的 Date = 脏')
   ok(dateCellIsClean('2026-10-08', VAL) === true, 'y-m-d 文本 = 干净')
   ok(dateCellIsClean('2026-10-07', VAL) === false, '差一天 → 脏')
+
+  // 船期列的护栏：非空文本（代理名/备注）绝不覆盖
+  ok(isDateish('') === false, '空格 → 可以写')
+  ok(isDateish('FUJIAN GUANGFU') === false, '代理名是文本 → 跳过，不许覆盖')
+  ok(isDateish(46302.666666666666) === true && isDateish(new Date()) === true, '数字/Date → 可以写（脏日期才能被修回）')
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)

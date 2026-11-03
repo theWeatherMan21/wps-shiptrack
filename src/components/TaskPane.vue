@@ -180,7 +180,7 @@ import { cleanNumber, looksLikeNumber, splitParts, carrierFromSl, looksLikeCarri
 import { zhEvent, cleanCity } from '../lib/events.js'
 import { stageOf, STAGE_COLOR, NO_FILL, STAGE_LABEL } from '../lib/milestone.js'
 import { matchPortHeaders, matchDateHeaders, matchNumberHeaders } from '../lib/headers.js'
-import { pickEtdEta, dateCellIsClean, dateCellWriteValue } from '../lib/dates.js'
+import { pickEtdEta, dateCellIsClean, dateCellWriteValue, isDateish } from '../lib/dates.js'
 // ★ 10-30：读回校验的口径只有一份（lib/cellwrite.js）—— 批量路径与逐格路径共用，
 //   以前逐格用裸比较、批量用归一化，日期列/数值列走逐格必然误判「补不进去」。
 import { cellMatches, judgeReadback, writeCellCore, cellText } from '../lib/cellwrite.js'
@@ -2715,6 +2715,13 @@ export default {
           const rng = sheet.Range(addr)
           let cur
           try { cur = rng.Value2 } catch (e) { cur = undefined }
+          // ★ 11-03 护栏：格子里已经是**文本**（代理名/联系方式这类）时绝不覆盖。
+          //   配置里的 etdCol/etaCol 是历史遗留的，表头一改（列被挪动/复用）它就会指到别人的列上；
+          //   照写等于把代理名换成日期 —— 那是比日期偏一天更狠的数据损坏。空着/是日期/是数字才写。
+          if (cur !== undefined && cur !== null && String(cur).trim() !== '' && !isDateish(cur)) {
+            this.log(`R${row} ${colLetter(col)} 现在是文本（${String(cur).slice(0, 12)}）→ 不当船期列，跳过`)
+            return false
+          }
           // ★ 11-03：已经干净地等于这一天（Date 零点 / 整数序列号 / y-m-d 文本）→ 不重写。
           //   注意用 dateCellIsClean 而不是 sameDate：带时分的 46302.6667 是**脏的**（偏一天的历史坏值），
           //   必须允许被重写改回来，否则重跑刷新永远修不好那批格子。
