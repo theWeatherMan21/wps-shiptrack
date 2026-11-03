@@ -32,6 +32,15 @@ const num = (v, d) => { const n = Number(v); return Number.isFinite(n) && n >= 0
 export function normalizeSpec(raw = {}) {
   const cols = raw.cols || {};
   const rows = num(raw.rows, 0);
+  // ★ 卡 t_aa0674a9 驳回 1：「只补失败」必须真的只查失败行。
+  //   失败行本来就在 ledger 里（带 row + number），直接复用，App 不用自己记。
+  //   pendingRows 有值时插件只跑这些行，忽略 startRow/rows 的整段遍历。
+  const pendingRows = Array.isArray(raw.pendingRows)
+    ? raw.pendingRows
+        .filter((x) => x && x.number)
+        .map((x) => ({ row: num(x.row, 0) || null, number: String(x.number) }))
+        .slice(0, 2000)
+    : null;
   return {
     doc: String(raw.doc || '').trim(),
     cols: {
@@ -44,6 +53,7 @@ export function normalizeSpec(raw = {}) {
     startRow: Math.max(2, num(raw.startRow, 2)),   // 0/1 视为未设：表头占一行，数据从第 2 行起
     rows: Math.min(2000, rows),
     mode: raw.mode === 'range' ? 'range' : 'column',
+    pendingRows,
   };
 }
 
@@ -132,6 +142,7 @@ export class JobQueue {
       startRow: spec.startRow,
       rows: spec.rows,
       mode: spec.mode,
+      pendingRows: spec.pendingRows,      // null = 整段跑；有值 = 只补这些行
       state: 'queued',
       createdAt: new Date().toISOString(),
       claimedAt: null,
@@ -161,7 +172,7 @@ export class JobQueue {
     this._write(job);
     return {
       jobId: job.jobId,
-      spec: { doc: job.doc, cols: job.cols, startRow: job.startRow, rows: job.rows, mode: job.mode },
+      spec: { doc: job.doc, cols: job.cols, startRow: job.startRow, rows: job.rows, mode: job.mode, pendingRows: job.pendingRows || null },
     };
   }
 

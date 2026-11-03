@@ -489,6 +489,15 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/jobs' && req.method === 'POST') {
     return readJsonBody(req, res, (j) => {
       if (!j || !j.doc) return send(res, 400, { ok: false, error: '缺 doc（"工作簿|工作表"）' });
+      // ★ 驳回 1：only:'pending' = 只补上次失败的行。失败行在 ledger 里（带 row + number），
+      //   桥直接取出来塞进 spec，插件照着跑；App 不用自己记哪几行失败了。
+      if (j.only === 'pending') {
+        const pend = ledger.pending(j.doc).filter((r) => r.number);
+        if (!pend.length) return send(res, 200, { ok: false, error: '这份文档上次没有失败行，无需补查' });
+        j.pendingRows = pend.map((r) => ({ row: r.row || null, number: String(r.number) }));
+        j.rows = j.pendingRows.length;
+        console.error(`[jobs] 只补失败：${j.doc} 取到 ${j.pendingRows.length} 行`);
+      }
       const job = jobs.create(j);
       console.error(`[jobs] 建任务 ${job.jobId} doc=${job.doc} rows=${job.rows} mode=${job.mode}`);
       return send(res, 200, { ok: true, jobId: job.jobId, job });

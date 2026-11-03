@@ -2741,7 +2741,8 @@ export default {
       const report = (extra) => this.httpPost(`/jobs/${jobId}/report`, extra)
       const rows = Math.max(0, Number(spec.rows) || 0)
       const cols = spec.cols || {}
-      const total = rows
+      // 只补失败时总量是失败行数，不是整段行数
+      const total = (Array.isArray(spec.pendingRows) && spec.pendingRows.length) ? spec.pendingRows.length : rows
       let ok = 0, failed = 0, written = 0
       try {
         // ① 表被切走 / 列没配 → 一行不写（判据在 jobguard，可单测）
@@ -2754,16 +2755,27 @@ export default {
         const a = this.app()
         const sheet = a.ActiveSheet
         const outCol = Number(cols.out)
-        this.log(`派活 ${jobId}：${docAtClaim} 第 ${spec.startRow} 行起 ${rows} 行 → 写 ${colLetter(outCol)} 列`)
+        // ★ 驳回 1：pendingRows 有值时**只补这些行**，不再整段遍历。
+        //   失败行的 row + number 都是桥从 ledger 里取的，插件照单跑即可。
+        const pendingRows = Array.isArray(spec.pendingRows) && spec.pendingRows.length ? spec.pendingRows : null
+        const work = pendingRows
+          ? pendingRows.map((p) => ({ row: Number(p.row) || 0, number: String(p.number || '') }))
+          : Array.from({ length: rows }, (_, i) => ({ row: (Number(spec.startRow) || 2) + i, number: '' }))
+        this.log(pendingRows
+          ? `派活 ${jobId}：只补失败 ${work.length} 行（${work.map((w) => w.number).slice(0, 5).join(', ')}${work.length > 5 ? '…' : ''}）→ 写 ${colLetter(outCol)} 列`
+          : `派活 ${jobId}：${docAtClaim} 第 ${spec.startRow} 行起 ${rows} 行 → 写 ${colLetter(outCol)} 列`)
 
-        for (let i = 0; i < rows; i++) {
-          const row = (Number(spec.startRow) || 2) + i
+        for (let i = 0; i < work.length; i++) {
+          const row = work[i].row
+          if (!row) { failed++; continue }          // ledger 里没行号（老记录）→ 算失败，别乱猜行
           if (this.docKey() !== docAtClaim) {       // 中途切表 → 停手，已写的保留
             this.log(`派活 ${jobId}：跑到第 ${i + 1} 行时表被切走 → 停手（已写 ${written} 行保留）`)
             break
           }
-          let num = ''
-          try { num = cleanNumber(String(this.readColCached(null, cols.number, row) || '')) } catch (e) { num = '' }
+          let num = work[i].number
+          if (!num) {
+            try { num = cleanNumber(String(this.readColCached(null, cols.number, row) || '')) } catch (e) { num = '' }
+          }
           if (!num) continue                          // 空行 / 不是单号 → 跳过，不算失败
 
           let r = null
