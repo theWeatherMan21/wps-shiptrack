@@ -13,6 +13,9 @@
 //   3. **只有「读回来是空」或「还是旧值」才是真没写进去**（WPS 个别版本 Cells() 静默空实现
 //      就是这个形状）；COM 抛异常才是「表可能被保护/只读」。别把第三件事说成第一件。
 
+// ★ 11-03 写错数据事故：日期序列号的解释口径只有一份，放在 lib/dates.js
+import { serialToYmd } from './dates.js'
+
 const pad2 = (n) => String(n).padStart(2, '0')
 
 /** Date → yyyy-mm-dd（本地时区，不经过 toISOString 免得跨时区差一天） */
@@ -31,9 +34,13 @@ export function cellText(v) {
   return String(v)
 }
 
-/** 日期口径：Date / 'yyyy-mm-dd' / 'yyyy-mm-dd hh:mm:ss' 都按 y-m-d 比 */
+/** 日期口径：Date / Excel 序列号 / 'yyyy-mm-dd' / 'yyyy-mm-dd hh:mm:ss' 都按 y-m-d 比 */
 function asDateText(v) {
   if (v instanceof Date) return fmtDate(v)
+  // ★ 11-03：WPS 会把日期按 UTC 折成序列号读回来（46303 = 2026-10-08），
+  //   只认 Date 和字符串的话，「写进去了但读回是数字」会被判 fail（红条说数值没生效）。
+  //   只认 20000–80000 这个区间，12.5 / 0012 这类数字不会被当日期。
+  if (typeof v === 'number' && Number.isFinite(v)) return serialToYmd(v)
   const s = cellText(v).trim()
   return DATE_ONLY.test(s.slice(0, 10)) ? s.slice(0, 10) : ''
 }
@@ -81,7 +88,11 @@ export function cellMatches(back, want) {
 export function judgeReadback({ prev, back, want } = {}) {
   const b = cellText(back)
   if (!b) return 'fail'                                       // 一格空着 = 没写成
-  if (prev !== undefined && cellText(prev) !== '' && cellText(prev) === b && !cellMatches(prev, want)) {
+  // 「旧值还在」这一条用**严**口径（文本/数值相等），不吃日期归一：
+  //   否则格子里的历史坏值 46302.6667 会被 sameDate 四舍五入成「同一天」，
+  //   赋值静默没生效也叫 ok（11-03 那批偏一天的日期就是这么被吞掉的）。
+  if (prev !== undefined && cellText(prev) !== '' && cellText(prev) === b &&
+      !(sameText(prev, want) || sameNum(prev, want))) {
     return 'fail'                                             // 旧值还在 = 赋值没生效
   }
   // 完全一致、或只差日期表示（Date ⇄ y-m-d）→ ok。

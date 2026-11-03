@@ -180,7 +180,7 @@ import { cleanNumber, looksLikeNumber, splitParts, carrierFromSl, looksLikeCarri
 import { zhEvent, cleanCity } from '../lib/events.js'
 import { stageOf, STAGE_COLOR, NO_FILL, STAGE_LABEL } from '../lib/milestone.js'
 import { matchPortHeaders, matchDateHeaders, matchNumberHeaders } from '../lib/headers.js'
-import { pickEtdEta } from '../lib/dates.js'
+import { pickEtdEta, dateCellIsClean, dateCellWriteValue } from '../lib/dates.js'
 // ★ 10-30：读回校验的口径只有一份（lib/cellwrite.js）—— 批量路径与逐格路径共用，
 //   以前逐格用裸比较、批量用归一化，日期列/数值列走逐格必然误判「补不进去」。
 import { cellMatches, judgeReadback, writeCellCore, cellText } from '../lib/cellwrite.js'
@@ -2713,13 +2713,20 @@ export default {
         try {
           const addr = `${colLetter(col)}${row}`
           const rng = sheet.Range(addr)
-          let cur = '', fmt = ''
-          try { cur = String(rng.Value2 == null ? '' : rng.Value2).slice(0, 10) } catch (e) { cur = '' }
-          if (cur === val) return false
+          let cur
+          try { cur = rng.Value2 } catch (e) { cur = undefined }
+          // ★ 11-03：已经干净地等于这一天（Date 零点 / 整数序列号 / y-m-d 文本）→ 不重写。
+          //   注意用 dateCellIsClean 而不是 sameDate：带时分的 46302.6667 是**脏的**（偏一天的历史坏值），
+          //   必须允许被重写改回来，否则重跑刷新永远修不好那批格子。
+          if (dateCellIsClean(cur, val)) return false
+          let fmt = ''
           try { fmt = String(rng.NumberFormatLocal || '') } catch (e) { fmt = '' }
-          const isDate = /y{2,}|m{1,2}[-/]d|d{1,2}[-/]m/i.test(fmt)
-          const [y, m, d] = val.split('-').map(Number)
-          this.writeRowChecked(b, sheet, row, col, val, number, numCol, null, isDate ? new Date(y, m - 1, d) : val)
+          // ★★ 11-03 写错数据事故（R2 E 列 46302.66666666664）：
+          //   以前这里把 `new Date(y, m - 1, d)` 直接交给 COM。JS Date 是本地时区（UTC+8）的
+          //   2026-10-08 00:00 = UTC 2026-10-07 16:00，WPS 按 UTC 折序列号 → 46302.6667，
+          //   **整列偏一天 + 多 16 小时**。日期格一律写整数序列号，绝不传 Date 对象。
+          const spec = dateCellWriteValue(val, fmt)
+          this.writeRowChecked(b, sheet, row, col, val, number, numCol, null, spec.value)
           return true
         } catch (e) { return false }
       }

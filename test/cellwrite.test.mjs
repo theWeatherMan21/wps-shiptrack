@@ -14,6 +14,7 @@
 // 跑：node test/cellwrite.test.mjs
 
 import { judgeReadback, cellMatches, writeCellCore, fmtDate } from '../src/lib/cellwrite.js'
+import { ymdToSerial, serialToYmd, dateCellWriteValue, dateCellIsClean } from '../src/lib/dates.js'
 
 let pass = 0
 let fail = 0
@@ -52,6 +53,19 @@ const mkSheet = (opt = {}) => {
     if (kind === 'throw') throw new Error('Operation not permitted（模拟工作表保护）')
     if (kind === 'noop' || (kind === 'noop-range' && opt._api === 'Range')) return
     if (kind === 'date') { cells[a1] = toDate(v); return }
+    // ★ 11-03：真 WPS 的日期口径 —— Date 对象按 UTC 折成序列号（本地 00:00 → 前一天 16:00），
+    //   数字原样（整数天 = 当天零点），文本按本地解析成整数序列号。这就是事故的现场。
+    if (kind === 'excel') {
+      if (v instanceof Date) {
+        cells[a1] = (v.getTime() - Date.UTC(1899, 11, 30)) / 86400000
+      } else if (typeof v === 'number') {
+        cells[a1] = v
+      } else {
+        const s = ymdToSerial(v)
+        cells[a1] = s || String(v == null ? '' : v)
+      }
+      return
+    }
     if (kind === 'number') { const n = Number(v); cells[a1] = Number.isFinite(n) ? n : String(v == null ? '' : v); return }
     cells[a1] = v === null || v === undefined ? v : String(v)
   }
@@ -136,6 +150,68 @@ console.log('⑥ 读回判定本身（批量路径也走这把尺）')
   ok(judgeReadback({ prev: '旧值', back: '旧值', want: '新值' }) === 'fail', '读回旧值 → fail')
   ok(judgeReadback({ back: new Date(2026, 10, 3), want: '2026-11-03' }) === 'ok', '批量路径：日期类型差 → ok')
   ok(judgeReadback({ back: '甲\uff08注）', want: '甲' }) === 'format-diff', '非空但不一致 → format-diff（不判 fail）')
+}
+
+// ===================== ★ 11-03 写错数据事故的不变量 =====================
+// 事故：`isDate ? new Date(y, m - 1, d) : val` 把 **JS Date** 交给 COM。
+// JS Date 是本地（UTC+8）2026-10-08 00:00 = UTC 2026-10-07 16:00，
+// WPS 按 UTC 折序列号 → 46302.6667（前一天 16:00）→ 整列偏一天。
+// 下面这条用例就是「以后谁敢再把 Date 交出去，它必须红」。
+
+console.log('⑦ 不变量：写 2026-10-08 → 读回必须等于 2026-10-08（三种读回形态都要过）')
+{
+  const VAL = '2026-10-08'
+  const SERIAL = 46303                            // 46302 = 2026-10-07（damage），46303 = 2026-10-08
+  ok(ymdToSerial(VAL) === SERIAL, `ymdToSerial('${VAL}') = ${SERIAL}（实际 ${ymdToSerial(VAL)}）`)
+  ok(serialToYmd(SERIAL) === VAL, `serialToYmd(${SERIAL}) = '${VAL}'（实际 '${serialToYmd(SERIAL)}'）`)
+  ok(serialToYmd(46302) === '2026-10-07', '46302 = 2026-10-07（截图里那个序列号的正身）')
+
+  // 读回形态 ①本地 Date ②整数序列号 ③文本 ④带时分的文本
+  ok(judgeReadback({ back: new Date(2026, 9, 8), want: VAL }) === 'ok', '读回是 Date（本地 10-08 00:00）→ ok')
+  ok(judgeReadback({ back: SERIAL, want: VAL }) === 'ok', '读回是整数序列号 46303 → ok（以前直接判 fail）')
+  ok(judgeReadback({ back: VAL, want: VAL }) === 'ok', '读回是 y-m-d 文本 → ok')
+  ok(judgeReadback({ back: '2026-10-08 00:00:00', want: VAL }) === 'ok', '读回带时分文本 → ok')
+  // 反向：普通数字不许被误当日期
+  ok(serialToYmd(12.5) === '' && serialToYmd(19999) === '' && serialToYmd(80001) === '',
+    '12.5 / 19999 / 80001 都不当日期（只有 20000–80000 才是序列号）')
+}
+
+console.log('⑧ 红-绿：日期格写进去的必须是不带时间的整数天（旧写法必须被抓住）')
+{
+  const VAL = '2026-10-08'
+  // 假表 excel 模式 = 真 WPS 口径：Date 按 UTC 折序列号，数字原样，文本按本地解析
+  const sh = mkSheet({ kind: 'excel' })
+  const spec = dateCellWriteValue(VAL, 'mm-dd-yy')
+  ok(spec.serial === true && Number.isInteger(spec.value) && spec.value === 46303,
+    `日期格给宿主的是整数序列号（实际 ${JSON.stringify(spec)}）`)
+  ok(!(spec.value instanceof Date), '给宿主的**不是** Date 对象')
+  const r = write(sh, 2, 5, spec.value)          // E2 —— 截图里那一格
+  ok(sh.cells['E2'] === 46303, `E2 落盘 = 46303（整数天）`, `实际 ${sh.cells['E2']}`)
+  ok(serialToYmd(sh.cells['E2']) === VAL, `E2 反解 = ${VAL}（实际 ${serialToYmd(sh.cells['E2'])}）`)
+  ok(r.ok === true && r.kind === 'ok', '写入读回判定 = ok（不再报「数值没生效」）', JSON.stringify(r))
+
+  // 旧写法（事故原句）放进同一张假表 → 存的必须是偏一天的 46302.6667
+  const sh2 = mkSheet({ kind: 'excel' })
+  write(sh2, 2, 5, new Date(2026, 9, 8))
+  ok(Math.abs(Number(sh2.cells['E2']) - 46302.666666666666) < 1e-6,
+    '旧写法（传 Date）落盘 46302.6667 → 偏一天（这条用例就是拦住它的那道闸）',
+    `实际 ${sh2.cells['E2']}`)
+  ok(Number.isInteger(sh2.cells['E2']) === false, '旧写法存的不是整数天')
+
+  // 非日期格：写文本，宿主按本地解析，不能偏
+  const sh3 = mkSheet({ kind: 'excel' })
+  const spec3 = dateCellWriteValue(VAL, 'General')
+  ok(spec3.serial === false && spec3.value === VAL, '非日期格写 y-m-d 文本', JSON.stringify(spec3))
+  write(sh3, 2, 5, spec3.value)
+  ok(serialToYmd(sh3.cells['E2']) === VAL, `文本路径落盘也是 ${VAL}（实际 ${serialToYmd(sh3.cells['E2'])}）`)
+
+  // 脏值必须能被重写修好（否则「重跑一轮刷新」永远修不好 11-03 那批格子）
+  ok(dateCellIsClean(46303, VAL) === true, '整数序列号 46303 = 干净 → 不重写')
+  ok(dateCellIsClean(46302.666666666666, VAL) === false, '带时分的 46302.6667 = 脏 → 允许重写改回')
+  ok(dateCellIsClean(new Date(2026, 9, 8), VAL) === true, '本地零点 Date = 干净')
+  ok(dateCellIsClean(new Date(2026, 9, 7, 16, 0), VAL) === false, '前一天 16:00 的 Date = 脏')
+  ok(dateCellIsClean('2026-10-08', VAL) === true, 'y-m-d 文本 = 干净')
+  ok(dateCellIsClean('2026-10-07', VAL) === false, '差一天 → 脏')
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
