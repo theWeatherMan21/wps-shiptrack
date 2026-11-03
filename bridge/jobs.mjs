@@ -60,8 +60,29 @@ export class JobQueue {
   _write(job) {
     const f = this._file(job.jobId);
     const tmp = `${f}.tmp${process.pid}`;
-    fs.writeFileSync(tmp, JSON.stringify(job, null, 2));
-    fs.renameSync(tmp, f);            // 原子替换：半截文件永远不会被读到
+    const payload = JSON.stringify(job, null, 2);
+    try {
+      fs.writeFileSync(tmp, payload);
+    } catch (e) {
+      // 目录被清理工具扫掉过 → 重建再试一次。
+      // 不自愈的后果：这座桥之后**每一次**派活都写不进盘，任务只活在内存里，
+      // 一重启全没 —— 而且表面看不出来（列表照样有数据）。
+      if (e && (e.code === 'ENOENT' || e.code === 'ENOTDIR')) {
+        try {
+          fs.mkdirSync(this.dir, { recursive: true });
+          fs.writeFileSync(tmp, payload);
+        } catch (e2) {
+          throw new Error(`任务落盘失败（已尝试重建目录 ${this.dir}）: ${e2.code || ''} ${e2.message || e2}`);
+        }
+      } else {
+        throw new Error(`任务落盘失败: ${e.code || ''} ${e.message || e}`);
+      }
+    }
+    try {
+      fs.renameSync(tmp, f);          // 原子替换：半截文件永远不会被读到
+    } catch (e) {
+      throw new Error(`任务改名失败: ${e.code || ''} ${e.message || e}`);
+    }
     this.mem.set(job.jobId, job);
     return job;
   }

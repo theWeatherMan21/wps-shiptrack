@@ -134,8 +134,13 @@ function readJsonBody(req, res, cb) {
     }
   });
   req.on('end', () => {
-    try { cb(JSON.parse(body || '{}')); }
-    catch (e) { send(res, 200, { ok: false, error: 'body 不是合法 JSON: ' + String(e.message || e) }); }
+    // ★ 解析错误和处理错误必须分开报 —— 写盘失败被套成「body 不是合法 JSON」，
+    //   读的人第一反应会以为是自己请求写错了（知澜 2026-11-02 实撞）。
+    let parsed;
+    try { parsed = JSON.parse(body || '{}'); }
+    catch (e) { return send(res, 200, { ok: false, error: 'body 不是合法 JSON: ' + String(e.message || e) }); }
+    try { cb(parsed); }
+    catch (e) { return send(res, 200, { ok: false, error: '服务端处理失败: ' + String((e && e.message) || e) }); }
   });
 }
 
@@ -294,8 +299,13 @@ const clean = (s) => String(s || '').replace(/[\s\u200b\u3000]/g, '').toUpperCas
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${HOST}:${PORT}`);
   // 只接受本机页面（WPS 的 file:// 页面发 Origin: null）；浏览器跨站请求一律拒绝
+  // ★ 卡 t_aa0674a9 第三步：Tauri 的 WebView 发的是 `tauri://localhost`（macOS）或
+  //   `http://tauri.localhost`（Windows）—— 之前没放行，App 直连桥一律 403，
+  //   只能在 Rust 里再包一层转发。放行这两种 origin 后 WebView 可以直连，少一道墙。
+  //   安全性：这两个 scheme 只有本机 Tauri 应用能伪造，公网页面发不出来。
   const origin = req.headers.origin;
-  if (origin && origin !== 'null' && !/^file:\/\//.test(origin) && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin)) {
+  const isTauri = /^tauri:\/\//i.test(String(origin || '')) || /^https?:\/\/tauri\.localhost(:\d+)?$/i.test(String(origin || ''));
+  if (origin && origin !== 'null' && !isTauri && !/^file:\/\//.test(origin) && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin)) {
     return send(res, 403, { ok: false, error: '只接受本机页面调用' });
   }
   if (req.method === 'OPTIONS') { res.writeHead(204, CORS); return res.end(); }
@@ -454,6 +464,26 @@ const server = http.createServer(async (req, res) => {
   // App --POST /jobs--> 桥 <--GET /jobs/next-- 插件心跳领活 --POST /jobs/:id/report--> 桥
   // 为什么在桥里做而不加 Rust 命令：WebView 前端本来就能 fetch 127.0.0.1（CORS 已开），
   // 多一层 Rust 转发只是多一道要维护的墙。
+
+  // ⓪ 有哪些文档配过列（App 的「发起查询」要让人先选哪张表）
+  //    配置文件在 ~/.hermes/wps-shiptrack/<encodeURIComponent(doc)>.json
+  if (url.pathname === '/docs') {
+    let names = [];
+    try { names = fs.readdirSync(CFG_DIR).filter((n) => n.endsWith('.json')); } catch (e) { names = []; }
+    const docs = [];
+    for (const n of names) {
+      // 台账/冷却/队列这些不是列配置，跳过
+      if (/^(cooldowns|bridge-listen-failures)/.test(n)) continue;
+      let doc = '';
+      try { doc = decodeURIComponent(n.replace(/\.json$/, '')); } catch (e) { doc = n.replace(/\.json$/, ''); }
+      let cfg = null;
+      try { cfg = JSON.parse(fs.readFileSync(path.join(CFG_DIR, n), 'utf8')); } catch (e) { cfg = null; }
+      if (!cfg || !cfg.numberCol) continue;          // 没选过单号列的不算可用
+      docs.push({ doc, cols: { number: cfg.numberCol || 0, out: cfg.outCol || 0, carrier: cfg.carrierCol || 0, pol: cfg.polCol || 0, pod: cfg.podCol || 0 }, mode: cfg.mode || 'column', startRow: cfg.startRow || 2, rows: cfg.rows || 0 });
+    }
+    docs.sort((a, b) => String(a.doc).localeCompare(String(b.doc)));
+    return send(res, 200, { ok: true, count: docs.length, docs });
+  }
 
   // ① 建任务
   if (url.pathname === '/jobs' && req.method === 'POST') {
