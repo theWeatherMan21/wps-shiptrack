@@ -166,7 +166,7 @@ const cacheGet = (k, skip = false) => { if (skip) return null; const e = cache.g
 const cacheSet = (k, v) => { cache.set(k, { at: Date.now(), value: v }); if (cache.size > 500) cache.delete(cache.keys().next().value); };
 
 // ---------- 跑一次 CLI，收 NDJSON ----------
-function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = null, pol = '', pod = '' }) {
+function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = null, pol = '', pod = '', doc = '', sheet = '', row = 0 }) {
   return new Promise(async (resolve) => {
     const release = await slot();
     const args = [CLI, '--number', number];
@@ -175,6 +175,15 @@ function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = nul
     //   不往引擎传 = buildCanonical 收到空串 → 阶段退回纯事件推断，中转港会被当目的港。
     if (pol) args.push('--pol', String(pol).slice(0, 64));
     if (pod) args.push('--pod', String(pod).slice(0, 64));
+    // ★ 10-30：台账（jobs-YYYY-MM-DD.ndjson）里 doc/sheet/row 全是空/0 时，事后定位只能靠内存日志。
+    //   引擎的 jobMeta 早就会读 --doc/--sheet/--row，这里只是把插件上报的那三个参数递下去。
+    //   **不能过 clean()**：那会把工作簿名大写化、删空格，读回来对不上原表。
+    const metaDoc = String(doc || '').trim().slice(0, 200);
+    const metaSheet = String(sheet || '').trim().slice(0, 60);
+    const metaRow = Math.max(0, Math.floor(Number(row) || 0));
+    if (metaDoc) args.push('--doc', metaDoc);
+    if (metaSheet) args.push('--sheet', metaSheet);
+    if (metaRow) args.push('--row', String(metaRow));
     // 让引擎比桥的硬上限早 8s 自己收尾：这样超时能带回 steps（诊断用），而不是被 SIGKILL
     args.push('--timeout', String(Math.max(10000, timeoutMs - 8000)));
     const t0 = Date.now();
@@ -414,8 +423,12 @@ const server = http.createServer(async (req, res) => {
     const t0 = Date.now();
     const pol = String(url.searchParams.get('pol') || '').trim();
     const pod = String(url.searchParams.get('pod') || '').trim();
+    // ★ 10-30：插件上报它查的是哪张表哪一行 → 台账里带上，失败行事后能直接定位回表格
+    const docMeta = String(url.searchParams.get('doc') || '').trim();
+    const sheetMeta = String(url.searchParams.get('sheet') || '').trim();
+    const rowMeta = Number(url.searchParams.get('row')) || 0;
     let r = await runCli({
-      number, carrier, timeoutMs, pol, pod,
+      number, carrier, timeoutMs, pol, pod, doc: docMeta, sheet: sheetMeta, row: rowMeta,
       onSpawn: (kill) => req.on('close', () => { if (!res.writableEnded) { console.error(`[bridge] 客户端中断 ${number} → 杀子进程`); kill(); } }),
     });
     const elapsed = Date.now() - t0;
@@ -429,7 +442,7 @@ const server = http.createServer(async (req, res) => {
       const net = await netProfile().catch(() => null);
       const direct = !!(net && net.proxyOn);
       console.error(`[bridge] 重试 ${number}（首次: ${String(r.error).slice(0, 80)}）${conn ? ` → 换极性 forceDirect=${direct}` : ''}`);
-      r = await runCli({ number, carrier, timeoutMs, forceDirect: conn ? direct : false });
+      r = await runCli({ number, carrier, timeoutMs, forceDirect: conn ? direct : false, pol, pod, doc: docMeta, sheet: sheetMeta, row: rowMeta });
       r.retried = true;
       if (conn) r.netRetriedWith = direct ? 'direct' : 'proxy';
     }

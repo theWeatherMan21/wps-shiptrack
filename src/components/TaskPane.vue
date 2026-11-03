@@ -164,7 +164,9 @@
 </template>
 
 <script>
-const APP_VER = '1.0.0'
+// ★ 10-30：版本号来自 package.json（vite define 注入），别手写常量 —— 手写就会出现
+//   「面板显示新版本、包还是旧的」两个真相（技能 wps-addin 明写过的坑）。
+const APP_VER = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.0.0'
 const BRIDGE = 'http://127.0.0.1:8791'
 const CFG_KEY = 'shiptrack_cfg_v4'
 const LAST_RUN_KEY = 'shiptrack_lastrun_v3'
@@ -179,6 +181,9 @@ import { zhEvent, cleanCity } from '../lib/events.js'
 import { stageOf, STAGE_COLOR, NO_FILL, STAGE_LABEL } from '../lib/milestone.js'
 import { matchPortHeaders, matchDateHeaders, matchNumberHeaders } from '../lib/headers.js'
 import { pickEtdEta } from '../lib/dates.js'
+// ★ 10-30：读回校验的口径只有一份（lib/cellwrite.js）—— 批量路径与逐格路径共用，
+//   以前逐格用裸比较、批量用归一化，日期列/数值列走逐格必然误判「补不进去」。
+import { cellMatches, judgeReadback, writeCellCore, cellText } from '../lib/cellwrite.js'
 import { summarize as summarizeFails, classifyFail } from '../lib/fail.js'
 // ★ 卡 t_8a6689dc：canonical 契约（schemaVersion）闸门 + 单元格文案的唯一实现
 import { checkResultSchema, PLUGIN_SCHEMA_VERSION } from '../lib/contract.js'
@@ -303,11 +308,27 @@ export default {
       const b = this.vb
       const note = b && b.writeNote
       if (note && note.fail > 0) {
-        return { kind: 'err', text: `${note.fail} 格补不进去（表可能被保护/只读）—— 点「诊断」看具体行` }
+        const ex = note.failEx
+        const at = ex && ex.row ? `R${ex.row} ${ex.col} 列 ` : ''
+        // ★ 10-30：失败要分两种说，别一律甩「表可能被保护/只读」——
+        //   「读回不一致」是写入判定的事，跟保护无关，说成保护会把人引到错的路上（误报红条就是这么来的）。
+        if ((note.rbp || 0) > 0 && !((note.com || 0) > 0)) {
+          return { kind: 'err', text: `${note.fail} 格没写进去：${at}写入 ${ex ? ex.wrote : ''} / 读回 ${(ex && ex.back) || '空'}（赋值没生效，不是表保护）—— 点「诊断」看具体行` }
+        }
+        if ((note.com || 0) > 0 && !((note.rbp || 0) > 0)) {
+          return { kind: 'err', text: `${note.fail} 格补不进去（表可能被保护/只读）—— 点「诊断」看具体行` }
+        }
+        return { kind: 'err', text: `${note.fail} 格补不进去：${note.com || 0} 格是写入抛异常、${note.rbp || 0} 格是读回没变 —— 点「诊断」看具体行` }
       }
       const pend = this.pendingWrites.length
       if (pend > 0) {
         return { kind: 'warn', text: `已有 ${pend} 格结果暂存，切回原表自动补` }
+      }
+      // ★ 10-30：写进去了、只是读回形态不同（日期被转 Date、数值被格式化）—— 黄条交代一句就够
+      if (note && (note.fmt || 0) > 0) {
+        const ex = note.fmtEx
+        const at = ex ? `R${ex.row} ${ex.col} 列` : ''
+        return { kind: 'warn', text: `${note.fmt} 格写入成功但读回格式不同（${at}写入 ${ex ? ex.wrote : ''} / 读回 ${ex ? ex.back : ''}）—— 值已经在表里，不用重写` }
       }
       if (note && note.fbRows > 0) {
         return { kind: 'warn', text: `批量写不认，已逐格写入（成功 ${note.fbOk}）` }
@@ -659,7 +680,7 @@ export default {
         misalign: 0, misalignSeen: new Set(),
         writeStats: null, writeMs: 0,
         // ★ 0.9.45 写回三态账：fail=真写不进 / defer=跨表暂存 / fb=退回逐格（批量写不认）
-        writeNote: { fail: 0, defer: 0, fbRows: 0, fbOk: 0 },
+        writeNote: { fail: 0, defer: 0, fbRows: 0, fbOk: 0, fmt: 0, com: 0, rbp: 0, fmtEx: null, failEx: null },
         colSnap: null, outSnap: null,
         capErr: '', summary: '',
         xsheet: { ok: 0, fail: 0, dead: false }
@@ -776,6 +797,12 @@ export default {
       } catch (e) {
         return ''
       }
+    },
+    /** ★ 10-30：当前这张表的 doc / sheet 两段（台账要能事后定位到具体行，别只有内存里的日志） */
+    docSheetOf(b) {
+      const key = String((b && b.doc) || this.docKey() || '')
+      const parts = key.split('|')
+      return { doc: parts[0] || '', sheet: parts[1] || '' }
     },
     /** ★ 0.9.43：读「别的表」已落盘的配置（批次跑的是别的表时，重查队列要写回那张表的配置） */
     loadStoredCfg(doc) {
@@ -1372,29 +1399,16 @@ export default {
 
     writeCell(sheet, r, c, text) {
       const a = this.app()
-      const A1 = this.addr(r, c)
-      const tries = [
-        ['Range.Value2', () => { sheet.Range(A1).Value2 = text }],
-        ['Cells.Item', () => { sheet.Cells.Item(r, c).Value2 = text }],
-        ['Cells()', () => { sheet.Cells(r, c).Value2 = text }],
-        ['App.Range', () => { if (typeof a.Range !== 'function') throw new Error('无 Application.Range'); a.Range(A1).Value2 = text }]
-      ]
-      const errs = []
-      for (const [name, fn] of tries) {
-        try {
-          fn()
-          const back = this.readOne(sheet, r, c)
-          if (String(back) === String(text)) {
-            this.apiReport = { ...(this.apiReport || {}), write: name }
-            return { ok: true, via: name }
-          }
-          errs.push(`${name}: 读回不一致（${back === undefined ? 'undefined' : back}）`)
-        } catch (e) {
-          errs.push(`${name}: ${String(e.message || e)}`)
-        }
-      }
-      // 报第一条失败原因（通常最贴近根因），别把最后一条「API 不存在」当结论
-      return { ok: false, error: errs[0] || '写入失败', all: errs }
+      // ★ 10-30：判定逻辑全部搬进 lib/cellwrite.js（纯函数 + 可单测）。
+      //   以前这里是 `String(back) === String(text)`，和批量路径的 sameCellText 两把尺，
+      //   日期列（读回 Date）和数值列（读回 number）走逐格必然「读回不一致」→ fail →
+      //   红条说「表可能被保护/只读」，方向全指错。
+      const res = writeCellCore({
+        sheet, app: a, a1: this.addr(r, c), r, c, value: text,
+        readOne: (sh, rr, cc) => this.readOne(sh, rr, cc),
+      }) || { ok: false, error: '写入失败' }
+      if (res.ok) this.apiReport = { ...(this.apiReport || {}), write: res.via }
+      return res
     },
 
     // ================= ★ 0.9.42（P0-2）唯一写回入口 + 批量写 =================
@@ -1478,7 +1492,7 @@ export default {
      * （整段覆盖会把洞里的公式/用户内容替换成死值 —— 这是最隐蔽的一种数据损坏，所以宁可按段写。）
      */
     async _flushWriteQueue() {
-      const st = { ok: 0, fail: 0, miss: 0, runs: 0, cells: 0, fills: 0, via: '', ms: 0 }
+      const st = { ok: 0, fail: 0, miss: 0, runs: 0, cells: 0, fills: 0, fmt: 0, com: 0, rbp: 0, via: '', ms: 0 }
       if (this.writing || !this.writeQ.length) return st
       const a = this.app()
       if (!a) return st
@@ -1504,7 +1518,7 @@ export default {
           const cross = doc !== this.docKey()
           const sheet = cross ? (b && b.sheet) : a.ActiveSheet
           if (!sheet) { later.push(...list); continue }
-          const bst = { ok: 0, fail: 0, miss: 0, runs: 0, cells: 0, fills: 0, via: '', ms: 0 }
+          const bst = { ok: 0, fail: 0, miss: 0, runs: 0, cells: 0, fills: 0, fmt: 0, com: 0, rbp: 0, via: '', ms: 0 }
           const bt0 = this.nowMs()
           let deferred = 0
           this.flushingDocs.add(doc)
@@ -1532,7 +1546,7 @@ export default {
           bst.deferred = deferred          // ★ 0.9.45：跨表暂存也算三态之一（不进 fail）
           if (b && cross) { b.xsheet.ok += bst.ok; b.xsheet.fail += deferred }
           this._accWriteStats(b, bst)
-          for (const k of ['ok', 'fail', 'miss', 'runs', 'cells', 'fills', 'ms']) st[k] += bst[k]
+          for (const k of ['ok', 'fail', 'miss', 'runs', 'cells', 'fills', 'fmt', 'ms']) st[k] += bst[k]
           if (bst.via) st.via = bst.via
         }
       } catch (e) {
@@ -1557,8 +1571,8 @@ export default {
       }
       // ★ 0.9.43：写回账本累计（界面/诊断/基准看的是「这一轮一共写了多少格、一共多久」，
       //   只报最后一次 flush 会让人以为只写了 3 格）
-      const acc = this.writeAcc || (this.writeAcc = { ok: 0, fail: 0, miss: 0, runs: 0, cells: 0, fills: 0, ms: 0 })
-      for (const k of ['ok', 'fail', 'miss', 'runs', 'cells', 'fills', 'ms']) acc[k] += st[k]
+      const acc = this.writeAcc || (this.writeAcc = { ok: 0, fail: 0, miss: 0, runs: 0, cells: 0, fills: 0, fmt: 0, ms: 0 })
+      for (const k of ['ok', 'fail', 'miss', 'runs', 'cells', 'fills', 'fmt', 'ms']) acc[k] += st[k]
       if (st.via) acc.via = st.via
       try { window.__SHIPTRACK_STATS__ = { ...acc, lastMs: st.ms, lastCells: st.cells } } catch (e) {}
       this.publishCross()
@@ -1576,21 +1590,39 @@ export default {
       b.writeMs = (b.writeMs || 0) + bst.ms
       // ★ 0.9.45：三态分开记账。别再往 errs.write 里塞「批量写不可用，退回逐格也没写进」——
       //   那句话把「跨表暂存」「批量路径不认但逐格写成了」「真写不进」糊成一条，害人。
-      const note = b.writeNote || (b.writeNote = { fail: 0, defer: 0, fbRows: 0, fbOk: 0 })
+      const note = b.writeNote || (b.writeNote = { fail: 0, defer: 0, fbRows: 0, fbOk: 0, fmt: 0, com: 0, rbp: 0, fmtEx: null, failEx: null })
       note.fail += Number(bst.fail || 0)
       note.defer += Number(bst.deferred || 0)
+      // ★ 10-30：格式差单独记账（不算失败）；失败按「COM 抛异常 / 读回没变」分开数，
+      //   横幅才能说准话（只有前者才可能是保护/只读）。
+      note.fmt = (note.fmt || 0) + Number(bst.fmt || 0)
+      note.com = (note.com || 0) + Number(bst.com || 0)
+      note.rbp = (note.rbp || 0) + Number(bst.rbp || 0)
+      if (bst.fmtEx && !note.fmtEx) note.fmtEx = bst.fmtEx
+      if (bst.failEx && !note.failEx) note.failEx = bst.failEx
       if (bst.fbRows) {
         note.fbRows += Number(bst.fbRows || 0)
         note.fbOk += Number(bst.fbOk || 0)
       }
+      // 这一轮整段写成了 → 之前那轮留下的失败计数不再成立（横幅只从状态推导，不许挂僵尸红条）
+      if (bst.cells && !bst.fail) { note.fail = 0; note.com = 0; note.rbp = 0; note.failEx = null }
       if (bst.cells && !bst.fail) b.errs.write = ''
     },
     /** 某一批的写回三态文案（条上的 tooltip 用；横幅走 writeNote） */
     writeNoteFor(b) {
       const n = b && b.writeNote
       if (!n) return ''
-      if (n.fail > 0) return `${n.fail} 格补不进去（表可能被保护/只读）`
+      if (n.fail > 0) {
+        const ex = n.failEx
+        if ((n.rbp || 0) > 0 && !((n.com || 0) > 0)) return `${n.fail} 格没写进去（${ex ? `R${ex.row} ${ex.col} 列：写入 ${ex.wrote} / 读回 ${ex.back || '空'}` : '赋值没生效'}）`
+        if ((n.com || 0) > 0 && !((n.rbp || 0) > 0)) return `${n.fail} 格补不进去（表可能被保护/只读）`
+        return `${n.fail} 格补不进去（${n.com || 0} 格抛异常 / ${n.rbp || 0} 格读回没变）`
+      }
       if (n.defer > 0) return `${n.defer} 格结果暂存，切回原表自动补`
+      if ((n.fmt || 0) > 0) {
+        const ex = n.fmtEx
+        return `${n.fmt} 格写入成功但读回格式不同${ex ? `（R${ex.row} ${ex.col} 列：写入 ${ex.wrote} / 读回 ${ex.back}）` : ''}`
+      }
       if (n.fbRows > 0) return `批量写不认，已逐格写入（成功 ${n.fbOk}）`
       return ''
     },
@@ -1732,16 +1764,13 @@ export default {
     _cellValueOf(w) {
       return w.value === undefined ? w.text : w.value
     },
-    /** 读回校验：日期列回来的可能是 Date，按 y-m-d 比 */
+    /**
+     * 读回校验（批量路径用）：与逐格路径同一个口径 —— lib/cellwrite.js 的 cellMatches。
+     * 日期列回来的可能是 Date、数值列可能是 number：类型差一律吞掉（谁也别在这里另写一版比较）。
+     */
     sameCellText(back, w) {
       const want = this._cellValueOf(w)
-      if (want instanceof Date) {
-        const p = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-        if (back instanceof Date) return p(back) === p(want)
-        const s = String(back == null ? '' : back)
-        return s === p(want) || s.slice(0, 10) === p(want) || s === w.text
-      }
-      return String(back == null ? '' : back) === String(want)
+      return cellMatches(back, want) || cellMatches(back, w && w.text)
     },
     /** 一段连续行：批量核身份 → 逐段写（段内批量）→ 记着色计划 */
     _writeSeg(batch, sheet, seg, st, paints) {
@@ -1803,17 +1832,30 @@ export default {
         ['App.Range(二维)', () => { if (typeof a.Range !== 'function') throw new Error('无 Application.Range'); a.Range(addr).Value2 = grid }]
       ]
       const errs = []
+      // ★ 10-30：写前读一次整段旧值。归因要靠它：读回来还是旧值 = 赋值没生效（真失败）；
+      //   读回来是新值只是形态不同 = 格式差（不许记 fail，最多记一条 format-diff 备注）。
+      const before = this.readRangeValues(sheet, col, from, to)
+      const prevs = (before && before.values && before.values.length === run.length) ? before.values : null
       for (const [name, fn] of tries) {
         try {
           fn()
           const back = this.readRangeValues(sheet, col, from, to)
           if (back && back.values && back.values.length === run.length) {
             let bad = 0
-            run.forEach((w, k) => { if (!this.sameCellText(back.values[k], w)) bad++ })
+            let fmt = 0
+            run.forEach((w, k) => {
+              const v = judgeReadback({ prev: prevs ? prevs[k] : undefined, back: back.values[k], want: this._cellValueOf(w) })
+              if (v === 'fail') bad++
+              else if (v === 'format-diff') {
+                fmt++
+                if (!st.fmtEx) st.fmtEx = { row: w.row, col: colLetter(col), wrote: cellText(this._cellValueOf(w)), back: cellText(back.values[k]) }
+              }
+            })
             if (!bad) {
               st.ok += run.length
               st.cells += run.length
               st.runs++
+              if (fmt) st.fmt = (st.fmt || 0) + fmt
               st.via = name
               this.apiReport = { ...(this.apiReport || {}), write: name }
               run.forEach((w) => { w.result = 'ok'; w.via = name })
@@ -1857,9 +1899,23 @@ export default {
         st.runs++
         w.result = 'ok'
         w.via = r.via
+        // ★ 10-30：写成但读回形态不同 ≠ 失败（日期列 Date / 数值列 number）。
+        //   最多记一条 format-diff 备注，别把用户引到「表被保护」那条死路上。
+        if (r.kind === 'format-diff') {
+          st.fmt = (st.fmt || 0) + 1
+          const ex = { row: w.row, col: colLetter(w.col), wrote: r.wrote, back: r.backText }
+          if (!st.fmtEx) st.fmtEx = ex
+          this.log(`R${ex.row} ${ex.col} 列写入成功但读回格式不同（写入 ${r.wrote} / 读回 ${r.backText}）—— 算写成，不重写`)
+        }
         return true
       }
       st.fail++
+      // ★ 10-30：失败分两种，别糊成一句「可能被保护/只读」：
+      //   com      = 四种写法全抛异常 → 才可能是保护/只读
+      //   readback = 没抛错但读回是空/旧值 → 是 API 静默没写（Cells() 那类），跟保护无关
+      if (r && r.kind === 'com') st.com = (st.com || 0) + 1
+      else st.rbp = (st.rbp || 0) + 1
+      if (!st.failEx) st.failEx = { row: w.row, col: colLetter(w.col), wrote: (r && r.wrote) || '', back: (r && r.backText) || '', kind: (r && r.kind) || 'readback' }
       w.result = 'fail'
       w.error = r && r.error
       // ★ 0.9.45：真写不进才记——{row, col, error, via, ts} 进环形缓冲，供事后归因
@@ -2542,6 +2598,9 @@ export default {
         //   只有插件知道用户选了哪两列港口；不传就等于让引擎瞎猜阶段。
         const rowPol = cfg.polCol ? String(this.readColCached(b, cfg.polCol, t.row) || '') : ''
         const rowPod = cfg.podCol ? String(this.readColCached(b, cfg.podCol, t.row) || '') : ''
+        // ★ 10-30：台账（~/.hermes/wps-shiptrack/jobs/*.ndjson）里 doc/sheet/row 全是空/0，
+        //   事后定位全靠内存里的 writeFailLog —— /track 早就支持这三个参数，带上就完事。
+        const at = this.docSheetOf(b)
         const call = async (num) => {
           await this.acquireSlot()
           try {
@@ -2549,6 +2608,7 @@ export default {
               // 单条 90s：绝大多数成功查询 <15s；跑飞的（站点卡住）不能占着 worker 两分钟
               // ★ 卡 t_8a6689dc：带上本插件认得的契约版本 → 桥太新/太旧都能当场拒绝（日志里也能定位是谁旧）
               '/track?number=' + encodeURIComponent(num) + (override ? '&carrier=' + override : '') + '&timeout=90000' + '&schema=' + PLUGIN_SCHEMA_VERSION
+              + '&doc=' + encodeURIComponent(at.doc) + '&sheet=' + encodeURIComponent(at.sheet) + '&row=' + Number(t.row || 0)
               + (rowPol ? '&pol=' + encodeURIComponent(rowPol) : '') + (rowPod ? '&pod=' + encodeURIComponent(rowPod) : ''), 95000)
           } finally {
             this.releaseSlot()
@@ -2785,6 +2845,8 @@ export default {
               'timeout=90000',
               'schema=' + PLUGIN_SCHEMA_VERSION,
               'doc=' + encodeURIComponent(docAtClaim),
+              // ★ 10-30：sheet 也要带上（以前只有 doc+row，台账里 sheet 恒空）
+              'sheet=' + encodeURIComponent(String(docAtClaim).split('|')[1] || ''),
               'row=' + row,
             ]
             if (cols.pol) { const v = String(this.readColCached(null, cols.pol, row) || '').trim(); if (v) q.push('pol=' + encodeURIComponent(v)) }

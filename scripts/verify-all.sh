@@ -41,11 +41,15 @@ run "单测：号码解析"        "$ADDON" node scripts/cellparse-test.mjs
 run "单测：事件词典"        "$ADDON" node scripts/events-test.mjs
 run "单测：里程碑/颜色"     "$ADDON" node scripts/milestone-test.mjs
 run "不变量：计划≠事实"      "$ADDON" node scripts/invariants-test.mjs
+# ★ 10-30：读回校验的三种列型都不许判 fail（日期列/数值列误报「表可能被保护」的红条正身）
+run "不变量：写回读回判定"    "$ADDON" node test/cellwrite.test.mjs
 run "单测：表头识别"        "$ADDON" node scripts/headers-test.mjs
 run "单测：ribbon"          "$ADDON" node scripts/ribbon-test.mjs
 # ★ 卡 t_8a6689dc：canonical 契约（schemaVersion）—— 闸门纯函数 + 桥真进程端到端
 run "单测：契约闸门"        "$ADDON" node test/schema.test.mjs
 run "探针：桥契约接口（/health 区间 + 降级桩）" "$ADDON" node test/schema-e2e.mjs
+# ★ 10-30：doc/sheet/row 从 URL → CLI → 台账，端到端一条（假 CLI 用真 journal 落盘）
+run "探针：台账行号端到端"  "$ADDON" node test/track-meta-e2e.mjs
 # 台账回归：拿本机真实台账（183 单那批）按新代码重渲染一遍，字段错位就红
 run "回归：台账重渲染（183 单）" "$ADDON" node test/ledger-regress.mjs
 if [ -n "$PROBE_ARG" ]; then
