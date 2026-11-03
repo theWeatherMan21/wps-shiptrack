@@ -33,6 +33,25 @@
       <span v-else class="upd-msg">{{ upd.msg }}</span>
     </div>
 
+    <!-- ★ 11-03 爹地原话：「写入 ETD/ETA，请加一个按钮来确认吧，不要静默替换」
+         一批查询结束才出这条；**没点确认之前 ETD/ETA 一格都不改**（连历史脏值修复也过这道闸）。
+         输出列（短结论）照旧自动写，不受影响。 -->
+    <div v-if="schedAsk && schedView" class="schedbar">
+      <div class="sb-hd">
+        船期回填：将更新 {{ schedView.n }} 行
+        <span class="sb-cnt">（ETD {{ schedView.etdN }} / ETA {{ schedView.etaN }}）</span>
+      </div>
+      <div class="sb-list">
+        <div v-for="(x, i) in schedView.preview" :key="i">R{{ x.row }} {{ x.label }} {{ x.oldText }} → {{ x.newText }}</div>
+        <div v-if="schedView.more" class="muted">…等共 {{ schedView.n }} 行</div>
+      </div>
+      <div class="sb-btns">
+        <button class="mini sb-go" @click="schedConfirm">确认写入</button>
+        <button class="mini" @click="schedSkip">跳过本次</button>
+        <label class="sb-auto"><input type="checkbox" v-model="schedAuto" /> 本表以后直接写</label>
+      </div>
+    </div>
+
     <!-- 三步：选单号列 → 选输出列 → 刷新 -->
     <div class="row">
       <button @click="pickNumberCol">① 选单号列</button>
@@ -180,7 +199,7 @@ import { cleanNumber, looksLikeNumber, splitParts, carrierFromSl, looksLikeCarri
 import { zhEvent, cleanCity } from '../lib/events.js'
 import { stageOf, STAGE_COLOR, NO_FILL, STAGE_LABEL } from '../lib/milestone.js'
 import { matchPortHeaders, matchDateHeaders, matchNumberHeaders } from '../lib/headers.js'
-import { pickEtdEta, dateCellIsClean, dateCellWriteValue, isDateish } from '../lib/dates.js'
+import { pickEtdEta } from '../lib/dates.js'
 // ★ 10-30：读回校验的口径只有一份（lib/cellwrite.js）—— 批量路径与逐格路径共用，
 //   以前逐格用裸比较、批量用归一化，日期列/数值列走逐格必然误判「补不进去」。
 import { cellMatches, judgeReadback, writeCellCore, cellText } from '../lib/cellwrite.js'
@@ -190,6 +209,9 @@ import { checkResultSchema, PLUGIN_SCHEMA_VERSION } from '../lib/contract.js'
 import { CARRIER_NAME } from '../lib/render.js'
 // ★ 卡 t_aa0674a9：派活的三条护栏（doc 校验 / 战果汇总 / 该不该领活）——纯函数，可单测
 import { decideBeforeRun, summarizeRun, shouldClaim } from '../lib/jobguard.js'   // ★ t_cec031c1：只借船司短名表，文案逻辑已搬进引擎
+// ★ 11-03 爹地原话「写入 ETD/ETA，请加一个按钮来确认吧，不要静默替换」：
+//   船期写回的判据与文案全在 lib/schedask.js（纯函数 + 可单测），组件只负责收集 / 出条 / 确认后写。
+import { decideScheduleWrite, shortDateText, summarizeAsk } from '../lib/schedask.js'
 
 const colLetter = (n) => {
   let s = ''
@@ -249,7 +271,12 @@ export default {
       timer: null,
       xsheetProbe: null,   // ★ 0.9.43 启动时对别的工作表做一次只读探针（不写不建不删）
       jobBusy: false,      // ★ t_aa0674a9：App 派下来的任务正在跑（同一面板只跑一个）
-      jobIdNow: ''         // 正在跑的任务 id（日志/界面用）
+      jobIdNow: '',        // 正在跑的任务 id（日志/界面用）
+      // ★ 11-03：ETD/ETA 一律先收集、不写。schedQueue = 本批还没交出去的变更；
+      //   schedAsks = 已收尾、等用户点确认的那几批（一格都还没写）
+      schedQueue: [],
+      schedAsks: [],
+      schedAuto: false     // 确认条上「本表以后直接写」的勾选状态
     }
   },
   computed: {
@@ -266,6 +293,18 @@ export default {
     },
     items() {
       return this.vb ? this.vb.items : []
+    },
+    /** ★ 11-03：当前这张表等着确认的那一批船期变更（别的表的不在这儿显示，切回去才出条） */
+    schedAsk() {
+      if (!this.schedAsks || !this.schedAsks.length) return null
+      const d = this.docNow || this.docKey()
+      const mine = this.schedAsks.filter((x) => x.doc === d)
+      return mine.length ? mine[0] : null
+    },
+    /** 条上的数字与差异列表（前 5 条） */
+    schedView() {
+      const a = this.schedAsk
+      return a ? (a.sum || summarizeAsk(a.items)) : null
     },
     /** 「这张表现在有没有一批在跑」——按当前活动表判断，不受「正在看哪一批」影响 */
     busy() {
@@ -2417,6 +2456,8 @@ export default {
       b.state = b.stop ? 'stopped' : 'done'
       this.publishBatches()
       this.log(`第 ${b.seq} 批（${b.doc}）汇总：${b.summary}`)
+      // ★ 11-03：船期变更在这一批收尾时才交出去（自动写 or 出确认条）——绝不在查询途中写日期
+      try { this.settleSchedule(b) } catch (e) { this.log('船期确认条异常: ' + ((e && e.message) || e)) }
       this.scheduleRetry(b)
       if (completed) {
         this.saveLastRun(Date.now(), b.doc)
@@ -2706,40 +2747,140 @@ export default {
       let etd = '', eta = ''
       try { ({ etd, eta } = pickEtdEta(r.events || [], { pod })) } catch (e) { this.log('船期取值失败: ' + (e.message || e)); return }
       const numCol = cfg.numberCol
-      // ★ 0.9.42：船期也是「写回」——一律走唯一入口（入队 → 批量核身份 → 批量写），
-      //   不再直接摸 Range；行身份由 writeRowChecked 那一把尺统一核，写错行的口子彻底收掉。
-      const put = (col, val) => {
+      // ★ 11-03 爹地原话：「写入 ETD/ETA，请加一个按钮来确认吧，不要静默替换」
+      //   所以这里**只收集、不写**：一格都不许动，等一批收尾由 settleSchedule 出确认条，
+      //   用户点「确认写入」才走 writeRowChecked（judge 在 lib/schedask.js，收集/确认各判一次）。
+      const doc = (b && b.doc) || this.docKey()
+      const batchId = (b && b.id) || ''
+      const collect = (col, val, label) => {
         if (!col || !val) return false
+        let cur
+        let fmt = ''
         try {
-          const addr = `${colLetter(col)}${row}`
-          const rng = sheet.Range(addr)
-          let cur
+          const rng = sheet.Range(`${colLetter(col)}${row}`)
           try { cur = rng.Value2 } catch (e) { cur = undefined }
-          // ★ 11-03 护栏：格子里已经是**文本**（代理名/联系方式这类）时绝不覆盖。
-          //   配置里的 etdCol/etaCol 是历史遗留的，表头一改（列被挪动/复用）它就会指到别人的列上；
-          //   照写等于把代理名换成日期 —— 那是比日期偏一天更狠的数据损坏。空着/是日期/是数字才写。
-          if (cur !== undefined && cur !== null && String(cur).trim() !== '' && !isDateish(cur)) {
-            this.log(`R${row} ${colLetter(col)} 现在是文本（${String(cur).slice(0, 12)}）→ 不当船期列，跳过`)
-            return false
-          }
-          // ★ 11-03：已经干净地等于这一天（Date 零点 / 整数序列号 / y-m-d 文本）→ 不重写。
-          //   注意用 dateCellIsClean 而不是 sameDate：带时分的 46302.6667 是**脏的**（偏一天的历史坏值），
-          //   必须允许被重写改回来，否则重跑刷新永远修不好那批格子。
-          if (dateCellIsClean(cur, val)) return false
-          let fmt = ''
           try { fmt = String(rng.NumberFormatLocal || '') } catch (e) { fmt = '' }
-          // ★★ 11-03 写错数据事故（R2 E 列 46302.66666666664）：
-          //   以前这里把 `new Date(y, m - 1, d)` 直接交给 COM。JS Date 是本地时区（UTC+8）的
-          //   2026-10-08 00:00 = UTC 2026-10-07 16:00，WPS 按 UTC 折序列号 → 46302.6667，
-          //   **整列偏一天 + 多 16 小时**。日期格一律写整数序列号，绝不传 Date 对象。
-          const spec = dateCellWriteValue(val, fmt)
-          this.writeRowChecked(b, sheet, row, col, val, number, numCol, null, spec.value)
-          return true
         } catch (e) { return false }
+        // 护栏两条都在 decideScheduleWrite 里：
+        //   ① 格子里是非空文本（代理名/联系方式）→ 绝不覆盖（列被挪动/复用时会指到别人的列上）
+        //   ② 已经干净等于这一天 → 不重写；带时分的 46302.6667 是脏值，要能修回，但必须过确认
+        const d = decideScheduleWrite(cur, val, fmt)
+        if (!d.write) {
+          if (d.reason === 'text') this.log(`R${row} ${colLetter(col)} 现在是文本（${String(cur).slice(0, 12)}）→ 不当船期列，跳过`)
+          return false
+        }
+        this.schedQueue.push({
+          batchId,
+          doc,
+          row,
+          col,
+          label,
+          number: String(number == null ? '' : number),
+          numCol,
+          oldText: shortDateText(cur),
+          newText: val,
+          value: d.value         // ★ 日期格给整数序列号，非日期格给 ymd 文本 —— 绝不把 Date 交给宿主
+        })
+        return true
       }
-      const a = put(etdCol, etd)
-      const c = put(etaCol, eta)
-      if (a || c) this.log(`R${row} 待回填船期：ETD ${etd || '—'} · ETA ${eta || '—'}`)
+      const a = collect(etdCol, etd, 'ETD')
+      const c = collect(etaCol, eta, 'ETA')
+      if (a || c) this.log(`R${row} 待回填船期（还没写，等确认）：ETD ${etd || '—'} · ETA ${eta || '—'}`)
+    },
+
+    /**
+     * ★ 11-03 一批收尾：把这一批收集到的船期变更交出去 ——
+     *   本表勾过「以后直接写」→ 直接写；否则出确认条，**在用户点确认之前一格都不写**。
+     */
+    settleSchedule(batch) {
+      const b = batch || this.vb
+      if (!b) return
+      const bid = b.id
+      const mine = this.schedQueue.filter((x) => x.batchId === bid)
+      if (!mine.length) return
+      this.schedQueue = this.schedQueue.filter((x) => x.batchId !== bid)
+      const sum = summarizeAsk(mine)
+      if (b.cfg && b.cfg.autoEtdEta) {
+        this.log(`船期回填（本表已选「以后直接写」）：${sum.n} 行（ETD ${sum.etdN} / ETA ${sum.etaN}）`)
+        this.applyScheduleItems(mine, b, 'auto').catch((e) => this.log('船期自动写入异常: ' + ((e && e.message) || e)))
+        return
+      }
+      this.schedAsks.push({ batchId: bid, seq: b.seq, doc: b.doc || this.docKey(), items: mine, sum, at: Date.now() })
+      this.schedAuto = false
+      this.log(sum.title + ' —— 等你点「确认写入」，确认前一格不改')
+    },
+
+    /**
+     * 真正写船期（确认 / 自动两条路共用）。
+     * 收集到确认之间用户可能刚手改过格子 → 每格按现场值重判一遍，文本仍不覆盖、干净仍不重写。
+     */
+    async applyScheduleItems(items, b, why) {
+      const list = Array.isArray(items) ? items : []
+      const doc = (b && b.doc) || (list[0] && list[0].doc) || this.docKey()
+      if (!list.length) return { ok: 0, skip: 0, fail: 0 }
+      if (this.docKey() !== doc) {
+        const msg = `船期没写：当前是「${this.docKey()}」，这批属于「${doc}」—— 切回那张表再点确认`
+        this.panelErr = msg
+        this.log(msg)
+        return { ok: 0, skip: list.length, fail: 0 }
+      }
+      const sheet = (b && b.sheet) || (this.app() && this.app().ActiveSheet)
+      if (!sheet) {
+        this.panelErr = '没有活动工作表，船期写不进去'
+        return { ok: 0, skip: list.length, fail: 0 }
+      }
+      const handles = []
+      let skipped = 0
+      for (const w of list) {
+        if (this.docKey() !== doc) break          // 写到一半被切走 → 立刻停，绝不多写一格
+        let cur
+        let fmt = ''
+        try {
+          const rng = sheet.Range(`${colLetter(w.col)}${w.row}`)
+          try { cur = rng.Value2 } catch (e) { cur = undefined }
+          try { fmt = String(rng.NumberFormatLocal || '') } catch (e) { fmt = '' }
+        } catch (e) { skipped++; continue }
+        const d = decideScheduleWrite(cur, w.newText, fmt)
+        if (!d.write) { skipped++; continue }
+        handles.push({ w, h: this.writeRowChecked(b, sheet, w.row, w.col, w.newText, w.number, w.numCol, null, d.value) })
+      }
+      await this.flushWrites()
+      let ok = 0
+      let fail = 0
+      let miss = 0
+      for (const { h } of handles) {
+        const res = h && h.entry ? h.entry.result : 'fail'
+        if (res === 'ok' || res === 'superseded') ok++
+        else if (res === 'miss') miss++
+        else fail++
+      }
+      const label = why === 'auto' ? '自动写入' : '确认写入'
+      this.log(`船期回填（${label}）：写成功 ${ok} 格 · 现场跳过 ${skipped} 格 · 写不进 ${fail} 格${miss ? ` · 错位 ${miss}` : ''}`)
+      if (fail || miss) this.panelErr = `船期回填：成功 ${ok} 格、写不进 ${fail} 格、错位 ${miss} 格`
+      return { ok, skip: skipped, fail, miss }
+    },
+
+    /** 确认条：确认写入（只写条里这几行；勾了「以后直接写」就记进这张表的 cfg） */
+    async schedConfirm() {
+      const a = this.schedAsk
+      if (!a) return
+      if (this.schedAuto) {
+        this.cfg = { ...this.cfg, autoEtdEta: true }
+        this.saveCfg(a.doc)
+        this.log(`已记住：表「${a.doc}」以后 ETD/ETA 直接写（不再问）`)
+      }
+      this.schedAsks = this.schedAsks.filter((x) => !(x.batchId === a.batchId && x.at === a.at))
+      const b = this.batchById(a.batchId) || null
+      await this.applyScheduleItems(a.items, b, 'confirm')
+    },
+
+    /** 确认条：跳过本次（一格不写，但账要记） */
+    schedSkip() {
+      const a = this.schedAsk
+      if (!a) return
+      const sum = a.sum || summarizeAsk(a.items)
+      this.schedAsks = this.schedAsks.filter((x) => !(x.batchId === a.batchId && x.at === a.at))
+      this.log(`用户跳过船期回填 ${sum.n} 行（ETD ${sum.etdN} / ETA ${sum.etaN}）—— 一格没写`)
     },
 
     /** ★ 10-28：切表时把这一行的结果攒起来（不写、不丢），切回来一次补齐 */
@@ -3220,4 +3361,13 @@ tr.skip td { color: #aaa; }
 button.bchip { font-family: inherit; line-height: 1.4; }
 .bchips.more { margin-top: -2px; padding-left: 8px; border-left: 2px solid #e6e9ef; }
 .hist-more { font-size: 10px; align-self: center; }
+/* ★ 11-03 ETD/ETA 回填确认条（爹地要的按钮：不许静默替换） */
+.schedbar { margin: 6px 0 8px; padding: 8px 10px; border: 1px solid #f0c36d; border-left: 4px solid #d98b00;
+  background: #fffdf3; border-radius: 8px; font-size: 12px; color: #5b4300; }
+.sb-hd { font-weight: 700; color: #8a5a00; }
+.sb-cnt { font-weight: 400; }
+.sb-list { margin: 4px 0 6px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; color: #444; line-height: 1.5; }
+.sb-btns { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sb-auto { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; color: #6b5a2e; cursor: pointer; }
+.mini.sb-go { background: #d98b00; border-color: #d98b00; color: #fff; font-weight: 700; }
 </style>

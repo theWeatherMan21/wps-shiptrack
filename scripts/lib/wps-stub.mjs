@@ -158,6 +158,13 @@ export const STUB = ({ doc = 'A.xlsx', lead = 0, grid = null, evKind = null, sav
             for (let r = a.row; r <= b.row; r++) o.push(g[`${r},${a.col}`] ?? '')
             return o.join('\n')
           },
+          // ★ 11-03：单元格数字格式。「日期格写整数序列号、非日期格写 ymd 文本」取决于它，
+          //   探针用 window.__fmts = {'5,2':'yyyy-mm-dd'} 按需注入；不注入时恒为 ''（老用例行为一字不变）。
+          //   故意不记 COM 次数：加进来不能改动既有探针的 __ops 断言。
+          get NumberFormatLocal() {
+            const m = window.__fmts || {}
+            return m[`${a.row},${a.col}`] ?? ''
+          },
           set Value2(v) {
             guard()
             COM()
