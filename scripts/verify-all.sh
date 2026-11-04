@@ -43,6 +43,7 @@ run "单测：里程碑/颜色"     "$ADDON" node scripts/milestone-test.mjs
 run "不变量：计划≠事实"      "$ADDON" node scripts/invariants-test.mjs
 # ★ 11-05：版本号比较（-hotfixN 后缀）—— 曾把 hotfix3→hotfix4 判成 noop，发布阻断
 run "单测：版本号比较"      "$ADDON" node test/vercmp.test.mjs
+run "单测：自更新降级保护"  "$ADDON" node test/update-guard.test.mjs
 # ★ 10-30：读回校验的三种列型都不许判 fail（日期列/数值列误报「表可能被保护」的红条正身）
 run "不变量：写回读回判定"    "$ADDON" node test/cellwrite.test.mjs
 run "单测：表头识别"        "$ADDON" node scripts/headers-test.mjs

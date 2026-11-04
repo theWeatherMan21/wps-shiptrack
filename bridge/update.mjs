@@ -135,15 +135,21 @@ export async function checkUpdate() {
   try {
     if (repo) {
       const man = await ghRelease();
-      const hasUpdate = !!man.version && cmp(man.version, local) > 0;
-      return { ok: true, enabled: true, source: 'github', repo, local, remote: { version: man.version, file: man.file, sha256: man.sha256, tag: man.tag }, hasUpdate, notes: man.notes || '' };
+      const rel = cmp(man.version, local);
+      // 降级保护：远端比本地旧 → 不算更新。发布没同步（manifest 还停在上一版）时，
+      // 否则「安装」会把爹地已经用上的 hotfix 回退成正式版（11-05 实测：远端 1.0.0、本地 1.0.0-hotfix3）。
+      const older = !!man.version && !!local && rel < 0;
+      const hasUpdate = !!man.version && rel > 0;
+      return { ok: true, enabled: true, source: 'github', repo, local, remote: { version: man.version, file: man.file, sha256: man.sha256, tag: man.tag, isOlder: older }, hasUpdate, reason: older ? `更新源落后（远端 ${man.version} < 本地 ${local}），发布未同步` : '', notes: man.notes || '' };
     }
     const manName = process.env.WPS_UPDATE_MANIFEST || 'wps-version.json';
     const r = await fetchWithTimeout(`${base}/${manName}${base.includes('?') ? '&' : '?'}t=${Date.now()}`);
     if (!r.ok) return { ok: false, enabled: true, local, error: `拉取 version.json 失败 HTTP ${r.status}` };
     const man = await r.json();
-    const hasUpdate = !!man.version && cmp(man.version, local) > 0;
-    return { ok: true, enabled: true, local, remote: man, hasUpdate, notes: man.notes || '' };
+    const rel = cmp(man.version, local);
+    const older = !!man.version && !!local && rel < 0;
+    const hasUpdate = !!man.version && rel > 0;
+    return { ok: true, enabled: true, local, remote: { ...man, isOlder: older }, hasUpdate, reason: older ? `更新源落后（远端 ${man.version} < 本地 ${local}），发布未同步` : '', notes: man.notes || '' };
   } catch (e) {
     return { ok: false, enabled: true, local, error: '更新源不可达: ' + String(e.message || e).slice(0, 80) };
   }
@@ -163,7 +169,10 @@ async function applyUpdateInner() {
   if (!base && !updateRepo()) return { ok: false, error: '未配置更新源（WPS_UPDATE_URL / WPS_UPDATE_REPO）' };
   const chk = await checkUpdate();
   if (!chk.ok) return { ok: false, error: chk.error };
-  if (!chk.hasUpdate) return { ok: false, error: `已是最新（本地 ${chk.local}）` };
+  if (!chk.hasUpdate) {
+    if (chk.remote && chk.remote.isOlder) return { ok: false, error: `更新源落后于本地（远端 ${chk.remote.version} < 本地 ${chk.local}），已拒绝降级安装；等发布同步后再试` };
+    return { ok: false, error: `已是最新（本地 ${chk.local}）` };
+  }
 
   const dir = addonDir();
   let man = chk.remote;

@@ -43,11 +43,11 @@ eq('订舱/提单 复合', splitComposite('11527275/HLCTSTU09000025E7XX'), 'HLCT
 eq('空格分隔', splitComposite('30225118 HLCUEUR25BA14ED88XX'), 'HLCUEUR25BA14ED88XX')
 eq('单一号码', splitComposite('900000009'), '900000009')
 eq('单一 HLCU', splitComposite('HLCTSTU09000025E7XX'), 'HLCTSTU09000025E7XX')
-eq('带空格', splitComposite(' HLCU EUR25220885E7XX '), 'HLCTSTU09000025E7XX')
+eq('带空格', splitComposite(' HLCU ABC1234567E7XX '), 'HLCUABC1234567E7XX')
 eq('空', splitComposite(''), '')
 
 // ---- 清洗与形态 ----
-eq('去空格', cleanNumber(' hlc u eur25220885e7xx '), 'HLCTSTU09000025E7XX')
+eq('去空格', cleanNumber(' hlc u abc1234567e7xx '), 'HLCUABC1234567E7XX')
 eq('日期排除', looksLikeDate('20261023'), true)
 eq('日期不当单号', looksLikeNumber('20261023'), false)
 eq('9 位数字', looksLikeNumber('900000009'), true)
