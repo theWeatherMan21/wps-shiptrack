@@ -11,6 +11,7 @@ cd "$ROOT"
 ./scripts/pack-update.sh >/dev/null
 SRC="$ROOT/dist-updates"
 TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
 NEWPKG="wps-shiptrack-$VER.tar.gz"
 cp "$SRC/shiptrack-$VER.tar.gz" "$TMP/$NEWPKG"
 python3 - "$SRC/version.json" "$TMP/wps-version.json" "$NEWPKG" <<'PY'
@@ -31,4 +32,9 @@ done
 # 滚动 tag（wps-latest）只留最新一版 + wps-version.json，历史版本包随 wps-v* 归档，不许再堆。
 # 想先看会删什么：scripts/prune-latest.sh --dry-run
 TAG=wps-latest REPO="$REPO" ./scripts/prune-latest.sh
-echo "发布完成：$REPO · wps-latest / wps-v$VER · v$VER"
+
+# 本地离线兜底包：GitHub / 镜像全挂时引擎按 man.file 去 ~/.hermes/wps-shiptrack/pkg 找包。
+# 不落这一步，会出现「清单取得到、包下载被断 → 安装失败」（不是回落旧版）。必须放在上传成功之后，
+# 保证 pkg 里的那份永远等于「线上真发出去的那一版」。
+./scripts/sync-pkg.sh --from "$TMP"
+echo "发布完成：$REPO · wps-latest / wps-v$VER · v$VER · pkg 已同步"

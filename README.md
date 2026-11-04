@@ -46,6 +46,16 @@ powershell -ExecutionPolicy Bypass -File bridge\start-win.ps1 -RepoPath "<ShipSc
 scripts/publish.sh --notes "说明"
 ```
 
+`publish.sh` 上传成功后会顺手把这一版同步进本地离线兜底目录
+`~/.hermes/wps-shiptrack/pkg`（`sync-pkg.sh --from`）：GitHub / 镜像全断时，
+App 的安装器按清单里的 `man.file` 只会去这个目录找同名包，少了这一步就是
+「清单取得到、包下载被断 → 安装直接失败」。只补目录、不整包重发：
+
+```bash
+scripts/sync-pkg.sh            # 从 dist-updates 同步（先 pack-update.sh）
+scripts/sync-pkg.sh --dry-run   # 看看会写什么
+```
+
 桥与 App 共用 `ShipScheduleHub` 的追踪引擎目录（`SSH_REPO`）。
 
 ## 与船期 App 的同步约定
