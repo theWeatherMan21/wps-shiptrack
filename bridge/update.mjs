@@ -11,6 +11,8 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+// 版本号比较只有一份实现（含 -hotfixN 后缀），与 ShipScheduleHub/engine/lib/vercmp.mjs 字节一致
+import { cmpVer as cmp } from './vercmp.mjs';
 
 const HOME = os.homedir();
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -51,14 +53,7 @@ export function installedVersion() {
   return '';
 }
 
-const cmp = (a, b) => {
-  const pa = String(a).split('.').map(Number);
-  const pb = String(b).split('.').map(Number);
-  for (let i = 0; i < 3; i++) {
-    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0);
-  }
-  return 0;
-};
+// 版本号语义：见 ./vercmp.mjs（-hotfixN 后缀、hotfix10 > hotfix9）
 
 /**
  * 更新源：
