@@ -1,5 +1,10 @@
 // 并发查询的 Chrome 档案池 —— 保证每个并发槽拿到「确认没有残留进程」的独立 profile
 //
+// ★ 2026-11-05 归因更正（重要）：提交 aa416d4 的标题写「OOCL 连查不再复用同一 Chrome 档案」，
+//   这句话是错的 —— **OOCL 是纯 fetch，不启 Playwright、根本不碰档案池**（见 engine/tracking/oocl.mjs
+//   文件头）。那个提交真正修的是「走浏览器的船司（Maersk/Hapag/ONE）并发踩同一 profile」。
+//   档案池的 LRU + 槽级冷却 + 档案轮换，只对走浏览器的船司有效；OOCL 的问题只能靠降频或换出口。
+//
 // 为什么需要（2026-11-05 爹地真机 + 知澜对照实验）：
 //   旧实现是 `(PROFILE_SEQ++) % MAX_CONCURRENT` 轮转发槽。子进程 'close' 只代表 node 退出，
 //   Chromium 孙进程还在收尾（写档案、释放 Singleton 锁）。下一个请求分到同一个 profile 时，
