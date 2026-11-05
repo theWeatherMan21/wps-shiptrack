@@ -29,6 +29,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import os from 'node:os';
 import { resolveTimeouts, makeClampTimeout, resolvePort, resolveCacheTtl } from './timeouts.mjs';
 import { makeContract } from './schema.mjs';
+import { makeProfilePool } from './profiles.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // Windows 上不能直接 import('C:\\a\\b.mjs')（ESM 只认 file:// URL）——统一走这个
@@ -71,8 +72,19 @@ const CONTRACT = makeContract(ENGINE_SCHEMA_VERSION);
 const CFG_DIR = process.env.WPS_TRACK_CONFIG_DIR || path.join(os.homedir(), '.hermes', 'wps-shiptrack');
 // 并发：默认 4（实测 2 时一批 96 单要十几分钟）。可用 WPS_TRACK_CONCURRENCY 覆盖。
 // 注意：每个查询会起一个 Chrome，机器弱就调回 2~3。
-let PROFILE_SEQ = 0;
+let PROFILE_SEQ = 0;   // 仅用于日志计数（真正的槽位由 profiles.mjs 的池子发）
 const MAX_CONCURRENT = Math.max(1, Math.min(8, Number(process.env.WPS_TRACK_CONCURRENCY || 4)));
+// ★ 2026-11-05（爹地真机 6 行待手工 + 知澜对照实验）：旧实现按 `(PROFILE_SEQ++) % MAX_CONCURRENT` 轮转，
+//   子进程 close 时 Chromium 孙进程还在收尾 → 下一个请求分到同一个 profile 就抢 Singleton 锁
+//   （"Target page, context or browser has been closed"），引擎兜底再把对方 Chrome 杀掉。
+//   现在改成档案池：容量 2×并发，每次分配都验证「没有活着的 Chrome 占着这个槽」，
+//   脏槽晾着等它退干净，只有全脏且等超时才强杀残留。见 ./profiles.mjs。
+const PROFILE_ROOT = process.env.WPS_TRACK_PROFILE_ROOT || path.join(os.homedir(), '.hermes', 'wps-shiptrack', 'chrome');
+const profilePool = makeProfilePool({
+  root: PROFILE_ROOT,
+  capacity: Math.max(MAX_CONCURRENT, Number(process.env.WPS_TRACK_PROFILE_POOL || 0) || MAX_CONCURRENT * 2),
+  log: (m) => console.error(m),
+});
 
 if (!fs.existsSync(CLI)) {
   console.error(`[bridge] 找不到追踪 CLI: ${CLI}`);
@@ -166,11 +178,14 @@ const cacheGet = (k, skip = false) => { if (skip) return null; const e = cache.g
 const cacheSet = (k, v) => { cache.set(k, { at: Date.now(), value: v }); if (cache.size > 500) cache.delete(cache.keys().next().value); };
 
 // ---------- 跑一次 CLI，收 NDJSON ----------
-function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = null, pol = '', pod = '', doc = '', sheet = '', row = 0 }) {
+function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = null, pol = '', pod = '', doc = '', sheet = '', row = 0, retry = false }) {
   return new Promise(async (resolve) => {
     const release = await slot();
     const args = [CLI, '--number', number];
     if (carrier) args.push('--carrier', carrier);
+    // ★ 2026-11-05：待重查的行重试时给引擎更长的站点窗口（Maersk 首查 8s，重试 20s）。
+    //   首查要快（一批几十行），重试是「上次没抓到」的行，宁可慢也要抓到。
+    if (retry) args.push('--retry');
     // ★ 卡 t_cec031c1：里程碑判定在引擎里，pol/pod 只有调用方知道（用户选了哪两列港口）。
     //   不往引擎传 = buildCanonical 收到空串 → 阶段退回纯事件推断，中转港会被当目的港。
     if (pol) args.push('--pol', String(pol).slice(0, 64));
@@ -188,12 +203,13 @@ function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = nul
     args.push('--timeout', String(Math.max(10000, timeoutMs - 8000)));
     const t0 = Date.now();
     let out = '', err = '', killed = false;
-    // 每个并发槽用独立 Chrome profile：
+    // 每个并发查询用「确认已退干净」的独立 Chrome 档案（池子见 ./profiles.mjs）：
     // 共用同一个 profile 时，多个进程同时 launchPersistentContext 会抢 Singleton 锁 →
-    // 报 "browserType.launchPersistentContext: Fail..."，表格里就是一堆失败行。
-    const profSlot = (PROFILE_SEQ++) % MAX_CONCURRENT;
-    const profDir = path.join(os.homedir(), '.hermes', 'wps-shiptrack', 'chrome', `p${profSlot}`);
-    console.error(`[bridge] profile=${profDir}`);
+    // 报 "Target page, context or browser has been closed"，表格里就是一堆失败行。
+    let profSlot = null;
+    try { profSlot = await profilePool.acquire(); } catch { profSlot = null; }
+    const profDir = (profSlot && profSlot.dir) || path.join(PROFILE_ROOT, 'p0');
+    console.error(`[bridge] profile=${profSlot ? profSlot.name : '(fallback p0)'}`);
     const child = spawn(process.execPath, args, {
       cwd: REPO,
       env: { ...childEnv(forceDirect), SSH_PROFILE_DIR: profDir },
@@ -228,6 +244,8 @@ function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = nul
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      // 档案放回池子：后台等 Chromium 孙进程真退出再清锁（acquire 侧还会二次验证）
+      try { profilePool.release(profSlot); } catch { /* 池子异常不许影响结果 */ }
       release();
       resolve(obj);
     };
@@ -302,6 +320,10 @@ function readCfgLoose(doc) {
 }
 // 网络抖动类错误：自动重试一次（2026-10-23 实测：Maersk/MSC 偶发 ERR_CONNECTION_CLOSED，隔几秒再跑就通）
 const TRANSIENT = /ERR_CONNECTION|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|非 JSON|被拦|timeout|超时|net::ERR_|has been closed|Target page, context or browser|两个入口都不可用|无查询表单/i;
+// ★ 2026-11-05（复验实测）：SPA 在 8s 窗口内没发出 XHR（引擎报「页面有内容但没发请求」）也该重来一次——
+//   同一个号 8s 窗口连挂两次、20s 窗口 9~12s 就成功（两个不同提单号各复现一次）。
+//   这类错误文案不带 ERR_/超时，旧正则漏掉 → 桥一次都不重试，直接落「待手工」。
+const RETRY_WORTHY = new RegExp(`${TRANSIENT.source}|没抓到追踪数据|没发请求|页面空白`, 'i');
 const send = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', ...CORS }); res.end(JSON.stringify(obj)); };
 const clean = (s) => String(s || '').replace(/[\s\u200b\u3000]/g, '').toUpperCase();
 
@@ -323,6 +345,9 @@ const server = http.createServer(async (req, res) => {
     return send(res, 200, {
       ok: true, service: 'wps-shiptrack-bridge', repo: REPO, port: PORT,
       concurrency: MAX_CONCURRENT, busy: running, cached: cache.size,
+      // ★ 2026-11-05：Chrome 档案池状态 —— 「脏槽」= 上个查询的 Chromium 还没退干净，
+      //   验收并发改动的第一手证据（正常情况下 dirty 最多一两个、且很快清空）
+      profilePool: profilePool.stats(),
       // ★ 插件按这两个字段校验：不认识这个版本就别猜字段，降级 + 提示更新加载项
       schemaVersion: ENGINE_SCHEMA_VERSION,
       supportedSchemaVersions: ENGINE_SCHEMA_VERSION ? [ENGINE_SCHEMA_VERSION] : [],
@@ -427,8 +452,10 @@ const server = http.createServer(async (req, res) => {
     const docMeta = String(url.searchParams.get('doc') || '').trim();
     const sheetMeta = String(url.searchParams.get('sheet') || '').trim();
     const rowMeta = Number(url.searchParams.get('row')) || 0;
+    // ★ 2026-11-05：?retry=1 = 这是「待重查」队列里的行 → 引擎给更长的站点窗口（Maersk 8s → 20s）
+    const retryHint = url.searchParams.get('retry') === '1' || url.searchParams.get('retry') === 'true';
     let r = await runCli({
-      number, carrier, timeoutMs, pol, pod, doc: docMeta, sheet: sheetMeta, row: rowMeta,
+      number, carrier, timeoutMs, pol, pod, doc: docMeta, sheet: sheetMeta, row: rowMeta, retry: retryHint,
       onSpawn: (kill) => req.on('close', () => { if (!res.writableEnded) { console.error(`[bridge] 客户端中断 ${number} → 杀子进程`); kill(); } }),
     });
     const elapsed = Date.now() - t0;
@@ -436,13 +463,15 @@ const server = http.createServer(async (req, res) => {
     console.error(`[track] ${number} ${carrier || 'auto'} ${r.ok ? 'ok' : 'FAIL'} ${elapsed}ms ${r.ok ? '' : String(r.error || '').slice(0, 80)}`);
     const hardDown = r.error && /ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET|ERR_NAME_NOT_RESOLVED|ENOTFOUND|EAI_AGAIN/i.test(String(r.error));
     // 连接不上（断网 / 代理没开）→ 立刻重试毫无意义，只是再开一个浏览器空烧
-    if (!r.ok && r.error && TRANSIENT.test(r.error) && !r.timeout && elapsed < 60000) {
+    if (!r.ok && r.error && RETRY_WORTHY.test(r.error) && !r.timeout && elapsed < 60000) {
       // 连接级失败：先判断是不是「网络姿势」问题 —— 换个极性（走代理 ⇄ 强制直连）再试一次
       const conn = isConnectionLevel(r.error);
       const net = await netProfile().catch(() => null);
       const direct = !!(net && net.proxyOn);
-      console.error(`[bridge] 重试 ${number}（首次: ${String(r.error).slice(0, 80)}）${conn ? ` → 换极性 forceDirect=${direct}` : ''}`);
-      r = await runCli({ number, carrier, timeoutMs, forceDirect: conn ? direct : false, pol, pod, doc: docMeta, sheet: sheetMeta, row: rowMeta });
+      console.error(`[bridge] 重试 ${number}（首次: ${String(r.error).slice(0, 80)}）${conn ? ` → 换极性 forceDirect=${direct}` : ''} · 放宽站点窗口`);
+      // ★ 2026-11-05：桥自己的第二次尝试也走「重试窗口」——8s 窗口下 SPA 常见「页面有内容但没发请求」，
+      //   第二次还是 8s 只是把同样的失败重演一遍（802735343 就是这么连挂两次的）。
+      r = await runCli({ number, carrier, timeoutMs, forceDirect: conn ? direct : false, pol, pod, doc: docMeta, sheet: sheetMeta, row: rowMeta, retry: true });
       r.retried = true;
       if (conn) r.netRetriedWith = direct ? 'direct' : 'proxy';
     }
@@ -575,6 +604,8 @@ const server = http.createServer(async (req, res) => {
     const numbers = (url.searchParams.get('numbers') || '').split(/[,\s]+/).map(clean).filter(Boolean).slice(0, 200);
     if (!numbers.length) return send(res, 400, { ok: false, error: '缺 numbers' });
     const timeoutMs = clampTimeout(url.searchParams.get('timeout'));
+    // ★ 2026-11-05：批量也能带 retry=1（待重查批次整批放宽站点窗口）
+    const retryHint = url.searchParams.get('retry') === '1' || url.searchParams.get('retry') === 'true';
     // ★ 卡 t_03fc348f：断点续查的两个入参（都可选，不带就是原来的行为）
     //   doc  文档 key（插件传 "工作簿|工作表"），分账本用
     //   rows 可选 JSON [{number, doc, sheet, row}]，带上才能落 doc/sheet/row 三字段
@@ -636,7 +667,7 @@ const server = http.createServer(async (req, res) => {
         // ② 正常查询
         const key = n + '|' + carrier;
         const hit = cacheGet(key);
-        const r0 = hit ? { ...hit, cached: true } : await runCli({ number: n, carrier, timeoutMs, pol, pod });
+        const r0 = hit ? { ...hit, cached: true } : await runCli({ number: n, carrier, timeoutMs, pol, pod, retry: retryHint });
         const r = withSchema(r0);
         if (!hit && r.ok) cacheSet(key, r);
         // ③ 落盘（成功也记：下次刷新才知道这行已经查过了）

@@ -2642,13 +2642,16 @@ export default {
         // ★ 10-30：台账（~/.hermes/wps-shiptrack/jobs/*.ndjson）里 doc/sheet/row 全是空/0，
         //   事后定位全靠内存里的 writeFailLog —— /track 早就支持这三个参数，带上就完事。
         const at = this.docSheetOf(b)
+        // ★ 2026-11-05：待重查批次（上次没抓到）告诉桥/引擎「这是重试」→ Maersk 站点窗口从 8s 放宽到 20s。
+        //   否则重试还是用 8s，同一批行会永远失败（爹地截图里 67 格待重查卡死就是这么来的）。
+        const retryQ = b.kind === 'retry' ? '&retry=1' : ''
         const call = async (num) => {
           await this.acquireSlot()
           try {
             return await this.httpGet(
               // 单条 90s：绝大多数成功查询 <15s；跑飞的（站点卡住）不能占着 worker 两分钟
               // ★ 卡 t_8a6689dc：带上本插件认得的契约版本 → 桥太新/太旧都能当场拒绝（日志里也能定位是谁旧）
-              '/track?number=' + encodeURIComponent(num) + (override ? '&carrier=' + override : '') + '&timeout=90000' + '&schema=' + PLUGIN_SCHEMA_VERSION
+              '/track?number=' + encodeURIComponent(num) + (override ? '&carrier=' + override : '') + '&timeout=90000' + '&schema=' + PLUGIN_SCHEMA_VERSION + retryQ
               + '&doc=' + encodeURIComponent(at.doc) + '&sheet=' + encodeURIComponent(at.sheet) + '&row=' + Number(t.row || 0)
               + (rowPol ? '&pol=' + encodeURIComponent(rowPol) : '') + (rowPod ? '&pod=' + encodeURIComponent(rowPod) : ''), 95000)
           } finally {
