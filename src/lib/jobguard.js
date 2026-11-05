@@ -27,13 +27,16 @@ export function decideBeforeRun({ currentDoc = '', specDoc = '', cols = {} } = {
 }
 
 /** ② 收尾：把实际战果算成要给桥的 report（中途炸了也走这里，别把已写的算成没写） */
-export function summarizeRun({ ok = 0, failed = 0, written = 0, total = 0, interrupted = false, error = '' } = {}) {
+export function summarizeRun({ ok = 0, failed = 0, written = 0, total = 0, skipped = 0, interrupted = false, error = '' } = {}) {
   const o = Math.max(0, Number(ok) || 0);
   const w = Math.max(0, Number(written) || 0);
   const t = Math.max(0, Number(total) || 0);
+  const s = Math.max(0, Number(skipped) || 0);
   // 中途炸了：没跑到的行算 failed，但**绝不把已写的抹掉**
-  const f = interrupted ? Math.max(Number(failed) || 0, t - o) : Math.max(0, Number(failed) || 0);
-  const out = { ok: o, failed: f, written: w, total: t, state: interrupted ? 'failed' : 'done' };
+  const f = interrupted ? Math.max(Number(failed) || 0, t - o - s) : Math.max(0, Number(failed) || 0);
+  // skipped = 空行 / 不是单号的行：正常跳过，不算失败，但必须计入「已处理」，
+  // 否则 ok+failed 永远小于 total（遍历 14 行、只有 13 行有号）→ 进度条停在 13/14。
+  const out = { ok: o, failed: f, written: w, total: t, skipped: s, done: o + f + s, state: interrupted ? 'failed' : 'done' };
   if (error) out.error = String(error).slice(0, 300);
   return out;
 }

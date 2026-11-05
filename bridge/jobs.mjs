@@ -183,7 +183,13 @@ export class JobQueue {
     const ok = num(raw.ok, 0);
     const failed = num(raw.failed, 0);
     const total = num(raw.total, ok + failed);
-    job.progress = { done: ok + failed, total, ok, failed };
+    // ★ 2026-11-05：written 也要进 progress。原来只落在 reports[] 历史里，
+    //   客户端读 progress.written 永远是 undefined —— App 进度面板没法显示「实际写了几格」。
+    const written = num(raw.written, 0);
+    const skipped = num(raw.skipped, 0);
+    // done 优先用插件报的（含跳过的空行）；插件没报就退回 ok+failed
+    const done = num(raw.done, ok + failed + skipped);
+    job.progress = { done, total, ok, failed, written, skipped };
     job.reports.push({
       at: new Date().toISOString(),
       ok, failed, total,

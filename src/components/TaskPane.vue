@@ -2960,8 +2960,11 @@ export default {
       const rows = Math.max(0, Number(spec.rows) || 0)
       const cols = spec.cols || {}
       // 只补失败时总量是失败行数，不是整段行数
-      const total = (Array.isArray(spec.pendingRows) && spec.pendingRows.length) ? spec.pendingRows.length : rows
-      let ok = 0, failed = 0, written = 0
+      // ★ 2026-11-05：初值给 rows，真正的总数在 work 构造后按 work.length 重算 ——
+      //   spec.rows 含表头行（startRow 从 1 传、规整到 2），直接拿来当 total
+      //   会让进度条永远停在 13/14，用户以为漏跑了一行。
+      let total = (Array.isArray(spec.pendingRows) && spec.pendingRows.length) ? spec.pendingRows.length : rows
+      let ok = 0, failed = 0, written = 0, skipped = 0
       try {
         // ① 表被切走 / 列没配 → 一行不写（判据在 jobguard，可单测）
         const gate = decideBeforeRun({ currentDoc: this.docKey(), specDoc: docAtClaim, cols })
@@ -2979,6 +2982,7 @@ export default {
         const work = pendingRows
           ? pendingRows.map((p) => ({ row: Number(p.row) || 0, number: String(p.number || '') }))
           : Array.from({ length: rows }, (_, i) => ({ row: (Number(spec.startRow) || 2) + i, number: '' }))
+        total = work.length || total          // 实际要跑的行数（不含表头/整段外）
         this.log(pendingRows
           ? `派活 ${jobId}：只补失败 ${work.length} 行（${work.map((w) => w.number).slice(0, 5).join(', ')}${work.length > 5 ? '…' : ''}）→ 写 ${colLetter(outCol)} 列`
           : `派活 ${jobId}：${docAtClaim} 第 ${spec.startRow} 行起 ${rows} 行 → 写 ${colLetter(outCol)} 列`)
@@ -2994,7 +2998,9 @@ export default {
           if (!num) {
             try { num = cleanNumber(String(this.readColCached(null, cols.number, row) || '')) } catch (e) { num = '' }
           }
-          if (!num) continue                          // 空行 / 不是单号 → 跳过，不算失败
+          if (!num) { skipped++; continue }           // 空行 / 不是单号 → 跳过，不算失败但要计入「已处理」
+          //   ★ 2026-11-05：不计数的话 ok+failed 永远 < total（遍历 14 行、只有 13 行有号），
+          //   进度条停在 13/14，用户以为漏跑了一行。
 
           let r = null
           try {
@@ -3022,15 +3028,15 @@ export default {
             else failed++
           } catch (e) { failed++ }
 
-          if ((i + 1) % 5 === 0) await report({ ok, failed, written, total })   // 中途只报进度，不带 state
+          if ((i + 1) % 5 === 0) await report({ ok, failed, written, total, skipped })   // 中途只报进度，不带 state
         }
 
-        const fin = summarizeRun({ ok, failed, written, total })
+        const fin = summarizeRun({ ok, failed, written, total, skipped })
         await report(fin)
         this.log(`派活 ${jobId} 完成：成功 ${fin.ok} · 失败 ${fin.failed} · 写入 ${fin.written}/${fin.total}`)
       } catch (e) {
         // ② 中途炸了：已写的不动，如实报
-        const fin = summarizeRun({ ok, failed, written, total, interrupted: true, error: String((e && e.message) || e) })
+        const fin = summarizeRun({ ok, failed, written, total, skipped, interrupted: true, error: String((e && e.message) || e) })
         await report(fin)
         this.log(`派活 ${jobId} 异常：${fin.error}（已写 ${fin.written} 行保留，未跑完的记为失败）`)
       } finally {
