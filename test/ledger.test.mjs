@@ -36,7 +36,7 @@ console.log('③ append / read / pending：后写覆盖前写');
 {
   const L = new Ledger(tmp);
   L.append('docA', [
-    toRecord({ doc: 'docA', sheet: 's', row: 1, number: 'N1', result: { ok: false, carrier: 'oocl', errorKind: 'timeout', error: '超时' } }),
+    toRecord({ doc: 'docA', sheet: 's', row: 1, number: 'N1', result: { ok: false, carrier: 'oocl', errorKind: 'network', error: '出口断了' } }),
     toRecord({ doc: 'docA', sheet: 's', row: 2, number: 'N2', result: { ok: true, carrier: 'hapag' } }),
   ]);
   ok(L.read('docA').length === 2, '两条都读回来');
@@ -81,7 +81,7 @@ console.log('⑥ 冷却：设了就有剩余，到点自动解封并落盘清理
 console.log('⑦ 坏行跳过，不影响同文件其它记录');
 {
   const L = new Ledger(tmp);
-  L.append('docC', [toRecord({ doc: 'docC', number: 'GOOD', result: { ok: false, carrier: 'x', errorKind: 'timeout' } })]);
+  L.append('docC', [toRecord({ doc: 'docC', number: 'GOOD', result: { ok: false, carrier: 'x', errorKind: 'network' } })]);
   fs.appendFileSync(path.join(tmp, 'docC.ndjson'), '这不是 JSON\n{坏}\n');
   ok(L.pending('docC').length === 1, '坏行被跳过，好行还在', JSON.stringify(L.pending('docC').map((r) => r.number)));
 }

@@ -47,14 +47,68 @@ export function toRecord({ doc, sheet, row, number, result }) {
     number: number ?? null,
     carrier: r.carrier ?? null,
     kind: errKind,
-    err: r.ok ? null : (r.error || null),
+    err: r.ok ? null : (r.error || r.msg || null),
+    // 死号不进队列：no_record / aged_out / bad_format / not_wired
+    why: r.ok ? null : whyNotRetry(errKind, r.error || r.msg),
+    state: r.ok ? 'ok' : (whyNotRetry(errKind, r.error || r.msg) || (STALE_TIMEOUT_KINDS.has(String(errKind)) ? 'stale_timeout' : 'retry_now')),
+    retryable: r.ok ? false : !whyNotRetry(errKind, r.error || r.msg),
     at: new Date().toISOString(),
   };
 }
 
-/** 一条记录是不是「下次要补查的」：失败且不是冷却类（冷却类等解封后再说，仍算待补） */
-export function isPendingRecord(rec) {
-  return !!rec && rec.kind !== null && rec.kind !== undefined;
+// ★ 2026-11-05（知澜定的收口口径）：**不是所有失败都值得重查**。
+//   实测 67 格待重查里 25 个是「官网真没有」、3 个是「引擎没接入」——
+//   把它们留在队列里，每轮都白烧时间，队列永远打转。
+//   所以落账时就把「为什么不该重试」定型：
+//     no_record  —— 官网查无此单 / 404（业务限制，重查一百次也一样）
+//     aged_out   —— 超出官网保留期（Hapag 只留 12 个月）
+//     bad_format —— 号码本身写错（少位/多位），要人去核表，不是机器重试
+//   只有「限流 / 网络 / 站点超时 / 挑战」这类**环境性**失败才进待重查队列。
+const BAD_FORMAT_RE = /格式不符|位数|应为\s*\d+\s*位|格式错误|too short|at least \d+ char/i;
+const AGED_RE = /12\s*个月|超过\s*\d+\s*个月|aged\s*out|超期/i;
+const NO_RECORD_RE = /无此单|查无此号|查无此单|no records were found|官网无此|\b404\b|no data/i;
+
+const NOT_WIRED_RE = /no tracking module|没接入|未接入|未支持该船司|no module/i;
+
+/** 这条失败为什么不值得每轮重试？返回 'bad_format' / 'aged_out' / 'no_record' / 'not_wired' / null */
+export function whyNotRetry(kind, err) {
+  const k = String(kind || '');
+  const e = String(err || '');
+  if (NOT_WIRED_RE.test(k) || NOT_WIRED_RE.test(e) || /no-module/.test(k)) return 'not_wired';
+  if (/bad-format|bad-args/.test(k) || BAD_FORMAT_RE.test(e)) return 'bad_format';
+  if (AGED_RE.test(e)) return 'aged_out';
+  if (/not-found|no-record/.test(k) || NO_RECORD_RE.test(e)) return 'no_record';
+  return null;
+}
+
+/** 站点超时不算死号，但也不该每轮重查：+24h、+72h 各试一次，第三次仍空就转 no_record。
+ *  这样僵尸队列有上限（最多再烧 2 次查询/行），不会永远打转。 */
+export const STALE_TIMEOUT_KINDS = new Set(['timeout']);
+export const STALE_RETRY_HOURS = [24, 72];   // 第 1、2 次补试的时间点（相对首次超时）
+
+/** 这条记录现在该不该进待重查队列？
+ *  - retry_now（限流/网络/挑战）：进，下一轮就查
+ *  - stale_timeout：只在到了 +24h / +72h 才进；补试 2 次仍失败 → 调用方转 no_record
+ *  - no_record / aged_out / bad_format / not_wired：永远不进
+ *  - ok（kind 为空）：不进
+ *  老账本没有 state 字段 → 用 kind/err 现算，向后兼容。 */
+export function pendingState(rec) {
+  if (!rec || rec.kind === null || rec.kind === undefined) return 'ok';
+  if (rec.state) return rec.state;
+  const why = whyNotRetry(rec.kind, rec.err);
+  if (why) return why;
+  if (STALE_TIMEOUT_KINDS.has(String(rec.kind))) return 'stale_timeout';
+  return 'retry_now';
+}
+
+export function isPendingRecord(rec, now = Date.now()) {
+  const st = pendingState(rec);
+  if (st === 'retry_now') return true;
+  if (st !== 'stale_timeout') return false;
+  const tries = Number(rec.staleTries || 0);
+  if (tries >= STALE_RETRY_HOURS.length) return false;          // 补试次数用尽 → 已转 no_record
+  const nextAt = Number(rec.nextAt || 0);
+  return !nextAt || now >= nextAt;
 }
 
 export class Ledger {
@@ -95,9 +149,42 @@ export class Ledger {
   }
 
   /** 追加一批记录（每行一个 JSON，天生可续、坏一行不影响前面） */
+  /** 这个 key 历史上「站点超时」过几次（含本次之前所有）。用于 stale_timeout 的补试计数。 */
+  _countStale(docKey, key) {
+    let n = 0;
+    try {
+      for (const line of fs.readFileSync(this._file(docKey), 'utf8').split('\n')) {
+        const s = line.trim();
+        if (!s) continue;
+        try {
+          const r = JSON.parse(s);
+          if (r && r.key === key && STALE_TIMEOUT_KINDS.has(String(r.kind))) n++;
+        } catch (e) { /* 坏行跳过 */ }
+      }
+    } catch (e) { /* 文件还不存在 */ }
+    return n;
+  }
+
   append(docKey, records) {
     if (!records || !records.length) return;
     const f = this._file(docKey);
+    for (const rec of records) {
+      // ★ 站点超时不是死号，但也不能每轮重查：+24h、+72h 各补试一次，第三次仍空转 no_record。
+      //   这样僵尸队列有硬上限（每行最多再烧 2 次查询），不会永远打转。
+      if (rec && rec.state === 'stale_timeout') {
+        const prev = this._countStale(docKey, rec.key);
+        const hours = STALE_RETRY_HOURS[prev];
+        rec.staleTries = prev;
+        if (hours === undefined) {
+          rec.state = 'no_record';       // 补试次数用尽 → 死号，从此不进队列
+          rec.why = 'no_record';
+          rec.retryable = false;
+          rec.nextAt = 0;
+        } else {
+          rec.nextAt = Date.now() + hours * 3600 * 1000;
+        }
+      }
+    }
     const lines = records.map((r) => JSON.stringify(r)).join('\n') + '\n';
     fs.appendFileSync(f, lines);
   }
@@ -121,7 +208,8 @@ export class Ledger {
 
   /** 该文档下次要补查的行 */
   pending(docKey) {
-    return this.read(docKey).filter(isPendingRecord);
+    const now = Date.now();
+    return this.read(docKey).filter((r) => isPendingRecord(r, now));
   }
 
   /** 命中撞盾 → 整家冷却 */
