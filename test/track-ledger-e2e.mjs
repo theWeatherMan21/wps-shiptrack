@@ -126,6 +126,18 @@ console.log('⑥ /track 和 /track-batch 写同一个 key（两条入口不能�
   ok(j.count === 2, 'batch 的失败行也进了同一本账（1+1=2）', String(j.count));
 }
 
+console.log('⑦ /pending 与 /ledger/clear 认「工作簿」+「工作表」分开传');
+{
+  const onlyDoc = await (await fetch(`http://127.0.0.1:${PORT}/pending?doc=${encodeURIComponent(DOC)}`)).json();
+  ok(onlyDoc.count === 0, '只给工作簿名 → 0（账本 key 是 工作簿|工作表）', String(onlyDoc.count));
+  const withSheet = await (await fetch(`http://127.0.0.1:${PORT}/pending?doc=${encodeURIComponent(DOC)}&sheet=${encodeURIComponent(SHEET)}`)).json();
+  ok(withSheet.count === 2, '补上 sheet 就查到 2 条', String(withSheet.count));
+  const cl = await (await fetch(`http://127.0.0.1:${PORT}/ledger/clear?doc=${encodeURIComponent(DOC)}&sheet=${encodeURIComponent(SHEET)}`)).json();
+  ok(cl.doc === `${DOC}|${SHEET}`, 'clear 也按拼好的 key 清', String(cl.doc));
+  const after = await (await fetch(`http://127.0.0.1:${PORT}/pending?doc=${encodeURIComponent(`${DOC}|${SHEET}`)}`)).json();
+  ok(after.count === 0, '清完归零', String(after.count));
+}
+
 br.kill('SIGKILL');
 fs.rmSync(LEDGER_DIR, { recursive: true, force: true });
 try { fs.unlinkSync(FAKE); } catch (e) {}

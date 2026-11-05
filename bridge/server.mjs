@@ -632,8 +632,17 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ★ 卡 t_03fc348f：断点续查 —— 拿到某个文档上次失败、要补查的行
+  // ★ 2026-11-05：账本 key 是 `工作簿|工作表`，写侧由 /track 的 doc+sheet 拼。
+  //   读侧原来只认拼好的整串，于是「传工作簿名查不到、传 工作簿|工作表 才查到」——
+  //   知澜按工作簿名查卡了半小时。这里两种传法都认：给了 sheet 就拼，没给当整串。
+  const ledgerDocKey = () => {
+    const docQ = String(url.searchParams.get('doc') || '').trim();     // 不能过 clean()：会大写化、删空格
+    const sheetQ = String(url.searchParams.get('sheet') || '').trim();
+    if (docQ && sheetQ && !docQ.includes('|')) return `${docQ}|${sheetQ}`;
+    return docQ || '_default';
+  };
   if (url.pathname === '/pending') {
-    const docKey = String(url.searchParams.get('doc') || '').trim() || '_default';   // 不能过 clean()：会大写化、删空格
+    const docKey = ledgerDocKey();
     const rows = ledger.pending(docKey).map((r) => ({
       number: r.number, doc: r.doc, sheet: r.sheet, row: r.row,
       carrier: r.carrier, kind: r.kind, err: r.err, at: r.at,
@@ -644,7 +653,7 @@ const server = http.createServer(async (req, res) => {
 
   // 清账本（用户点「重头查」时）—— 只删这一份文档的记录，不动别的表
   if (url.pathname === '/ledger/clear') {
-    const docKey = String(url.searchParams.get('doc') || '').trim() || '_default';   // 不能过 clean()：会大写化、删空格
+    const docKey = ledgerDocKey();
     ledger.clear(docKey);
     return send(res, 200, { ok: true, doc: docKey, cleared: true });
   }
