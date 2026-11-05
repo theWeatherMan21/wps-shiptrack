@@ -25,8 +25,11 @@ export function recordKey({ doc, sheet, row, number }) {
   return [v(doc), v(sheet), v(row), v(number)].join('|');
 }
 
-/** 哪些失败算「撞盾」→ 该家整家冷却 */
-const COOLDOWN_KINDS = new Set(['challenge', 'rate-limit', 'blocked', 'cooling']);
+/** 哪些失败算「撞盾」→ 该家整家冷却
+ *  ★ 卡 t_991b99f7：必须含 `throttled` —— OOCL 实测报的就是 throttled（oocl.mjs「QF8 访问过于频繁」
+ *    的 errorKind）和 blocked，**从不报 challenge**。少了它，OOCL 的限流既不会整家冷却、
+ *    也不会触发换档案重试 = 那两条防线对 OOCL 永远不生效。 */
+const COOLDOWN_KINDS = new Set(['challenge', 'rate-limit', 'blocked', 'cooling', 'throttled']);
 
 export function isCooldownKind(kind) {
   return COOLDOWN_KINDS.has(String(kind || ''));

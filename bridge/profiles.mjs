@@ -15,6 +15,16 @@
 //   ③ 全都脏且等到超时才强杀残留（最后一道，正常永远走不到）；
 //   ④ 释放不阻塞调用方：后台等进程退完再清锁，加速下一次分配。
 //
+// ★ 2026-11-05 卡 t_991b99f7（OOCL 连查串行场景没救）：
+//   上面那套只解决了「并发抢锁」，串行场景（同船司，见 sched.mjs）永远取到数组第一个干净槽
+//   p0 → 同一个 Chrome 档案连查 2 次就撞会话级风控（OOCL 实测：同档案第 2 次必被拦）。
+//   所以分配改成 **LRU（最久未用）+ 槽级冷却**：
+//     · 选槽 = `!busy && isClean && now >= cooldownUntil` 里 lastUsed 最小的那个；
+//       从没用过的槽 lastUsed=0 → 天然最先铺开（第一次仍是 p0）。
+//     · 撞盾（release(slot,{cooldown:true})）→ 该槽冷却 N 毫秒（默认 60s，env 可调）。
+//     · **冷却只在「还有别的可用槽」时生效**：全都在冷却 / 全脏就降级给 lastUsed 最小的干净槽，
+//       绝不新增等待、绝不死锁 —— 单查询场景不允许因为冷却变慢。
+//
 // 只碰 <root>/p* 这些桥自己的档案目录，绝不碰爹地日常 Chrome。
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -63,10 +73,12 @@ export function pidsUsing(dir, { includeHelpers = true } = {}) {
     const out = String(execFileSync('ps', ['-Ao', 'pid=,command='], { encoding: 'utf8', timeout: 8000 }) || '');
     const hit = [];
     for (const line of out.split('\n')) {
-      const i = line.indexOf(' ');
-      if (i < 0) continue;
-      const pid = Number(line.slice(0, i));
-      const cmd = line.slice(i + 1);
+      // ★ 卡 t_991b99f7：ps 的 pid 是右对齐的（`" 5727 /Users/…"`），旧写法按第一个空格切 ⇒ pid=0 ⇒
+      //   这个函数永远返回空数组（「没有锁但有进程占着」这条检测形同虚设，单测 ④ 在 HEAD 上一直红）。
+      const m = /^\s*(\d+)\s+(\S.*)$/.exec(line);
+      if (!m) continue;
+      const pid = Number(m[1]);
+      const cmd = m[2];
       if (!Number.isFinite(pid) || pid <= 0) continue;
       if (!cmd.includes(dir)) continue;
       if (!includeHelpers && /Helper|crashpad/.test(cmd)) continue;
@@ -98,14 +110,34 @@ export function forceClean(dir) {
   return pids.size;
 }
 
+/** 槽级冷却默认时长：撞盾后这个 Chrome 档案歇一会儿再用（OOCL 实测 4 分钟足够，60s 起步）
+ *  env: WPS_TRACK_PROFILE_COOLDOWN_MS（0 = 关掉冷却，退回纯 LRU） */
+export const PROFILE_COOLDOWN_MS = 60 * 1000;
+export function resolveCooldownMs(env = process.env) {
+  const raw = Number(env && env.WPS_TRACK_PROFILE_COOLDOWN_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : PROFILE_COOLDOWN_MS;
+}
+
 /**
- * @param {{root:string, capacity?:number, waitMs?:number, pollMs?:number, log?:(m:string)=>void}} o
- * @returns {{acquire:()=>Promise<object>, release:(s:object)=>void, stats:()=>object, slots:()=>object[]}}
+ * @param {{root:string, capacity?:number, waitMs?:number, pollMs?:number,
+ *          cooldownMs?:number, now?:()=>number, log?:(m:string)=>void}} o
+ * @returns {{acquire:()=>Promise<object>, release:(s:object,o?:{cooldown?:boolean})=>void, stats:()=>object, slots:()=>object[]}}
  */
-export function makeProfilePool({ root, capacity = 8, waitMs = 12000, pollMs = 120, log = () => {} } = {}) {
+export function makeProfilePool({
+  root, capacity = 8, waitMs = 12000, pollMs = 120,
+  cooldownMs = resolveCooldownMs(), now = Date.now, log = () => {},
+} = {}) {
   const size = Math.max(1, Math.floor(Number(capacity) || 8));
+  const coolMs = Math.max(0, Math.floor(Number(cooldownMs) || 0));
+  const clock = typeof now === 'function' ? now : Date.now;
   const slots = [];
-  for (let i = 0; i < size; i++) slots.push({ name: `p${i}`, dir: path.join(root, `p${i}`), busy: false, since: 0, uses: 0 });
+  for (let i = 0; i < size; i++) {
+    slots.push({
+      name: `p${i}`, dir: path.join(root, `p${i}`), busy: false, since: 0, uses: 0,
+      lastUsed: 0,        // 上次 acquire/release 的时刻（LRU 排序依据；0 = 从没用过）
+      cooldownUntil: 0,   // 冷却到期时刻，now < 它 → 这个槽暂时别用
+    });
+  }
   const st = { acquired: 0, waitedMs: 0, dirtySkips: 0, forced: 0 };
 
   // 后台清场：释放后等 Chrome 退出（最多 5s），然后删残留锁。不阻塞调用方。
@@ -115,28 +147,53 @@ export function makeProfilePool({ root, capacity = 8, waitMs = 12000, pollMs = 1
     if (!pidsUsing(slot.dir).length) removeLocks(slot.dir);
   }
 
+  function take(s) {
+    s.busy = true; s.since = clock(); s.uses++; s.lastUsed = clock();
+    st.acquired++;
+    return s;
+  }
+
   async function acquire() {
     const t0 = Date.now();
     for (;;) {
       const free = slots.filter((s) => !s.busy);
       if (free.length) {
-        for (const s of free) {
+        // LRU：lastUsed 最小的先挑（全 0 时靠 sort 稳定性保持 p0→p7 的顺序，首次仍是 p0）
+        const order = free.slice().sort((a, b) => a.lastUsed - b.lastUsed);
+        const t = clock();
+        const ready = order.filter((s) => s.cooldownUntil <= t);
+        const cooling = order.filter((s) => s.cooldownUntil > t);
+        // 第一轮：不在冷却的槽，第一个干净的就给它
+        for (const s of ready) {
           if (isClean(s.dir)) {
-            s.busy = true; s.since = Date.now(); s.uses++;
-            st.acquired++;
+            const slot = take(s);
             if (Date.now() - t0 > 0) st.waitedMs += Date.now() - t0;
             if (st.dirtySkips) { log(`[profile] ${s.name} 可用（本次跳过 ${st.dirtySkips} 个未退干净的槽）`); st.dirtySkips = 0; }
-            return s;
+            return slot;
           }
           st.dirtySkips++;
         }
+        // 第二轮：全都在冷却（或只剩冷却槽干净）→ 降级直接给最久未用的干净槽，**不等待**
+        for (const s of cooling) {
+          if (isClean(s.dir)) {
+            const slot = take(s);
+            const left = Math.max(0, Math.round((s.cooldownUntil - t) / 1000));
+            log(`[profile] 没有可用新槽 → 降级复用 ${s.name}（冷却还剩 ${left}s，不等待）`);
+            if (Date.now() - t0 > 0) st.waitedMs += Date.now() - t0;
+            if (st.dirtySkips) st.dirtySkips = 0;
+            return slot;
+          }
+          st.dirtySkips++;
+        }
+        // 一个干净槽都没有 → 等，等到 waitMs 才强清（原有行为，冷却不许把这条路径拖长）
         if (Date.now() - t0 >= waitMs) {
           const s = free[0];
           const killed = forceClean(s.dir);
-          s.busy = true; s.since = Date.now(); s.uses++;
+          const slot = take(s);
+          slot.cooldownUntil = 0;   // 火线救急用完就别再压着它
           st.forced++;
           log(`[profile] 等待 ${Math.round((Date.now() - t0) / 1000)}s 仍无干净槽 → 强制清场 ${s.name}（杀残留 ${killed} 个）`);
-          return s;
+          return slot;
         }
         await sleep(pollMs);
       } else {
@@ -146,20 +203,35 @@ export function makeProfilePool({ root, capacity = 8, waitMs = 12000, pollMs = 1
     }
   }
 
-  function release(slot) {
+  /** @param {object} slot  @param {{cooldown?:boolean}} [o] cooldown=true → 这个槽冷却一会儿（撞盾换槽用） */
+  function release(slot, o = {}) {
     if (!slot) return;
     slot.busy = false;
+    slot.lastUsed = clock();
+    if (o && o.cooldown && coolMs > 0) {
+      slot.cooldownUntil = slot.lastUsed + coolMs;
+      log(`[profile] ${slot.name} 撞盾 → 冷却 ${Math.round(coolMs / 1000)}s`);
+    }
     sweep(slot).catch(() => {});
   }
 
   return {
     acquire,
     release,
-    slots: () => slots.map((s) => ({ name: s.name, dir: s.dir, busy: s.busy, uses: s.uses })),
-    stats: () => ({
-      capacity: size, ...st,
-      busy: slots.filter((s) => s.busy).length,
-      dirty: slots.filter((s) => !s.busy && !isClean(s.dir)).map((s) => s.name),
-    }),
+    slots: () => slots.map((s) => ({
+      name: s.name, dir: s.dir, busy: s.busy, uses: s.uses,
+      lastUsed: s.lastUsed,
+      cooldownMs: Math.max(0, s.cooldownUntil - clock()),   // 剩余冷却，0 = 可用
+    })),
+    stats: () => {
+      const t = clock();
+      return {
+        capacity: size, ...st,
+        busy: slots.filter((s) => s.busy).length,
+        dirty: slots.filter((s) => !s.busy && !isClean(s.dir)).map((s) => s.name),
+        cooling: slots.filter((s) => s.cooldownUntil > t).map((s) => s.name),
+        cooldownMs: coolMs,
+      };
+    },
   };
 }

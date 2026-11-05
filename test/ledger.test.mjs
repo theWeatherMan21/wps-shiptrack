@@ -56,10 +56,12 @@ console.log('④ 不同文档互不干扰');
   ok(L.pending('docA').length === 0, 'docA 不受影响');
 }
 
-console.log('⑤ 撞盾类判据：challenge / rate-limit / blocked / cooling');
+console.log('⑤ 撞盾类判据：challenge / rate-limit / blocked / cooling / throttled');
 {
-  for (const k of ['challenge', 'rate-limit', 'blocked', 'cooling']) ok(isCooldownKind(k), `${k} 算撞盾`);
+  for (const k of ['challenge', 'rate-limit', 'blocked', 'cooling', 'throttled']) ok(isCooldownKind(k), `${k} 算撞盾`);
   for (const k of ['timeout', 'network', 'failed', 'not-found', null, undefined]) ok(!isCooldownKind(k), `${k} 不算撞盾`);
+  // ★ 卡 t_991b99f7：OOCL 真实返回的 errorKind 就是 throttled，必须算撞盾，否则整家冷却 + 换档案两条防线对它都失效
+  ok(isCooldownKind('throttled'), 'OOCL 的 throttled 算撞盾（卡 t_991b99f7 钉住）');
 }
 
 console.log('⑥ 冷却：设了就有剩余，到点自动解封并落盘清理');

@@ -29,7 +29,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import os from 'node:os';
 import { resolveTimeouts, makeClampTimeout, resolvePort, resolveCacheTtl } from './timeouts.mjs';
 import { makeContract } from './schema.mjs';
-import { makeProfilePool } from './profiles.mjs';
+import { makeProfilePool, resolveCooldownMs } from './profiles.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // Windows 上不能直接 import('C:\\a\\b.mjs')（ESM 只认 file:// URL）——统一走这个
@@ -83,6 +83,8 @@ const PROFILE_ROOT = process.env.WPS_TRACK_PROFILE_ROOT || path.join(os.homedir(
 const profilePool = makeProfilePool({
   root: PROFILE_ROOT,
   capacity: Math.max(MAX_CONCURRENT, Number(process.env.WPS_TRACK_PROFILE_POOL || 0) || MAX_CONCURRENT * 2),
+  // ★ 卡 t_991b99f7：撞盾的槽冷却多久（默认 60s，WPS_TRACK_PROFILE_COOLDOWN_MS 可调，0 = 关）
+  cooldownMs: resolveCooldownMs(),
   log: (m) => console.error(m),
 });
 
@@ -178,7 +180,7 @@ const cacheGet = (k, skip = false) => { if (skip) return null; const e = cache.g
 const cacheSet = (k, v) => { cache.set(k, { at: Date.now(), value: v }); if (cache.size > 500) cache.delete(cache.keys().next().value); };
 
 // ---------- 跑一次 CLI，收 NDJSON ----------
-function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = null, pol = '', pod = '', doc = '', sheet = '', row = 0, retry = false }) {
+function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = null, pol = '', pod = '', doc = '', sheet = '', row = 0, retry = false, slotCooldown = null }) {
   return new Promise(async (resolve) => {
     const release = await slot();
     const args = [CLI, '--number', number];
@@ -244,10 +246,16 @@ function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = nul
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      const out = (obj && typeof obj === 'object') ? obj : { ok: false, error: String(obj) };
+      // ★ 卡 t_991b99f7：结果里带上用的是哪个档案（串行连查的排障证据：日志/表格能看见 pX）
+      out.profile = profSlot ? profSlot.name : null;
       // 档案放回池子：后台等 Chromium 孙进程真退出再清锁（acquire 侧还会二次验证）
-      try { profilePool.release(profSlot); } catch { /* 池子异常不许影响结果 */ }
+      // ★ 撞盾（限流/被拦/挑战）→ 这个档案冷却一会儿，下一个请求自然换到别的槽
+      let cool = false;
+      try { cool = !!(slotCooldown && profSlot && slotCooldown(out)); } catch { cool = false; }
+      try { profilePool.release(profSlot, { cooldown: cool }); } catch { /* 池子异常不许影响结果 */ }
       release();
-      resolve(obj);
+      resolve(out);
     };
     child.on('close', (code) => {
       clearTimeout(timer);
@@ -324,6 +332,9 @@ const TRANSIENT = /ERR_CONNECTION|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|so
 //   同一个号 8s 窗口连挂两次、20s 窗口 9~12s 就成功（两个不同提单号各复现一次）。
 //   这类错误文案不带 ERR_/超时，旧正则漏掉 → 桥一次都不重试，直接落「待手工」。
 const RETRY_WORTHY = new RegExp(`${TRANSIENT.source}|没抓到追踪数据|没发请求|页面空白`, 'i');
+// ★ 卡 t_991b99f7：撞盾判据 —— 这个结果该不该让「刚才用的 Chrome 档案」歇一会儿。
+//   走 ledger 的 isCooldownKind（已补 throttled）：OOCL 报的是 throttled/blocked，从不报 challenge。
+const isShieldResult = (res) => !!res && !res.ok && isCooldownKind(res.errorKind);
 const send = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', ...CORS }); res.end(JSON.stringify(obj)); };
 const clean = (s) => String(s || '').replace(/[\s\u200b\u3000]/g, '').toUpperCase();
 
@@ -347,7 +358,9 @@ const server = http.createServer(async (req, res) => {
       concurrency: MAX_CONCURRENT, busy: running, cached: cache.size,
       // ★ 2026-11-05：Chrome 档案池状态 —— 「脏槽」= 上个查询的 Chromium 还没退干净，
       //   验收并发改动的第一手证据（正常情况下 dirty 最多一两个、且很快清空）
-      profilePool: profilePool.stats(),
+      // ★ 卡 t_991b99f7：再加每槽的 lastUsed / cooldownMs —— 串行连查是否真的换了档案，
+      //   看这三个数字递增就够了（不再靠猜）。
+      profilePool: { ...profilePool.stats(), slots: profilePool.slots() },
       // ★ 插件按这两个字段校验：不认识这个版本就别猜字段，降级 + 提示更新加载项
       schemaVersion: ENGINE_SCHEMA_VERSION,
       supportedSchemaVersions: ENGINE_SCHEMA_VERSION ? [ENGINE_SCHEMA_VERSION] : [],
@@ -454,16 +467,33 @@ const server = http.createServer(async (req, res) => {
     const rowMeta = Number(url.searchParams.get('row')) || 0;
     // ★ 2026-11-05：?retry=1 = 这是「待重查」队列里的行 → 引擎给更长的站点窗口（Maersk 8s → 20s）
     const retryHint = url.searchParams.get('retry') === '1' || url.searchParams.get('retry') === 'true';
+    // ★ 卡 t_991b99f7：撞盾（challenge / rate-limit / throttled / blocked）→ 这个 Chrome 档案冷却。
+    //   实测依据：OOCL 报的是 throttled（QF8 限流）和 blocked，**从不报 challenge** ——
+    //   所以判据必须走 ledger 的 isCooldownKind（已补 throttled），不能只匹配字面 challenge。
+    const shieldCool = isShieldResult;
+    const runArgs = { number, carrier, timeoutMs, pol, pod, doc: docMeta, sheet: sheetMeta, row: rowMeta };
     let r = await runCli({
-      number, carrier, timeoutMs, pol, pod, doc: docMeta, sheet: sheetMeta, row: rowMeta, retry: retryHint,
+      ...runArgs, retry: retryHint, slotCooldown: shieldCool,
       onSpawn: (kill) => req.on('close', () => { if (!res.writableEnded) { console.error(`[bridge] 客户端中断 ${number} → 杀子进程`); kill(); } }),
     });
-    const elapsed = Date.now() - t0;
-    r = withSchema(r);
-    console.error(`[track] ${number} ${carrier || 'auto'} ${r.ok ? 'ok' : 'FAIL'} ${elapsed}ms ${r.ok ? '' : String(r.error || '').slice(0, 80)}`);
+    let runs = 1;   // 子进程计数：网络级重试 + 换槽重试合计不超过 2 次额外子进程
+    // ★ 卡 t_991b99f7 ②：撞盾 → 该槽已经带着冷却放回池子，这里换另一个档案重跑一次。
+    //   为什么值得多跑一次：同档案第 2 次必被拦（OOCL 实测，117s 烧满预算），
+    //   而换新档案 + 冷却后马上就恢复；原槽硬撞只是把预算烧光。
+    if (!r.ok && isCooldownKind(r.errorKind) && r.profile && runs < 3) {
+      const from = r.profile;
+      console.error(`[bridge] ${number} 撞盾 ${r.errorKind} → ${from} 冷却并换档案重试`);
+      const r2 = await runCli({ ...runArgs, retry: true, slotCooldown: shieldCool });
+      runs++;
+      // 打标给插件/日志看：这次结果是换过档案才拿到的
+      r2.slotRetried = true;
+      r2.slotSwapped = `${from}→${r2.profile || '(fallback)'}`;
+      console.error(`[bridge] 换槽重试 ${number} ${r2.slotSwapped} ${r2.ok ? 'ok' : `FAIL ${String(r2.errorKind || r2.error || '').slice(0, 60)}`}`);
+      r = r2;
+    }
     const hardDown = r.error && /ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET|ERR_NAME_NOT_RESOLVED|ENOTFOUND|EAI_AGAIN/i.test(String(r.error));
     // 连接不上（断网 / 代理没开）→ 立刻重试毫无意义，只是再开一个浏览器空烧
-    if (!r.ok && r.error && RETRY_WORTHY.test(r.error) && !r.timeout && elapsed < 60000) {
+    if (!r.ok && r.error && RETRY_WORTHY.test(r.error) && !r.timeout && Date.now() - t0 < 60000 && runs < 3) {
       // 连接级失败：先判断是不是「网络姿势」问题 —— 换个极性（走代理 ⇄ 强制直连）再试一次
       const conn = isConnectionLevel(r.error);
       const net = await netProfile().catch(() => null);
@@ -471,10 +501,14 @@ const server = http.createServer(async (req, res) => {
       console.error(`[bridge] 重试 ${number}（首次: ${String(r.error).slice(0, 80)}）${conn ? ` → 换极性 forceDirect=${direct}` : ''} · 放宽站点窗口`);
       // ★ 2026-11-05：桥自己的第二次尝试也走「重试窗口」——8s 窗口下 SPA 常见「页面有内容但没发请求」，
       //   第二次还是 8s 只是把同样的失败重演一遍（802735343 就是这么连挂两次的）。
-      r = await runCli({ number, carrier, timeoutMs, forceDirect: conn ? direct : false, pol, pod, doc: docMeta, sheet: sheetMeta, row: rowMeta, retry: true });
+      r = await runCli({ ...runArgs, forceDirect: conn ? direct : false, retry: true, slotCooldown: shieldCool });
+      runs++;
       r.retried = true;
       if (conn) r.netRetriedWith = direct ? 'direct' : 'proxy';
     }
+    const elapsed = Date.now() - t0;
+    r = withSchema(r);
+    console.error(`[track] ${number} ${carrier || 'auto'} ${r.ok ? 'ok' : 'FAIL'} ${elapsed}ms profile=${r.profile || '-'}${r.slotSwapped ? ` swapped=${r.slotSwapped}` : ''} ${r.ok ? '' : String(r.error || '').slice(0, 80)}`);
     if (r.ok) cacheSet(key, r);
     return send(res, 200, { ...r, cached: false });
   }
@@ -667,7 +701,7 @@ const server = http.createServer(async (req, res) => {
         // ② 正常查询
         const key = n + '|' + carrier;
         const hit = cacheGet(key);
-        const r0 = hit ? { ...hit, cached: true } : await runCli({ number: n, carrier, timeoutMs, pol, pod, retry: retryHint });
+        const r0 = hit ? { ...hit, cached: true } : await runCli({ number: n, carrier, timeoutMs, pol, pod, retry: retryHint, slotCooldown: isShieldResult });
         const r = withSchema(r0);
         if (!hit && r.ok) cacheSet(key, r);
         // ③ 落盘（成功也记：下次刷新才知道这行已经查过了）
