@@ -118,6 +118,22 @@ export function resolveCooldownMs(env = process.env) {
   return Number.isFinite(raw) && raw >= 0 ? raw : PROFILE_COOLDOWN_MS;
 }
 
+/** ★ 2026-11-05（知澜定口径）：风控是「档案级」不是 IP 级 —— 实测同档案连查两次全拦、
+ *  换新档案立刻复通。所以每个档案连用 2 次后强制轮换，歇 5 分钟再回来。
+ *  这比 60s 全局节流好：并发不受影响，127 单不会拖成几小时（8 槽 × 2 次 = 16 次才轮到第一轮全冷，
+ *  全冷时走「降级复用」路径，不等待）。
+ *  env: WPS_TRACK_PROFILE_MAX_USES（0 = 关掉轮换）、WPS_TRACK_PROFILE_RETIRE_MS */
+export const PROFILE_MAX_USES = 2;
+export const PROFILE_RETIRE_MS = 5 * 60 * 1000;
+export function resolveMaxUses(env = process.env) {
+  const raw = Number(env && env.WPS_TRACK_PROFILE_MAX_USES);
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : PROFILE_MAX_USES;
+}
+export function resolveRetireMs(env = process.env) {
+  const raw = Number(env && env.WPS_TRACK_PROFILE_RETIRE_MS);
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : PROFILE_RETIRE_MS;
+}
+
 /**
  * @param {{root:string, capacity?:number, waitMs?:number, pollMs?:number,
  *          cooldownMs?:number, now?:()=>number, log?:(m:string)=>void}} o
@@ -126,9 +142,12 @@ export function resolveCooldownMs(env = process.env) {
 export function makeProfilePool({
   root, capacity = 8, waitMs = 12000, pollMs = 120,
   cooldownMs = resolveCooldownMs(), now = Date.now, log = () => {},
+  maxUses = resolveMaxUses(), retireMs = resolveRetireMs(),
 } = {}) {
   const size = Math.max(1, Math.floor(Number(capacity) || 8));
   const coolMs = Math.max(0, Math.floor(Number(cooldownMs) || 0));
+  const maxUse = Math.max(0, Math.floor(Number(maxUses) || 0));      // 0 = 关掉轮换
+  const retire = Math.max(0, Math.floor(Number(retireMs) || 0));
   const clock = typeof now === 'function' ? now : Date.now;
   const slots = [];
   for (let i = 0; i < size; i++) {
@@ -136,6 +155,7 @@ export function makeProfilePool({
       name: `p${i}`, dir: path.join(root, `p${i}`), busy: false, since: 0, uses: 0,
       lastUsed: 0,        // 上次 acquire/release 的时刻（LRU 排序依据；0 = 从没用过）
       cooldownUntil: 0,   // 冷却到期时刻，now < 它 → 这个槽暂时别用
+      consecutive: 0,     // 本轮连续被用了几次（到 maxUse 就轮换冷却，见 release）
     });
   }
   const st = { acquired: 0, waitedMs: 0, dirtySkips: 0, forced: 0 };
@@ -149,6 +169,7 @@ export function makeProfilePool({
 
   function take(s) {
     s.busy = true; s.since = clock(); s.uses++; s.lastUsed = clock();
+    s.consecutive = (s.consecutive || 0) + 1;
     st.acquired++;
     return s;
   }
@@ -210,7 +231,13 @@ export function makeProfilePool({
     slot.lastUsed = clock();
     if (o && o.cooldown && coolMs > 0) {
       slot.cooldownUntil = slot.lastUsed + coolMs;
+      slot.consecutive = 0;      // 撞盾冷却比轮换更强，重新计数
       log(`[profile] ${slot.name} 撞盾 → 冷却 ${Math.round(coolMs / 1000)}s`);
+    } else if (maxUse > 0 && retire > 0 && slot.consecutive >= maxUse) {
+      // ★ 档案级风控：连用 maxUse 次就轮换，歇 retire 再回来
+      slot.cooldownUntil = slot.lastUsed + retire;
+      slot.consecutive = 0;
+      log(`[profile] ${slot.name} 连用 ${maxUse} 次 → 轮换冷却 ${Math.round(retire / 1000)}s`);
     }
     sweep(slot).catch(() => {});
   }
@@ -222,6 +249,7 @@ export function makeProfilePool({
       name: s.name, dir: s.dir, busy: s.busy, uses: s.uses,
       lastUsed: s.lastUsed,
       cooldownMs: Math.max(0, s.cooldownUntil - clock()),   // 剩余冷却，0 = 可用
+      consecutive: s.consecutive,                           // 本轮连用次数（到 maxUses 就轮换）
     })),
     stats: () => {
       const t = clock();
@@ -231,6 +259,8 @@ export function makeProfilePool({
         dirty: slots.filter((s) => !s.busy && !isClean(s.dir)).map((s) => s.name),
         cooling: slots.filter((s) => s.cooldownUntil > t).map((s) => s.name),
         cooldownMs: coolMs,
+        maxUses: maxUse,
+        retireMs: retire,
       };
     },
   };
