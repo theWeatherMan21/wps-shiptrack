@@ -180,7 +180,7 @@ const cacheGet = (k, skip = false) => { if (skip) return null; const e = cache.g
 const cacheSet = (k, v) => { cache.set(k, { at: Date.now(), value: v }); if (cache.size > 500) cache.delete(cache.keys().next().value); };
 
 // ---------- 跑一次 CLI，收 NDJSON ----------
-function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = null, pol = '', pod = '', doc = '', sheet = '', row = 0, retry = false, slotCooldown = null }) {
+function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = null, pol = '', pod = '', doc = '', sheet = '', row = 0, retry = false, slotCooldown = null, noCache = false }) {
   return new Promise(async (resolve) => {
     const release = await slot();
     const args = [CLI, '--number', number];
@@ -188,6 +188,9 @@ function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = nul
     // ★ 2026-11-05：待重查的行重试时给引擎更长的站点窗口（Maersk 首查 8s，重试 20s）。
     //   首查要快（一批几十行），重试是「上次没抓到」的行，宁可慢也要抓到。
     if (retry) args.push('--retry');
+    // ★ 2026-11-05：?nocache=1 → 引擎跳过 20 分钟结果缓存。
+    //   没有这个口子，「重查救回率」永远测不出来：第 2 轮起全命中上一轮的失败缓存，秒回同一个错。
+    if (noCache) args.push('--no-cache');
     // ★ 卡 t_cec031c1：里程碑判定在引擎里，pol/pod 只有调用方知道（用户选了哪两列港口）。
     //   不往引擎传 = buildCanonical 收到空串 → 阶段退回纯事件推断，中转港会被当目的港。
     if (pol) args.push('--pol', String(pol).slice(0, 64));
@@ -467,11 +470,13 @@ const server = http.createServer(async (req, res) => {
     const rowMeta = Number(url.searchParams.get('row')) || 0;
     // ★ 2026-11-05：?retry=1 = 这是「待重查」队列里的行 → 引擎给更长的站点窗口（Maersk 8s → 20s）
     const retryHint = url.searchParams.get('retry') === '1' || url.searchParams.get('retry') === 'true';
+    // ★ 2026-11-05：?nocache=1 = 不吃也不写结果缓存（跑对照实验、验重查救回率用）
+    const noCache = url.searchParams.get('nocache') === '1' || url.searchParams.get('nocache') === 'true';
     // ★ 卡 t_991b99f7：撞盾（challenge / rate-limit / throttled / blocked）→ 这个 Chrome 档案冷却。
     //   实测依据：OOCL 报的是 throttled（QF8 限流）和 blocked，**从不报 challenge** ——
     //   所以判据必须走 ledger 的 isCooldownKind（已补 throttled），不能只匹配字面 challenge。
     const shieldCool = isShieldResult;
-    const runArgs = { number, carrier, timeoutMs, pol, pod, doc: docMeta, sheet: sheetMeta, row: rowMeta };
+    const runArgs = { number, carrier, timeoutMs, pol, pod, doc: docMeta, sheet: sheetMeta, row: rowMeta, noCache };
     let r = await runCli({
       ...runArgs, retry: retryHint, slotCooldown: shieldCool,
       onSpawn: (kill) => req.on('close', () => { if (!res.writableEnded) { console.error(`[bridge] 客户端中断 ${number} → 杀子进程`); kill(); } }),
@@ -509,7 +514,17 @@ const server = http.createServer(async (req, res) => {
     const elapsed = Date.now() - t0;
     r = withSchema(r);
     console.error(`[track] ${number} ${carrier || 'auto'} ${r.ok ? 'ok' : 'FAIL'} ${elapsed}ms profile=${r.profile || '-'}${r.slotSwapped ? ` swapped=${r.slotSwapped}` : ''} ${r.ok ? '' : String(r.error || '').slice(0, 80)}`);
-    if (r.ok) cacheSet(key, r);
+    if (r.ok && !noCache) cacheSet(key, r);
+    // ★ 2026-11-05 根因修复：`/pending` 一直是 count 0 —— 因为插件/App **全部走单号 `/track`**，
+    //   而账本只由 `/track-batch` 写（grep 实读：TaskPane 里 `/track-batch` 0 次、`/track?` 2 次）。
+    //   结果 M2「断点续查 / 只补失败」的账本从来没被真实查询写过，爹地那 67 格待重查全在插件自己的 retry 数组里。
+    //   这里补上：只要调用方给了 doc（插件总会给），单号结果也进账本。
+    if (docMeta) {
+      const docKey = sheetMeta ? `${docMeta}|${sheetMeta}` : docMeta;
+      try {
+        ledger.append(docKey, [toRecord({ doc: docMeta, sheet: sheetMeta || null, row: rowMeta || null, number, result: r })]);
+      } catch (e) { console.error(`[track] 落账本失败 ${number}: ${e.message}`); }
+    }
     return send(res, 200, { ...r, cached: false });
   }
 
@@ -640,6 +655,7 @@ const server = http.createServer(async (req, res) => {
     const timeoutMs = clampTimeout(url.searchParams.get('timeout'));
     // ★ 2026-11-05：批量也能带 retry=1（待重查批次整批放宽站点窗口）
     const retryHint = url.searchParams.get('retry') === '1' || url.searchParams.get('retry') === 'true';
+    const noCache = url.searchParams.get('nocache') === '1' || url.searchParams.get('nocache') === 'true';
     // ★ 卡 t_03fc348f：断点续查的两个入参（都可选，不带就是原来的行为）
     //   doc  文档 key（插件传 "工作簿|工作表"），分账本用
     //   rows 可选 JSON [{number, doc, sheet, row}]，带上才能落 doc/sheet/row 三字段
@@ -701,9 +717,9 @@ const server = http.createServer(async (req, res) => {
         // ② 正常查询
         const key = n + '|' + carrier;
         const hit = cacheGet(key);
-        const r0 = hit ? { ...hit, cached: true } : await runCli({ number: n, carrier, timeoutMs, pol, pod, retry: retryHint, slotCooldown: isShieldResult });
+        const r0 = hit ? { ...hit, cached: true } : await runCli({ number: n, carrier, timeoutMs, pol, pod, retry: retryHint, slotCooldown: isShieldResult, noCache });
         const r = withSchema(r0);
-        if (!hit && r.ok) cacheSet(key, r);
+        if (!hit && r.ok && !noCache) cacheSet(key, r);
         // ③ 落盘（成功也记：下次刷新才知道这行已经查过了）
         ledger.append(docKey, [toRecord({ ...meta, number: n, result: r })]);
         // ④ 撞盾 → 整家冷却，本轮剩余该家不再发请求
