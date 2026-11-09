@@ -57,6 +57,8 @@
       <button @click="pickNumberCol">① 选单号列</button>
       <button @click="pickOutputCol">② 选输出列</button>
       <button @click="pickCarrierCol" class="mini-btn">船司列（可选）</button>
+      <button @click="pickVesselCol" class="mini-btn" :title="'选中船名（如 MSC LONSON）那一列再点'">船名列（可选）</button>
+      <button @click="pickVoyageCol" class="mini-btn" :title="'选中航次（如 GA645W）那一列再点'">航次列（可选）</button>
       <button @click="refresh(true)" :disabled="busy || !ready">③ 立即刷新</button>
       <button @click="stop" :disabled="!hasRunning">停止</button>
       <button v-if="pendingWrites.length" class="mini-btn pending-btn" :title="`暂存了 ${pendingWrites.length} 行结果：查询中切走的那几张表，切回来点这里一次写回`" @click="flushPending">补齐回填 {{ pendingWrites.length }}</button>
@@ -110,6 +112,11 @@
       <div class="step" :class="cfg.carrierCol > 0 ? 'done' : 'idle'">
         <b>船司列</b>
         <span>{{ cfg.carrierCol > 0 ? carrierColText : '可选（按单号识别）' }}</span>
+      </div>
+      <div class="step" :class="(cfg.vesselCol > 0 || cfg.voyageCol > 0) ? 'done' : 'idle'">
+        <b>船名/航次</b>
+        <span v-if="cfg.vesselCol > 0 || cfg.voyageCol > 0">{{ vesselVoyageText }}</span>
+        <span v-else class="muted">可选（配了才回填）</span>
       </div>
     </div>
     <div class="next" v-if="stepHint">{{ stepHint }}</div>
@@ -254,7 +261,7 @@ export default {
       flushing: false,
       pendingWrites: [],   // ★ 10-28：切表期间查到的结果先攒着，切回来点「补齐回填」再写，不整轮作废
       diag: '',
-      cfg: { numberCol: 0, outCol: 0, startRow: 0, rows: 0, mode: 'column', carrierCol: 0, polCol: 0, podCol: 0 },
+      cfg: { numberCol: 0, outCol: 0, startRow: 0, rows: 0, mode: 'column', carrierCol: 0, polCol: 0, podCol: 0, vesselCol: 0, voyageCol: 0 },
       scan: null,
       readVia: '',
       writeVia: '',
@@ -488,6 +495,11 @@ export default {
     },
     numColText() {
       return colLetter(this.cfg.numberCol)
+    },
+    vesselVoyageText() {
+      const v = this.cfg.vesselCol > 0 ? colLetter(this.cfg.vesselCol) : '—'
+      const y = this.cfg.voyageCol > 0 ? colLetter(this.cfg.voyageCol) : '—'
+      return `${v} / ${y}`
     },
     outColText() {
       return colLetter(this.cfg.outCol)
@@ -763,7 +775,7 @@ export default {
       this.docNow = d
       this.panelErr = ''
       this.log(`活动表变了：${prev || '—'} → ${d}`)
-      this.cfg = { numberCol: 0, outCol: 0, startRow: 0, rows: 0, mode: 'column', carrierCol: 0, polCol: 0, podCol: 0 }
+      this.cfg = { numberCol: 0, outCol: 0, startRow: 0, rows: 0, mode: 'column', carrierCol: 0, polCol: 0, podCol: 0, vesselCol: 0, voyageCol: 0 }
       this.scan = null
       this.loadCfg()
       const mine = this.latestForDoc(d)
@@ -925,7 +937,7 @@ export default {
     resetCfg() {
       // 注意：真实 key 是 CFG_KEY + ':' + docKey()，原来清的是裸 CFG_KEY → 什么都没清掉
       const key = CFG_KEY + ':' + this.docKey()
-      this.cfg = { numberCol: 0, outCol: 0, startRow: 0, rows: 0, mode: 'column', carrierCol: 0, polCol: 0, podCol: 0 }
+      this.cfg = { numberCol: 0, outCol: 0, startRow: 0, rows: 0, mode: 'column', carrierCol: 0, polCol: 0, podCol: 0, vesselCol: 0, voyageCol: 0 }
       this.scan = null
       this.saveLastRun(0)
       const st = this.storage()
@@ -1008,6 +1020,24 @@ export default {
       return { r1, r2, how, mode: wholeColumn ? 'column' : 'range' }
     },
 
+    pickVesselCol() { this.pickExtraCol('vesselCol', '船名') },
+    pickVoyageCol() { this.pickExtraCol('voyageCol', '航次') },
+    /** 选「额外结果列」（船名/航次）—— 撞单号列/输出列直接拒，别把提单号覆盖掉 */
+    pickExtraCol(field, label) {
+      try {
+        const s = this.readSel()
+        if (s.col === this.cfg.numberCol || s.col === this.cfg.outCol) {
+          this.flash(`${label}列不能和单号列/输出列相同（${colLetter(s.col)}）`)
+          return
+        }
+        this.cfg = { ...this.cfg, [field]: s.col }
+        this.saveCfg()
+        this.log(`${label}列 = ${colLetter(s.col)}（查到才写，查不到保留原值）`)
+        this.panelErr = ''
+      } catch (e) {
+        this.panelErr = `选${label}列失败：` + e.message
+      }
+    },
     pickCarrierCol() {
       try {
         const s = this.readSel()
@@ -2703,6 +2733,10 @@ export default {
         }
         // ★ 卡 t_cec031c1：「说人话」只在引擎定义一次 —— 插件照字段渲染，不再自己算
         it.text = (r && r.canonical && r.canonical.shortText) || ('查询完成' + (r && r.ok === false ? '（失败）' : ''))
+        // ★ 2026-11-05：船名/航次（引擎 canonical.vessel/voyage，爹地图上「MSC LONSON | GA645W」两列）
+        //   只有成功结果才带；失败时留空，让写回逻辑按「保留旧值」处理
+        it.vessel = (r && r.canonical && r.canonical.vessel) || ''
+        it.voyage = (r && r.canonical && r.canonical.voyage) || ''
         it.state = r && r.ok === false ? 'error' : 'ok'
         if (it.state === 'error') {
           it.failReason = String((r && r.error) || '查询失败')
@@ -3145,6 +3179,16 @@ export default {
       if (!w || !w.ok) {
         if (b) b.errs.write = '写入失败：' + (w ? w.error : '未知')
         this.log(`写 ${colLetter(outCol)}${row} 失败: ${w ? w.error : '未知'}`)
+        return
+      }
+      // ★ 2026-11-05：船名 / 航次。配了列才写，没配（0）就跳过 —— 不预设默认列。
+      //   走同一个 writeRowChecked（唯一写入口），身份校验、批量、读回全部复用，不另开一条写路径。
+      for (const [col, val, label] of [[this.cfg.vesselCol, it.vessel, '船名'], [this.cfg.voyageCol, it.voyage, '航次']]) {
+        const c = Number(col || 0)
+        if (!c || !val) continue
+        if (c === Number(outCol) || c === Number(it.numCol)) continue   // 撞列不写，别把结果/单号覆盖掉
+        const wv = this.writeRowChecked(b, sheet, row, c, String(val), it.number, it.numCol, it)
+        if (!wv || !wv.ok) this.log(`写 ${colLetter(c)}${row} ${label}失败: ${wv ? wv.error : '未知'}`)
       }
     },
 
