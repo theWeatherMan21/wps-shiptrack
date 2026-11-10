@@ -210,7 +210,7 @@ import { pickEtdEta } from '../lib/dates.js'
 // ★ 10-30：读回校验的口径只有一份（lib/cellwrite.js）—— 批量路径与逐格路径共用，
 //   以前逐格用裸比较、批量用归一化，日期列/数值列走逐格必然误判「补不进去」。
 import { cellMatches, judgeReadback, writeCellCore, cellText } from '../lib/cellwrite.js'
-import { planVesselVoyage, mergeBlockOf, mergeSkipText } from '../lib/writeplan.js'   // ★ 11-10：船名/航次同列 + 合并格
+import { planVesselVoyage, mergeBlockOf, mergeSkipText, isVbaTrue } from '../lib/writeplan.js'   // ★ 11-10：船名/航次同列 + 合并格 + VBA 布尔
 import { summarize as summarizeFails, classifyFail } from '../lib/fail.js'
 // ★ 卡 t_8a6689dc：canonical 契约（schemaVersion）闸门 + 单元格文案的唯一实现
 import { checkResultSchema, PLUGIN_SCHEMA_VERSION } from '../lib/contract.js'
@@ -1872,7 +1872,8 @@ export default {
       let area = null
       try {
         const cell = sheet.Cells(row, col)
-        if (cell.MergeCells === true) {
+        // ★ WPS COM 返回 -1/0，不是 true/false —— `=== true` 恒假，这个判断曾经完全没生效
+        if (isVbaTrue(cell.MergeCells)) {
           const ma = cell.MergeArea
           if (ma) area = { mergeCells: true, topRow: ma.Row, topCol: ma.Column, address: ma.Address }
         } else {
@@ -1895,7 +1896,8 @@ export default {
         const a2 = `${colLetter(seg[seg.length - 1].col)}${seg[seg.length - 1].row}`
         mc = sheet.Range(`${a1}:${a2}`).MergeCells
       } catch (e) { mc = null }
-      if (mc === false) {
+      // 快路径：整段明确没合并（VBA 的 0 / false）就不用逐格摸；摸不到（null）仍走逐格
+      if (mc !== null && mc !== undefined && !isVbaTrue(mc)) {
         for (const w of seg) w.mergeChecked = true
         return seg
       }

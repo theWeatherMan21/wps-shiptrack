@@ -4,7 +4,7 @@
 //   ① 船名列 = 航次列时**只写一次**「船名 空格 航次」；同列写两遍 → 只剩航次（原 bug）
 //   ② 合并单元格只有左上角能写；非左上角一律跳过并报「与 K12:K13 合并」，不许报读回不一致
 //   ③ 撞结果列/单号列不许写；两个都没查到一格都不动
-import { planVesselVoyage, mergeBlockOf, mergeSkipText } from '../src/lib/writeplan.js'
+import { planVesselVoyage, mergeBlockOf, mergeSkipText, isVbaTrue } from '../src/lib/writeplan.js'
 
 let fail = 0
 const ok = (cond, label, extra = '') => {
@@ -57,6 +57,21 @@ ok(mergeBlockOf({ mergeCells: true, topRow: 12, topCol: 12, address: '$L$12:$L$1
 // 地址读不到时用行列兜底
 ok(mergeBlockOf({ mergeCells: true, topRow: 12, topCol: 11 }, 13, 11)?.addr === 'K12',
   'MergeArea.Address 读不到 → 用左上角行列兜底（K12）')
+
+// ④ WPS/COM 的布尔是 -1/0，不是 true/false —— 判 `=== true` 会静默失效
+//    （原 bug：合并检测看着写了，其实一次都没进分支，K13 照写 → 读回空 → 报「赋值没生效」）
+console.log('\n-- VBA 布尔 --')
+ok(isVbaTrue(-1) === true, 'WPS 的「真」是 -1')
+ok(isVbaTrue(0) === false, 'WPS 的「假」是 0')
+ok(isVbaTrue(true) === true, 'JS true 也认')
+ok(isVbaTrue(false) === false, 'JS false 也认')
+ok(isVbaTrue(1) === true, '1 也当真（部分版本返回 1）')
+ok(isVbaTrue(null) === false && isVbaTrue(undefined) === false, '读不到 = 假，不猜')
+ok(isVbaTrue('true') === true && isVbaTrue('false') === false, '字符串形态也认')
+// 端到端：MergeCells 返回 -1 时必须真的判成合并（这就是爹地那 2 格写不进的根因）
+ok(mergeBlockOf({ mergeCells: -1, topRow: 12, topCol: 11, address: '$K$12:$K$13' }, 13, 11)?.addr === 'K12:K13',
+  'MergeCells=-1（WPS 真实返回）→ 判为不可写')
+ok(mergeBlockOf({ mergeCells: 0 }, 13, 11) === null, 'MergeCells=0 → 可写')
 
 console.log(fail ? `\n${fail} FAIL` : '\nALL PASS')
 process.exit(fail ? 1 : 0)

@@ -51,13 +51,27 @@ export function planVesselVoyage({ vesselCol, voyageCol, outCol, numCol, vessel,
  * 返回 { addr, topRow, topCol } = 不可写（非左上角），addr 形如 "K12:K13"。
  */
 export function mergeBlockOf(area, row, col) {
-  if (!area || area.mergeCells !== true) return null
+  if (!area || !isVbaTrue(area.mergeCells)) return null
   const topRow = Number(area.topRow || 0)
   const topCol = Number(area.topCol || 0)
   if (!topRow || !topCol) return null
   if (topRow === Number(row) && topCol === Number(col)) return null   // 左上角 = 可写
   const addr = String(area.address || '').replace(/\$/g, '') || `${letter(topCol)}${topRow}`
   return { addr, topRow, topCol }
+}
+
+/**
+ * WPS/COM 的「布尔」不是 JS 布尔：真返回 **-1**，假返回 **0**。
+ * 直接写 `x === true` 恒为 false —— 合并单元格检测就是这么静默失效的
+ * （代码看着判了，实际一次都没进分支，K13 照写 → 读回空 → 报「赋值没生效」）。
+ * 兼容 true/false、-1/0、1/0、'true'/'false'、null/undefined。
+ */
+export function isVbaTrue(v) {
+  if (v === true) return true
+  if (v === false || v === null || v === undefined) return false
+  if (typeof v === 'number') return v !== 0
+  const s = String(v).trim().toLowerCase()
+  return s === 'true' || s === '-1' || s === '1'
 }
 
 /** 跳过时给用户看的一句：「与 K12:K13 合并（不是左上角，这一格不存值）」 */
