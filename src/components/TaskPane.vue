@@ -210,6 +210,7 @@ import { pickEtdEta } from '../lib/dates.js'
 // ★ 10-30：读回校验的口径只有一份（lib/cellwrite.js）—— 批量路径与逐格路径共用，
 //   以前逐格用裸比较、批量用归一化，日期列/数值列走逐格必然误判「补不进去」。
 import { cellMatches, judgeReadback, writeCellCore, cellText } from '../lib/cellwrite.js'
+import { planVesselVoyage, mergeBlockOf, mergeSkipText } from '../lib/writeplan.js'   // ★ 11-10：船名/航次同列 + 合并格
 import { summarize as summarizeFails, classifyFail } from '../lib/fail.js'
 // ★ 卡 t_8a6689dc：canonical 契约（schemaVersion）闸门 + 单元格文案的唯一实现
 import { checkResultSchema, PLUGIN_SCHEMA_VERSION } from '../lib/contract.js'
@@ -1030,9 +1031,15 @@ export default {
           this.flash(`${label}列不能和单号列/输出列相同（${colLetter(s.col)}）`)
           return
         }
+        // ★ 2026-11-10：船名列 = 航次列是**允许**的（爹地的表就一格放「船名 航次」）。
+        //   同列时回填只写一次拼接值，不会互相覆盖 —— 这里只提示一句，不拦。
+        const other = field === 'vesselCol' ? this.cfg.voyageCol : this.cfg.vesselCol
+        const sameCol = Number(other || 0) === Number(s.col)
         this.cfg = { ...this.cfg, [field]: s.col }
         this.saveCfg()
-        this.log(`${label}列 = ${colLetter(s.col)}（查到才写，查不到保留原值）`)
+        this.log(sameCol
+          ? `${label}列 = ${colLetter(s.col)}（和另一列同一格 → 回填「船名 航次」一次写进去）`
+          : `${label}列 = ${colLetter(s.col)}（查到才写，查不到保留原值）`)
         this.panelErr = ''
       } catch (e) {
         this.panelErr = `选${label}列失败：` + e.message
@@ -1561,7 +1568,7 @@ export default {
      * （整段覆盖会把洞里的公式/用户内容替换成死值 —— 这是最隐蔽的一种数据损坏，所以宁可按段写。）
      */
     async _flushWriteQueue() {
-      const st = { ok: 0, fail: 0, miss: 0, runs: 0, cells: 0, fills: 0, fmt: 0, com: 0, rbp: 0, via: '', ms: 0 }
+      const st = { ok: 0, fail: 0, miss: 0, merged: 0, runs: 0, cells: 0, fills: 0, fmt: 0, com: 0, rbp: 0, via: '', ms: 0 }
       if (this.writing || !this.writeQ.length) return st
       const a = this.app()
       if (!a) return st
@@ -1587,7 +1594,7 @@ export default {
           const cross = doc !== this.docKey()
           const sheet = cross ? (b && b.sheet) : a.ActiveSheet
           if (!sheet) { later.push(...list); continue }
-          const bst = { ok: 0, fail: 0, miss: 0, runs: 0, cells: 0, fills: 0, fmt: 0, com: 0, rbp: 0, via: '', ms: 0 }
+          const bst = { ok: 0, fail: 0, miss: 0, merged: 0, runs: 0, cells: 0, fills: 0, fmt: 0, com: 0, rbp: 0, via: '', ms: 0 }
           const bt0 = this.nowMs()
           let deferred = 0
           this.flushingDocs.add(doc)
@@ -1615,7 +1622,7 @@ export default {
           bst.deferred = deferred          // ★ 0.9.45：跨表暂存也算三态之一（不进 fail）
           if (b && cross) { b.xsheet.ok += bst.ok; b.xsheet.fail += deferred }
           this._accWriteStats(b, bst)
-          for (const k of ['ok', 'fail', 'miss', 'runs', 'cells', 'fills', 'fmt', 'ms']) st[k] += bst[k]
+          for (const k of ['ok', 'fail', 'miss', 'merged', 'runs', 'cells', 'fills', 'fmt', 'ms']) st[k] += bst[k]
           if (bst.via) st.via = bst.via
         }
       } catch (e) {
@@ -1633,6 +1640,10 @@ export default {
       }
       st.ms = Math.round(this.nowMs() - t0)
       if (st.via) this.writeVia = st.via
+      if (st.merged) {
+        const ex = st.mergedEx
+        this.log(`写回：${st.merged} 格跳过（合并单元格${ex ? `，如 ${ex.col}${ex.row} 与 ${ex.block} 合并` : ''}）`)
+      }
       if (st.fail) {
         this.log(`写回：成功 ${st.ok} / 失败 ${st.fail} / 错位跳过 ${st.miss}`)
       } else if (st.cells) {
@@ -1641,7 +1652,7 @@ export default {
       // ★ 0.9.43：写回账本累计（界面/诊断/基准看的是「这一轮一共写了多少格、一共多久」，
       //   只报最后一次 flush 会让人以为只写了 3 格）
       const acc = this.writeAcc || (this.writeAcc = { ok: 0, fail: 0, miss: 0, runs: 0, cells: 0, fills: 0, fmt: 0, ms: 0 })
-      for (const k of ['ok', 'fail', 'miss', 'runs', 'cells', 'fills', 'fmt', 'ms']) acc[k] += st[k]
+      for (const k of ['ok', 'fail', 'miss', 'merged', 'runs', 'cells', 'fills', 'fmt', 'ms']) acc[k] += st[k]
       if (st.via) acc.via = st.via
       try { window.__SHIPTRACK_STATS__ = { ...acc, lastMs: st.ms, lastCells: st.cells } } catch (e) {}
       this.publishCross()
@@ -1664,6 +1675,9 @@ export default {
       note.defer += Number(bst.deferred || 0)
       // ★ 10-30：格式差单独记账（不算失败）；失败按「COM 抛异常 / 读回没变」分开数，
       //   横幅才能说准话（只有前者才可能是保护/只读）。
+      // ★ 2026-11-10：合并单元格跳过单独记账（不是失败，但要让用户知道哪格没写、跟谁合并了）
+      note.merged = (note.merged || 0) + Number(bst.merged || 0)
+      if (bst.mergedEx && !note.mergedEx) note.mergedEx = bst.mergedEx
       note.fmt = (note.fmt || 0) + Number(bst.fmt || 0)
       note.com = (note.com || 0) + Number(bst.com || 0)
       note.rbp = (note.rbp || 0) + Number(bst.rbp || 0)
@@ -1686,6 +1700,10 @@ export default {
         if ((n.rbp || 0) > 0 && !((n.com || 0) > 0)) return `${n.fail} 格没写进去（${ex ? `R${ex.row} ${ex.col} 列：写入 ${ex.wrote} / 读回 ${ex.back || '空'}` : '赋值没生效'}）`
         if ((n.com || 0) > 0 && !((n.rbp || 0) > 0)) return `${n.fail} 格补不进去（表可能被保护/只读）`
         return `${n.fail} 格补不进去（${n.com || 0} 格抛异常 / ${n.rbp || 0} 格读回没变）`
+      }
+      if ((n.merged || 0) > 0) {
+        const ex = n.mergedEx
+        return `${n.merged} 格跳过（合并单元格${ex ? `：${ex.col}${ex.row} 与 ${ex.block} 合并，只有左上角能写` : ''}）`
       }
       if (n.defer > 0) return `${n.defer} 格结果暂存，切回原表自动补`
       if ((n.fmt || 0) > 0) {
@@ -1841,8 +1859,72 @@ export default {
       const want = this._cellValueOf(w)
       return cellMatches(back, want) || cellMatches(back, w && w.text)
     },
+    /**
+     * 合并单元格判定（★ 2026-11-10，爹地那张表 K12:K13 / L12:L13 是合并的）。
+     * 合并区只有**左上角**那格存值：往其余格写 → 值跑到左上角、读回是空 → 整段报「读回不一致」，
+     * 把人引到「表可能被保护/只读」的死路上。所以写之前先判 MergeArea：
+     *   非左上角 → 跳过并报「与 K12 合并」，绝不写；左上角 → 照常写。
+     * 返回 null（可写）或 {addr, topRow, topCol}。
+     * 老版本摸不到 MergeCells/MergeArea 就返回 null —— 不猜，按原路写。
+     */
+    _mergeBlockOf(sheet, row, col) {
+      // 只负责摸 COM；「算不算不可写」的判定在 lib/writeplan.js（纯函数，可单测）
+      let area = null
+      try {
+        const cell = sheet.Cells(row, col)
+        if (cell.MergeCells === true) {
+          const ma = cell.MergeArea
+          if (ma) area = { mergeCells: true, topRow: ma.Row, topCol: ma.Column, address: ma.Address }
+        } else {
+          area = { mergeCells: false }
+        }
+      } catch (e) {
+        return null   // 老版本摸不到 MergeCells/MergeArea → 不猜，按原路写
+      }
+      return mergeBlockOf(area, row, col)
+    },
+    /**
+     * 批量范围先剔合并格：剔除后剩下的连续行号自然断开，不会把不可写的格串进同一段批量写。
+     * 快路径：整段 MergeCells === false → 一次 COM 就过，不逐格摸。
+     */
+    _dropMerged(sheet, seg, st, batch) {
+      if (!seg || !seg.length) return seg || []
+      let mc
+      try {
+        const a1 = `${colLetter(seg[0].col)}${seg[0].row}`
+        const a2 = `${colLetter(seg[seg.length - 1].col)}${seg[seg.length - 1].row}`
+        mc = sheet.Range(`${a1}:${a2}`).MergeCells
+      } catch (e) { mc = null }
+      if (mc === false) {
+        for (const w of seg) w.mergeChecked = true
+        return seg
+      }
+      const keep = []
+      for (const w of seg) {
+        w.mergeChecked = true
+        const blk = this._mergeBlockOf(sheet, w.row, w.col)
+        if (!blk) { keep.push(w); continue }
+        // 不是失败：这一格本来就不存值。单独记一笔（merged），横幅上说清「与 K12 合并」。
+        w.result = 'merged'
+        w.error = `与 ${blk.addr} 合并`
+        st.merged = (st.merged || 0) + 1
+        if (!st.mergedEx) st.mergedEx = { row: w.row, col: colLetter(w.col), block: blk.addr }
+        if (w.it) {
+          w.it.state = 'skip'
+          w.it.mergedInto = blk.addr
+          w.it.failReason = w.it.failReason || 'merged'
+          w.it.text = `${String(w.it.text || '')}（${mergeSkipText(blk)}）`
+        }
+        this.log(`R${w.row} ${colLetter(w.col)} 与 ${blk.addr} 合并（不是左上角）→ 跳过不写`)
+      }
+      return keep
+    },
     /** 一段连续行：批量核身份 → 逐段写（段内批量）→ 记着色计划 */
     _writeSeg(batch, sheet, seg, st, paints) {
+      // ★ 2026-11-10：写之前先把合并格剔掉（非左上角根本不可写）——
+      //   否则批量写会把值塞进左上角、其余格读回空 → 全段误报「读回不一致」。
+      seg = this._dropMerged(sheet, seg, st, batch)
+      if (!seg.length) return
       const from = seg[0].row
       const to = seg[seg.length - 1].row
       const nc = seg[0].numCol
@@ -1952,6 +2034,25 @@ export default {
      * 单行段、以及批量写不可用时的逐格定位都走它：先核身份（needCheck=true 时），再写，写内置读回校验。
      */
     _writeOneChecked(batch, sheet, w, st, needCheck = true, why = '写前核对不通过', viaHint = '') {
+      // ★ 2026-11-10：合并区非左上角 → 跳过（不写，也不许报「读回不一致」）。
+      //   正常路径在 _writeSeg 已经判过（w.mergeChecked）；这里兜住别处直接调进来的情况。
+      if (!w.mergeChecked) {
+        w.mergeChecked = true
+        const blk = this._mergeBlockOf(sheet, w.row, w.col)
+        if (blk) {
+          w.result = 'merged'
+          w.error = `与 ${blk.addr} 合并`
+          st.merged = (st.merged || 0) + 1
+          if (!st.mergedEx) st.mergedEx = { row: w.row, col: colLetter(w.col), block: blk.addr }
+          if (w.it) {
+            w.it.state = 'skip'
+            w.it.mergedInto = blk.addr
+            w.it.text = `${String(w.it.text || '')}（${mergeSkipText(blk)}）`
+          }
+          this.log(`R${w.row} ${colLetter(w.col)} 与 ${blk.addr} 合并（不是左上角）→ 跳过不写`)
+          return false
+        }
+      }
       if (needCheck) {
         const cur = w.numCol ? this.readOne(sheet, w.row, w.numCol) : ''
         if (w.numCol && !this.sameNumber(w.number, cur)) {
@@ -3183,12 +3284,17 @@ export default {
       }
       // ★ 2026-11-05：船名 / 航次。配了列才写，没配（0）就跳过 —— 不预设默认列。
       //   走同一个 writeRowChecked（唯一写入口），身份校验、批量、读回全部复用，不另开一条写路径。
-      for (const [col, val, label] of [[this.cfg.vesselCol, it.vessel, '船名'], [this.cfg.voyageCol, it.voyage, '航次']]) {
-        const c = Number(col || 0)
-        if (!c || !val) continue
-        if (c === Number(outCol) || c === Number(it.numCol)) continue   // 撞列不写，别把结果/单号覆盖掉
-        const wv = this.writeRowChecked(b, sheet, row, c, String(val), it.number, it.numCol, it)
-        if (!wv || !wv.ok) this.log(`写 ${colLetter(c)}${row} ${label}失败: ${wv ? wv.error : '未知'}`)
+      // ★ 2026-11-10：写哪几格、写什么值由 lib/writeplan.js 的纯函数定（可单测）：
+      //   · 船名列 = 航次列 → **只写一次**「船名 空格 航次」（原来同一格写两遍，后写的航次盖掉船名）
+      //   · 分列 → 各写一格；撞结果列/单号列 → 该格不写
+      //   一律按「船名 空格 航次」拼，不去读原格猜它是什么（原格可能已被旧 bug 写坏）。
+      const targets = planVesselVoyage({
+        vesselCol: this.cfg.vesselCol, voyageCol: this.cfg.voyageCol,
+        outCol, numCol: it.numCol, vessel: it.vessel, voyage: it.voyage
+      })
+      for (const t of targets) {
+        const wv = this.writeRowChecked(b, sheet, row, t.col, t.text, it.number, it.numCol, it)
+        if (!wv || !wv.ok) this.log(`写 ${colLetter(t.col)}${row} 船名/航次失败: ${wv ? wv.error : '未知'}`)
       }
     },
 
