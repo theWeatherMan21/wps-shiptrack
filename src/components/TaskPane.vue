@@ -2838,6 +2838,8 @@ export default {
         //   只有成功结果才带；失败时留空，让写回逻辑按「保留旧值」处理
         it.vessel = (r && r.canonical && r.canonical.vessel) || ''
         it.voyage = (r && r.canonical && r.canonical.voyage) || ''
+        // 'actual' = 已开船的事实船名；'expected' = 还没开船，取官网计划航次
+        it.vesselFrom = (r && r.canonical && r.canonical.vesselFrom) || ''
         it.state = r && r.ok === false ? 'error' : 'ok'
         if (it.state === 'error') {
           it.failReason = String((r && r.error) || '查询失败')
