@@ -49,8 +49,36 @@ STALE=$( (grep -l "选提单号列" "$STAGE/.verify-$ADDON_NAME"/assets/*.js 2>/
 [ "$STALE" = "0" ] || { echo "⚠️ 仍然存在旧文案 chunk（$STALE 个），检查构建是否干净"; }
 
 mkdir -p "$HOME/.hermes/wps-shiptrack"
-printf '{"version":"%s","installedAt":"%s","dir":"%s"}\n' \
-  "$VER" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$J/$ADDON_NAME" > "$HOME/.hermes/wps-shiptrack/installed.json"
+# ★ 11-11：装机要幂等 —— 产物一个字节没变就不该把「装机时间」往后推。
+#   否则每次跑 install-verify 都会把 WPS 进程标成「旧插件」（狼来了），
+#   真正换了内容那天反而没人信。
+HASH_NOW=$(cd "$SRC" && find . -type f \( -name '*.js' -o -name '*.css' -o -name '*.html' \) -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256 | awk '{print $1}')
+OLD_JSON="$HOME/.hermes/wps-shiptrack/installed.json"
+OLD_HASH=$(python3 - "$OLD_JSON" <<'PYX' 2>/dev/null || true
+import json,sys
+print(json.load(open(sys.argv[1])).get("hash",""))
+PYX
+)
+OLD_TS=$(python3 - "$OLD_JSON" <<'PYX' 2>/dev/null || true
+import json,sys
+print(json.load(open(sys.argv[1])).get("installedAt",""))
+PYX
+)
+OLD_CHANGED=$(python3 - "$OLD_JSON" <<'PYX' 2>/dev/null || true
+import json,sys
+print(json.load(open(sys.argv[1])).get("changedAt",""))
+PYX
+)
+NOW_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+if [ -n "${OLD_HASH:-}" ] && [ "$OLD_HASH" = "$HASH_NOW" ] && [ -n "${OLD_CHANGED:-}" ]; then
+  # 内容和上次一个字节都不差 → 「这版插件是什么时候装上的」这个时刻不该往后推
+  CHANGED_TS="$OLD_CHANGED"
+  echo "   产物哈希未变（${HASH_NOW}）→ 内容自 ${OLD_CHANGED} 起没变过，这次是幂等重装"
+else
+  CHANGED_TS="$NOW_TS"
+fi
+printf '{"version":"%s","installedAt":"%s","changedAt":"%s","hash":"%s","dir":"%s"}\n' \
+  "$VER" "$NOW_TS" "$CHANGED_TS" "$HASH_NOW" "$J/$ADDON_NAME" > "$OLD_JSON"
 
 echo "✅ 装机完成并校验通过：$ADDON_NAME · v${VER} · 入口 ${IDX}"
 
@@ -70,9 +98,17 @@ PYEOF
 if [ -n "$WPID" ]; then
   WSTART=$(ps -o lstart= -p "$WPID" 2>/dev/null | sed 's/^ *//')
   WSTART_EPOCH=$(date -j -f "%a %b %d %T %Y" "$WSTART" +%s 2>/dev/null || echo 0)
-  if [ "$WSTART_EPOCH" -gt 0 ] && [ "$WSTART_EPOCH" -lt "$INSTALL_EPOCH" ]; then
+  # ★ 判据用 changedAt（内容最后变化的时刻）：幂等重装不该把 WPS 标成「旧插件」（狼来了）
+  CHANGED_EPOCH=$(python3 - "$OLD_JSON" <<'PYX' 2>/dev/null || true
+import json,sys,calendar,time
+j=json.load(open(sys.argv[1]))
+print(calendar.timegm(time.strptime(j.get("changedAt") or j.get("installedAt"), "%Y-%m-%dT%H:%M:%SZ")))
+PYX
+)
+  if [ -n "${CHANGED_EPOCH:-}" ]; then CHECK_EPOCH="$CHANGED_EPOCH"; else CHECK_EPOCH="$INSTALL_EPOCH"; fi
+  if [ "$WSTART_EPOCH" -gt 0 ] && [ "$WSTART_EPOCH" -lt "$CHECK_EPOCH" ]; then
     printf '\033[1;31m⚠️  WPS 正在运行（PID %s，启动于 %s），比本次装机（%s）早 —— 加载的是旧插件\033[0m\n' \
-      "$WPID" "$WSTART" "$(date -r "$INSTALL_EPOCH" '+%F %T')"
+      "$WPID" "$WSTART" "$(date -r "$CHECK_EPOCH" '+%F %T')"
     printf '\033[1;31m   关窗口无效，必须完全退出（Cmd+Q / 菜单「退出」）再打开。判据：面板右下角应显示 v%s。\033[0m\n' "$VER"
   else
     echo "   WPS 正在运行（PID ${WPID}，启动于 ${WSTART}）—— 比本次装机晚，用的就是新插件。"
