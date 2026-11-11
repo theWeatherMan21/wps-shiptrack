@@ -13,7 +13,7 @@
 // 这个测试锁的就是「多行段绝不允许走快路径」这一条 —— 它是所有批量写的公共入口。
 
 import {
-  canUseMergeFastPath, mergeBlockOf, mergeSkipText, isVbaTrue, isMergedNonAnchor,
+  canUseMergeFastPath, mergeBlockOf, mergeSkipText, isVbaTrue, isMergedNonAnchor, mergeVerdict,
 } from '../src/lib/writeplan.js';
 
 let pass = 0, fail = 0;
@@ -125,10 +125,41 @@ console.log('⑥ 行列号比较：判据不依赖 MergeCells 布尔值');
   ok(isMergedNonAnchor(13, 13, 13, 13) === false, '非合并格：MergeArea 等于自身 → 可写');
   ok(isMergedNonAnchor(12, 11, 13, 12) === true, '跨列合并 K12:L13 里的 L13 → 非左上角');
   ok(isMergedNonAnchor('12', '12', '13', '12') === true, '字符串数字也认');
-  ok(isMergedNonAnchor(null, 12, 13, 12) === null, '摸不到 Row → null（交调用方兜底）');
-  ok(isMergedNonAnchor(12, 12, null, 12) === null, '摸不到 cell row → null');
-  ok(isMergedNonAnchor(undefined, undefined, undefined, undefined) === null, '全摸不到 → null');
+  ok(isMergedNonAnchor(null, 12, 13, 12) === false, '摸不到 Row → false（不猜，按原路写）');
+  ok(isMergedNonAnchor(12, 12, null, 12) === false, '摸不到 cell row → false');
+  ok(isMergedNonAnchor(undefined, undefined, undefined, undefined) === false, '全摸不到 → false');
   ok(isMergedNonAnchor(12, 12, 13, 12) === true, '换列同样成立（K13）');
+}
+
+
+console.log('⑦ mergeVerdict：三重判据（真机四次失效后的最终版）');
+{
+  const L13 = { cellAddr: '$L$13', cellRow: 13, cellCol: 12, maAddr: '$L$12:$L$13', maRow: 12, maCol: 12, maRows: 2, maCols: 1 };
+  const L12 = { cellAddr: '$L$12', cellRow: 12, cellCol: 12, maAddr: '$L$12:$L$13', maRow: 12, maCol: 12, maRows: 2, maCols: 1 };
+  const M13 = { cellAddr: '$M$13', cellRow: 13, cellCol: 13, maAddr: '$M$13', maRow: 13, maCol: 13, maRows: 1, maCols: 1 };
+
+  const v13 = mergeVerdict(L13);
+  ok(v13.nonAnchor === true, 'L13 非左上角 → 跳过', JSON.stringify(v13));
+  ok(v13.reasons.includes('addr-range'), '理由含 addr-range（地址范围判据）', JSON.stringify(v13.reasons));
+
+  const v12 = mergeVerdict(L12);
+  ok(v12.nonAnchor === false, 'L12 左上角 → 必须可写（这条错了就是整列都写不进去）', JSON.stringify(v12));
+
+  const vm = mergeVerdict(M13);
+  ok(vm.nonAnchor === false, 'M13 未合并 → 可写', JSON.stringify(vm));
+
+  // 任一判据单独可用
+  ok(mergeVerdict({ cellRow: 13, cellCol: 12, maRow: 12, maCol: 12 }).nonAnchor === true, '只有坐标也能判 L13');
+  ok(mergeVerdict({ cellRow: 12, cellCol: 12, maRow: 12, maCol: 12 }).nonAnchor === false, '只有坐标也能判 L12');
+  ok(mergeVerdict({ cellRow: 13, cellCol: 12, maRows: 2, maCols: 1 }).nonAnchor === true, '只有尺寸也能兜住（保守跳过）');
+  ok(mergeVerdict({}).nonAnchor === false, '全摸不到 → 不跳过（按原路写）');
+
+  // 跨列合并 K12:L13 里的 L13
+  const cross = mergeVerdict({ cellAddr: '$L$13', cellRow: 13, cellCol: 12, maAddr: '$K$12:$L$13', maRow: 12, maCol: 11, maRows: 2, maCols: 2 });
+  ok(cross.nonAnchor === true, '跨列合并里同样判非左上角', JSON.stringify(cross));
+
+  // 大小写 / $ / 空格 都不影响
+  ok(mergeVerdict({ cellAddr: ' l13 ', cellRow: 13, cellCol: 12, maAddr: '$l$12:$l$13 ' }).nonAnchor === true, '大小写和空格不影响地址判据');
 }
 
 console.log(`\n${fail ? '✗' : '✓'} ${pass} 通过 / ${fail} 失败`);

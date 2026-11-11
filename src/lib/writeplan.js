@@ -103,24 +103,59 @@ export function canUseMergeFastPath(_segLength, _rangeMergeCells) {
 }
 
 /**
- * 这一格是不是「合并区里的非左上角格」（写进去值会落到左上角、读回空）。
+ * 判定一格能不能写：是不是「合并区里的非左上角格」。
  *
- * 判据用**行列号比较**，不用 MergeCells 布尔值 —— 那个值在 WPS 上两次坑人：
- *   单格合并返 -1（`=== true` 恒假）、区域内部分合并返 0（被当成「没合并」）。
+ * ★ 三重判据，任一命中即判非左上角。这是被 WPS 逼出来的：
+ *   第一次（hotfix9）`MergeCells === true` → WPS 返 -1，恒假，从没生效。
+ *   第二次（hotfix11）段级 `!isVbaTrue(0)` → 部分合并返 0，被当成「没合并」。
+ *   第三次（hotfix12）只比 MergeArea.Row/Column → 真机日志「现场跳过 0 格」，说明坐标也没动。
+ *   第四次（hotfix14）同上。
  *
- * `MergeArea.Row/Column` 是合并区左上角的坐标，非合并格等于自身坐标 —— 这是硬事实，
- * 跟布尔值无关，也不受 `$`/大小写/范围字符串格式影响。
+ * 所以不再赌某一个字段，三个一起看：
+ *   ① MergeArea.Address 含 ":"（是范围）且左上角 ≠ 本格地址 → 非左上角
+ *   ② MergeArea 的 Rows.Count 或 Columns.Count > 1        → 非左上角
+ *   ③ MergeArea.Row/Column ≠ 本格行列                     → 非左上角
  *
- * 摸不到（老版本 COM）→ 返回 null，调用方按「不知道」处理（退回布尔值 / 按原路写）。
- *
- * @returns {boolean|null} true=非左上角（不可写）, false=可写, null=摸不到
+ * 返回 { nonAnchor, reasons[] }：reasons 说明是哪条命中，方便日志和探针定位。
+ * 摸不到任何字段 → nonAnchor=false（按原路写，不猜）。
  */
+export function mergeVerdict({ cellAddr, cellRow, cellCol, maAddr, maRow, maCol, maRows, maCols } = {}) {
+  const norm = (x) => String(x == null ? '' : x).replace(/\$/g, '').replace(/\s/g, '').toUpperCase();
+
+  // ① 地址范围（最硬：合并区地址是 "$L$12:$L$13"，本格是 "$L$13"，冒号前后一比就知道是不是左上角）
+  const a = norm(maAddr);
+  if (a.indexOf(':') >= 0) {
+    const anchor = a.split(':')[0];
+    const nonAnchor = anchor !== norm(cellAddr);
+    return { nonAnchor, reasons: [nonAnchor ? 'addr-range' : 'anchor-left-top'] };
+  }
+
+  // ② 坐标（次硬：MergeArea.Row/Column 是合并区左上角坐标，非合并格等于自身）
+  //   ★ Number(null) === 0 —— 直接 Number() 会把「摸不到」当成第 0 行，误判成非左上角。
+  const num = (x) => {
+    if (x === null || x === undefined || x === '') return NaN;
+    const n = Number(x);
+    return Number.isFinite(n) ? n : NaN;
+  };
+  const ar = num(maRow), ac = num(maCol), cr = num(cellRow), cc = num(cellCol);
+  if ([ar, ac, cr, cc].every((n) => Number.isFinite(n))) {
+    const nonAnchor = ar !== cr || ac !== cc;
+    return { nonAnchor, reasons: [nonAnchor ? 'coord' : 'coord-same'] };
+  }
+
+  // ③ 尺寸兜底（只能确认「这是合并区」，分不出左上角）→ 保守跳过。
+  //   宁可少写一格（用户在面板上看得到「跳过」），也不能把值写进别人的格子。
+  const mr = num(maRows);
+  const mc = num(maCols);
+  if ((Number.isFinite(mr) && mr > 1) || (Number.isFinite(mc) && mc > 1)) {
+    return { nonAnchor: true, reasons: ['size-only-anchor-unknown'] };
+  }
+
+  return { nonAnchor: false, reasons: [] };
+}
+
+/** 兼容旧签名：只要结论 */
 export function isMergedNonAnchor(mergeAreaRow, mergeAreaCol, cellRow, cellCol) {
-  const nums = [mergeAreaRow, mergeAreaCol, cellRow, cellCol].map((v) => {
-    if (v === null || v === undefined || v === '') return NaN;
-    return Number(v);
-  });
-  if (nums.some((n) => !Number.isFinite(n))) return null;
-  const [ar, ac, cr, cc] = nums;
-  return ar !== cr || ac !== cc;
+  const v = mergeVerdict({ maRow: mergeAreaRow, maCol: mergeAreaCol, cellRow, cellCol });
+  return v.nonAnchor;
 }

@@ -252,7 +252,7 @@ import { pickEtdEta } from '../lib/dates.js'
 // ★ 10-30：读回校验的口径只有一份（lib/cellwrite.js）—— 批量路径与逐格路径共用，
 //   以前逐格用裸比较、批量用归一化，日期列/数值列走逐格必然误判「补不进去」。
 import { cellMatches, judgeReadback, writeCellCore, cellText } from '../lib/cellwrite.js'
-import { planVesselVoyage, mergeBlockOf, mergeSkipText, isVbaTrue, canUseMergeFastPath, isMergedNonAnchor } from '../lib/writeplan.js'   // ★ 11-10：船名/航次同列 + 合并格 + VBA 布尔
+import { planVesselVoyage, mergeBlockOf, mergeSkipText, isVbaTrue, canUseMergeFastPath, mergeVerdict } from '../lib/writeplan.js'   // ★ 11-10：船名/航次同列 + 合并格 + VBA 布尔
 import { summarize as summarizeFails, classifyFail } from '../lib/fail.js'
 // ★ 卡 t_8a6689dc：canonical 契约（schemaVersion）闸门 + 单元格文案的唯一实现
 import { checkResultSchema, PLUGIN_SCHEMA_VERSION } from '../lib/contract.js'
@@ -2062,40 +2062,38 @@ export default {
      * 老版本摸不到 MergeCells/MergeArea 就返回 null —— 不猜，按原路写。
      */
     _mergeBlockOf(sheet, row, col) {
-      // 只负责摸 COM；「算不算不可写」的判定在 lib/writeplan.js（纯函数，可单测）
-      let area = null
+      // 只负责摸 COM；判据在 lib/writeplan.js 的 mergeVerdict（纯函数，可单测）。
+      // ★ 2026-11-11 真机日志「现场跳过 0 格」逼出来的第四版：
+      //   前三次分别赌 MergeCells 布尔、段级布尔、MergeArea 坐标，全在真机上失效。
+      //   现在三个判据一起看，任一命中即跳过，并且把命中的理由记下来。
       try {
         const cell = sheet.Cells(row, col)
-
-        // ★ 判据用「MergeArea 左上角坐标 vs 本格坐标」，不用 MergeCells 布尔值 ——
-        //   这个布尔值在 WPS 上两次坑人：单格合并返 -1（hotfix9 踩过）、
-        //   区域内部分合并返 0（hotfix11 踩过）。
-        //   坐标相同 → 非合并区 或 合并区左上角 → 可写
-        //   坐标不同 → 合并区里的非左上角 → 写进去值落到左上角、读回空
-        let nonAnchor = null
-        try {
-          const ma0 = cell.MergeArea
-          nonAnchor = isMergedNonAnchor(
-            ma0 && ma0.Row, ma0 && ma0.Column, row, col,
-          )
-        } catch (e) { nonAnchor = null }
-
-        if (nonAnchor === false) {
-          area = { mergeCells: false }          // 地址相同 → 非合并区 或 左上角
-        } else if (nonAnchor === true) {
-          const ma = cell.MergeArea
-          area = { mergeCells: true, topRow: ma.Row, topCol: ma.Column, address: ma.Address }
-        } else if (isVbaTrue(cell.MergeCells)) {
-          // 地址比较摸不到（老版本 COM）→ 退回布尔值兜底
-          const ma = cell.MergeArea
-          if (ma) area = { mergeCells: true, topRow: ma.Row, topCol: ma.Column, address: ma.Address }
-        } else {
-          area = { mergeCells: false }
+        const ma = cell.MergeArea
+        let maRows = null, maCols = null
+        try { maRows = ma ? ma.Rows.Count : null } catch (e) { maRows = null }
+        try { maCols = ma ? ma.Columns.Count : null } catch (e) { maCols = null }
+        const v = mergeVerdict({
+          cellAddr: cell.Address,
+          cellRow: row,
+          cellCol: col,
+          maAddr: ma ? ma.Address : null,
+          maRow: ma ? ma.Row : null,
+          maCol: ma ? ma.Column : null,
+          maRows,
+          maCols,
+        })
+        if (!v.nonAnchor) return null
+        // 拿到合并区地址就报地址；拿不到就报「合并区」，绝不编格子号骗用户
+        const addr = String((ma && ma.Address) || '').replace(/\$/g, '') || '合并区'
+        return {
+          addr,
+          topRow: ma ? Number(ma.Row) || 0 : 0,
+          topCol: ma ? Number(ma.Column) || 0 : 0,
+          reasons: v.reasons,
         }
       } catch (e) {
         return null   // 摸不到 → 不猜，按原路写
       }
-      return mergeBlockOf(area, row, col)
     },
     /**
      * 批量范围先剔合并格：剔除后剩下的连续行号自然断开，不会把不可写的格串进同一段批量写。
@@ -2133,7 +2131,7 @@ export default {
           w.it.failReason = w.it.failReason || 'merged'
           w.it.text = `${String(w.it.text || '')}（${mergeSkipText(blk)}）`
         }
-        this.log(`R${w.row} ${colLetter(w.col)} 与 ${blk.addr} 合并（不是左上角）→ 跳过不写`)
+        this.log(`R${w.row} ${colLetter(w.col)} 与 ${blk.addr} 合并（不是左上角）→ 跳过不写${blk.reasons ? ' [' + blk.reasons.join(',') + ']' : ''}`)
       }
       return keep
     },
@@ -2267,7 +2265,7 @@ export default {
             w.it.mergedInto = blk.addr
             w.it.text = `${String(w.it.text || '')}（${mergeSkipText(blk)}）`
           }
-          this.log(`R${w.row} ${colLetter(w.col)} 与 ${blk.addr} 合并（不是左上角）→ 跳过不写`)
+          this.log(`R${w.row} ${colLetter(w.col)} 与 ${blk.addr} 合并（不是左上角）→ 跳过不写${blk.reasons ? ' [' + blk.reasons.join(',') + ']' : ''}`)
           return false
         }
       }
@@ -2566,16 +2564,25 @@ export default {
       try {
         const a = this.app()
         if (!a) { out.push('WPS Application 摸不到'); this.log(out.join('\n')); return }
-        const doc = a.ActiveDocument
-        const sheet = doc.ActiveSheet
+        // ★ 16:47 爹地点探针崩过：`Cannot read properties of undefined (reading 'ActiveSheet')`。
+        //   日志里「宿主: Microsoft Excel · 文档: 无」—— 这时 ActiveDocument 是 undefined。
+        //   走三条兜底，全空才认输。
+        let doc = null
+        try { doc = a.ActiveDocument } catch (e) { doc = null }
+        if (!doc) { try { doc = a.ActiveWorkbook } catch (e) { doc = null } }
+        if (!doc) { try { if (a.Workbooks && a.Workbooks.Count) doc = a.Workbooks.Item(1) } catch (e) { doc = null } }
+        if (!doc) { out.push('摸不到活动工作簿（ActiveDocument / ActiveWorkbook / Workbooks.Item(1) 全空）'); this.log(out.join('\n')); return }
+        let sheet = null
+        try { sheet = doc.ActiveSheet } catch (e) { sheet = null }
+        if (!sheet) { try { if (doc.Sheets && doc.Sheets.Count) sheet = doc.Sheets.Item(1) } catch (e) { sheet = null } }
+        if (!sheet) { out.push('摸不到活动工作表'); this.log(out.join('\n')); return }
+
         const cfg = this.cfg || {}
         const startRow = Number(cfg.startRow) || 2
         const rows = Number(cfg.rows) || 15
-        out.push('表: ' + doc.Name + ' | 工作表: ' + sheet.Name)
-        out.push('行: ' + startRow + '-' + (startRow + rows - 1))
+        out.push('表: ' + (doc.Name || '?') + ' | 工作表: ' + (sheet.Name || '?') + ' | 行: ' + startRow + '-' + (startRow + rows - 1))
 
-        // ★ 扫「所有会被写的列」，不只输出列。
-        //   爹地这次报错在 ETD 列（L），只扫 outCol（R）会输出一堆「没合并」，白重启一次。
+        // ★ 扫「所有会被写的列」，不只输出列 —— 报错的格子可能在 ETD/ETA 列
         const targets = []
         const add = (label, c) => { const n = Number(c) || 0; if (n > 0) targets.push([label, n]) }
         add('单号列', cfg.numberCol)
@@ -2599,27 +2606,25 @@ export default {
               const maAddr = ma ? ma.Address : '(null)'
               const maRow = ma ? ma.Row : '(null)'
               const maCol = ma ? ma.Column : '(null)'
+              let rowsCnt = null, colsCnt = null
+              try { rowsCnt = ma ? ma.Rows.Count : null } catch (e) { rowsCnt = null }
+              try { colsCnt = ma ? ma.Columns.Count : null } catch (e) { colsCnt = null }
               const ownAddr = cell.Address
-              let rowsCnt = '(?)', colsCnt = '(?)'
-              try { rowsCnt = ma ? ma.Rows.Count : '(null)' } catch (e) { rowsCnt = '(err)' }
-              try { colsCnt = ma ? ma.Columns.Count : '(null)' } catch (e) { colsCnt = '(err)' }
-              const norm = (x) => String(x || '').replace(/\$/g, '').toUpperCase()
-              const addrDiff = norm(maAddr) !== norm(ownAddr)
-              const sizeDiff = (Number(rowsCnt) > 1) || (Number(colsCnt) > 1)
-              const flag = (addrDiff || sizeDiff) ? ' ★非左上角' : ''
-              if (flag) { mergedCount++; totalMerged++ }
-              out.push(`${colLetter(c)}${r}: MergeCells=${JSON.stringify(mc)} | MergeArea=${maAddr} @(${maRow},${maCol}) | Address=${ownAddr} | Rows=${rowsCnt} Cols=${colsCnt} | 地址不同=${addrDiff} 尺寸>1=${sizeDiff}${flag}`)
+              // 用跟写路径完全相同的判据算一遍，真值和结论一起打
+              const v = mergeVerdict({
+                cellAddr: ownAddr, cellRow: r, cellCol: c,
+                maAddr, maRow, maCol, maRows: rowsCnt, maCols: colsCnt,
+              })
+              const flag = v.nonAnchor ? ' ★非左上角[' + v.reasons.join(',') + ']' : ''
+              if (v.nonAnchor) { mergedCount++; totalMerged++ }
+              out.push(`${colLetter(c)}${r}: MergeCells=${JSON.stringify(mc)} | MergeArea=${maAddr} @(${maRow},${maCol}) | Address=${ownAddr} | Rows=${rowsCnt} Cols=${colsCnt}${flag}`)
             } catch (e) {
               out.push(`${colLetter(c)}${r}: 读取异常 ${e && e.message ? e.message : e}`)
             }
           }
           out.push('--- ' + label + ' 命中 ' + mergedCount + ' 格 ---')
         }
-        out.push('=== 合计命中合并区非左上角: ' + totalMerged + ' 格 ===')
-        out.push('判读：')
-        out.push('  地址不同=true 且 尺寸>1=true   → 两种判据等价，用坐标即可')
-        out.push('  只有 尺寸>1=true                → MergeArea.Address 不可信，改用 Rows.Count')
-        out.push('  两者都 false 但确实该跳过        → 这格不是合并区，问题在别处')
+        out.push('=== 合计命中非左上角: ' + totalMerged + ' 格 ===')
       } catch (e) {
         out.push('探针失败: ' + (e && e.message ? e.message : e))
       }
