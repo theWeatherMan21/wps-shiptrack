@@ -2069,14 +2069,18 @@ export default {
       try {
         const cell = sheet.Cells(row, col)
         const ma = cell.MergeArea
-        let maRows = null, maCols = null
+        let maRows = null, maCols = null, maAnchorAddr = null
         try { maRows = ma ? ma.Rows.Count : null } catch (e) { maRows = null }
         try { maCols = ma ? ma.Columns.Count : null } catch (e) { maCols = null }
+        // ★ MergeArea.Cells(1,1) 是合并区左上角的真实地址 —— WPS 就算 MergeArea.Address
+        //   返回单格，这个也还是左上角。判据最硬的一条。
+        try { maAnchorAddr = ma && ma.Cells(1, 1) ? ma.Cells(1, 1).Address : null } catch (e) { maAnchorAddr = null }
         const v = mergeVerdict({
           cellAddr: cell.Address,
           cellRow: row,
           cellCol: col,
           maAddr: ma ? ma.Address : null,
+          maAnchorAddr,
           maRow: ma ? ma.Row : null,
           maCol: ma ? ma.Column : null,
           maRows,
@@ -2606,18 +2610,19 @@ export default {
               const maAddr = ma ? ma.Address : '(null)'
               const maRow = ma ? ma.Row : '(null)'
               const maCol = ma ? ma.Column : '(null)'
-              let rowsCnt = null, colsCnt = null
+              let rowsCnt = null, colsCnt = null, maAnchorAddr = null
               try { rowsCnt = ma ? ma.Rows.Count : null } catch (e) { rowsCnt = null }
               try { colsCnt = ma ? ma.Columns.Count : null } catch (e) { colsCnt = null }
+              try { maAnchorAddr = ma && ma.Cells(1, 1) ? ma.Cells(1, 1).Address : null } catch (e) { maAnchorAddr = null }
               const ownAddr = cell.Address
               // 用跟写路径完全相同的判据算一遍，真值和结论一起打
               const v = mergeVerdict({
                 cellAddr: ownAddr, cellRow: r, cellCol: c,
-                maAddr, maRow, maCol, maRows: rowsCnt, maCols: colsCnt,
+                maAddr, maAnchorAddr, maRow, maCol, maRows: rowsCnt, maCols: colsCnt,
               })
               const flag = v.nonAnchor ? ' ★非左上角[' + v.reasons.join(',') + ']' : ''
               if (v.nonAnchor) { mergedCount++; totalMerged++ }
-              out.push(`${colLetter(c)}${r}: MergeCells=${JSON.stringify(mc)} | MergeArea=${maAddr} @(${maRow},${maCol}) | Address=${ownAddr} | Rows=${rowsCnt} Cols=${colsCnt}${flag}`)
+              out.push(`${colLetter(c)}${r}: MergeCells=${JSON.stringify(mc)} | MergeArea=${maAddr} @(${maRow},${maCol}) | 左上角=${maAnchorAddr || '(null)'} | Address=${ownAddr} | Rows=${rowsCnt} Cols=${colsCnt}${flag}`)
             } catch (e) {
               out.push(`${colLetter(c)}${r}: 读取异常 ${e && e.message ? e.message : e}`)
             }

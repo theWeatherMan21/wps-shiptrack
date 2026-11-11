@@ -119,36 +119,45 @@ export function canUseMergeFastPath(_segLength, _rangeMergeCells) {
  * 返回 { nonAnchor, reasons[] }：reasons 说明是哪条命中，方便日志和探针定位。
  * 摸不到任何字段 → nonAnchor=false（按原路写，不猜）。
  */
-export function mergeVerdict({ cellAddr, cellRow, cellCol, maAddr, maRow, maCol, maRows, maCols } = {}) {
+export function mergeVerdict({ cellAddr, cellRow, cellCol, maAddr, maAnchorAddr, maRow, maCol, maRows, maCols } = {}) {
   const norm = (x) => String(x == null ? '' : x).replace(/\$/g, '').replace(/\s/g, '').toUpperCase();
-
-  // ① 地址范围（最硬：合并区地址是 "$L$12:$L$13"，本格是 "$L$13"，冒号前后一比就知道是不是左上角）
-  const a = norm(maAddr);
-  if (a.indexOf(':') >= 0) {
-    const anchor = a.split(':')[0];
-    const nonAnchor = anchor !== norm(cellAddr);
-    return { nonAnchor, reasons: [nonAnchor ? 'addr-range' : 'anchor-left-top'] };
-  }
-
-  // ② 坐标（次硬：MergeArea.Row/Column 是合并区左上角坐标，非合并格等于自身）
-  //   ★ Number(null) === 0 —— 直接 Number() 会把「摸不到」当成第 0 行，误判成非左上角。
+  // ★ Number(null) === 0 —— 直接 Number() 会把「摸不到」当成第 0 行，误判成非左上角
   const num = (x) => {
     if (x === null || x === undefined || x === '') return NaN;
     const n = Number(x);
     return Number.isFinite(n) ? n : NaN;
   };
-  const ar = num(maRow), ac = num(maCol), cr = num(cellRow), cc = num(cellCol);
-  if ([ar, ac, cr, cc].every((n) => Number.isFinite(n))) {
-    const nonAnchor = ar !== cr || ac !== cc;
-    return { nonAnchor, reasons: [nonAnchor ? 'coord' : 'coord-same'] };
+
+  const own = norm(cellAddr);
+
+  // ① 合并区左上角的真实地址（MergeArea.Cells(1,1).Address）—— 最硬，直接定生死
+  const anchor = norm(maAnchorAddr);
+  if (anchor) return { nonAnchor: anchor !== own, reasons: ['anchor-addr'] };
+
+  // ② MergeArea.Address 是范围（含冒号）—— 次硬
+  const a = norm(maAddr);
+  if (a.indexOf(':') >= 0) {
+    const topLeft = a.split(':')[0];
+    const nonAnchor = topLeft !== own;
+    return { nonAnchor, reasons: [nonAnchor ? 'addr-range' : 'addr-range-anchor'] };
   }
 
-  // ③ 尺寸兜底（只能确认「这是合并区」，分不出左上角）→ 保守跳过。
-  //   宁可少写一格（用户在面板上看得到「跳过」），也不能把值写进别人的格子。
-  const mr = num(maRows);
-  const mc = num(maCols);
-  if ((Number.isFinite(mr) && mr > 1) || (Number.isFinite(mc) && mc > 1)) {
-    return { nonAnchor: true, reasons: ['size-only-anchor-unknown'] };
+  const ar = num(maRow), ac = num(maCol), cr = num(cellRow), cc = num(cellCol);
+  const coordOk = [ar, ac, cr, cc].every((n) => Number.isFinite(n));
+  const mr = num(maRows), mc = num(maCols);
+  const sizeMerged = (Number.isFinite(mr) && mr > 1) || (Number.isFinite(mc) && mc > 1);
+
+  // ★ ③ 尺寸说「这格在合并区里」是硬事实。此时坐标不可信 ——
+  //   WPS 可能对非左上角格返回它自己的 Row/Column（前四版就是被这个坑掉的），
+  //   所以「坐标等于自身」不能推出「是左上角」。
+  //   地址和左上角地址都摸不到的情况下，只能保守跳过：
+  //   宁可少写一格（用户在面板上看得到「跳过」），也不能把值写进别人的格子（数据污染且不可发现）。
+  if (sizeMerged) return { nonAnchor: true, reasons: ['size-only-anchor-unknown'] };
+
+  // ④ 没有尺寸信息时才单靠坐标（普通表格没有合并区时的主路径）
+  if (coordOk) {
+    const nonAnchor = ar !== cr || ac !== cc;
+    return { nonAnchor, reasons: [nonAnchor ? 'coord' : 'coord-same'] };
   }
 
   return { nonAnchor: false, reasons: [] };

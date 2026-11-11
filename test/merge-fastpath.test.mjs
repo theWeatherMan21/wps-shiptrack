@@ -158,6 +158,23 @@ console.log('⑦ mergeVerdict：三重判据（真机四次失效后的最终版
   const cross = mergeVerdict({ cellAddr: '$L$13', cellRow: 13, cellCol: 12, maAddr: '$K$12:$L$13', maRow: 12, maCol: 11, maRows: 2, maCols: 2 });
   ok(cross.nonAnchor === true, '跨列合并里同样判非左上角', JSON.stringify(cross));
 
+  // ★ 知澜指出的结构性 bug：坐标把尺寸短路了。这两条是定案判据。
+  //   WPS 最可能的行为：MergeArea.Address 返回单格、Row/Column 返回自身、只有 Rows.Count=2 说真话。
+  ok(mergeVerdict({ cellAddr: '$L$13', cellRow: 13, cellCol: 12, maAddr: '$L$13', maRow: 13, maCol: 12, maRows: 2, maCols: 1 }).nonAnchor === true,
+    '场景C：Address 单格 + 坐标自身 + Rows=2 → 必须判非左上角（WPS 真实行为）');
+  ok(mergeVerdict({ cellAddr: '$L$12', cellRow: 12, cellCol: 12, maAddr: '$L$12', maRow: 12, maCol: 12, maRows: 2, maCols: 1 }).nonAnchor === true,
+    '同上场景的左上角：尺寸只证明「在合并区里」，分不出左上角 → 保守跳过（宁可少写，不能写错）');
+
+  // MergeArea.Cells(1,1).Address —— 最硬，能真正分出生死
+  ok(mergeVerdict({ cellAddr: '$L$13', cellRow: 13, cellCol: 12, maAnchorAddr: '$L$12', maRows: 2, maCols: 1 }).nonAnchor === true,
+    '左上角地址直给 L12、本格 L13 → 非左上角');
+  ok(mergeVerdict({ cellAddr: '$L$12', cellRow: 12, cellCol: 12, maAnchorAddr: '$L$12', maRows: 2, maCols: 1 }).nonAnchor === false,
+    '左上角地址直给 L12、本格 L12 → 左上角，必须可写（错这条整列都写不进去）');
+  ok(mergeVerdict({ cellAddr: '$M$13', cellRow: 13, cellCol: 13, maAnchorAddr: '$M$13', maRows: 1, maCols: 1 }).nonAnchor === false,
+    '普通格：左上角地址等于自身 → 可写');
+  ok(mergeVerdict({ cellAddr: '$L$13', cellRow: 13, cellCol: 12, maAnchorAddr: '$l$12 ', maAddr: '$L$12:$L$13' }).nonAnchor === true,
+    '左上角地址优先于地址范围（大小写/空格不影响）');
+
   // 大小写 / $ / 空格 都不影响
   ok(mergeVerdict({ cellAddr: ' l13 ', cellRow: 13, cellCol: 12, maAddr: '$l$12:$l$13 ' }).nonAnchor === true, '大小写和空格不影响地址判据');
 }
