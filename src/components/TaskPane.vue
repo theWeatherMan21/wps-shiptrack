@@ -539,7 +539,7 @@ export default {
     startCmdHint() {
       return this.isWindows
         ? '启动：powershell -ExecutionPolicy Bypass -File "%USERPROFILE%\\Documents\\trae_projects\\wps-shiptrack\\bridge\\start-win.ps1"'
-        : '启动：~/Documents/trae_projects/wps-shiptrack/scripts/bridge.sh start'
+        : '启动：~/dev/wps-shiptrack/scripts/bridge.sh start'
     },
     startCmdClean() {
       return this.startCmdHint.replace(/^启动：/, '')

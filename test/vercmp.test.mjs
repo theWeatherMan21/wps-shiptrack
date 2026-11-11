@@ -52,7 +52,7 @@ for (const a of S) for (const b of S) for (const c of S) {
 }
 
 // 与 App 侧那份必须字节一致（不在本机就跳过，不假装通过）
-const ENGINE = process.env.SHIP_HUB_DIR || path.join(os.homedir(), 'Documents', 'trae_projects', 'ShipScheduleHub');
+const ENGINE = process.env.SHIP_HUB_DIR || path.join(os.homedir(), 'dev', 'ShipScheduleHub');
 const engineFile = path.join(ENGINE, 'engine', 'lib', 'vercmp.mjs');
 const mine = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'bridge', 'vercmp.mjs');
 if (fs.existsSync(engineFile)) {

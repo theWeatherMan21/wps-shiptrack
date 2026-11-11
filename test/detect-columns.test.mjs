@@ -19,7 +19,7 @@ import { planVesselVoyage } from '../src/lib/writeplan.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const FIX_DIR = path.join(HERE, 'fixtures', 'detect')
-const REPO = process.env.SSH_REPO || path.resolve(os.homedir(), 'Documents', 'trae_projects', 'ShipScheduleHub')
+const REPO = process.env.SSH_REPO || path.resolve(os.homedir(), 'dev', 'ShipScheduleHub')
 
 let fail = 0
 const ok = (cond, label, extra = '') => {

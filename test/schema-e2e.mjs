@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url'
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(HERE, '..')
 const PORT = Number(process.env.SCHEMA_E2E_PORT || 8799)
-const SSH_REPO = process.env.SSH_REPO || path.resolve(os.homedir(), 'Documents', 'trae_projects', 'ShipScheduleHub')
+const SSH_REPO = process.env.SSH_REPO || path.resolve(os.homedir(), 'dev', 'ShipScheduleHub')
 
 let bad = 0
 const check = (name, cond, detail = '') => {
