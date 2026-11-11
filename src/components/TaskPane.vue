@@ -252,7 +252,7 @@ import { pickEtdEta } from '../lib/dates.js'
 // ★ 10-30：读回校验的口径只有一份（lib/cellwrite.js）—— 批量路径与逐格路径共用，
 //   以前逐格用裸比较、批量用归一化，日期列/数值列走逐格必然误判「补不进去」。
 import { cellMatches, judgeReadback, writeCellCore, cellText } from '../lib/cellwrite.js'
-import { planVesselVoyage, mergeBlockOf, mergeSkipText, isVbaTrue, canUseMergeFastPath, mergeVerdict, shouldRevertAnchor } from '../lib/writeplan.js'   // ★ 11-10：船名/航次同列 + 合并格 + VBA 布尔
+import { planVesselVoyage, mergeBlockOf, mergeSkipText, isVbaTrue, canUseMergeFastPath, mergeVerdict, findMovedValue } from '../lib/writeplan.js'   // ★ 11-10：船名/航次同列 + 合并格 + VBA 布尔
 import { summarize as summarizeFails, classifyFail } from '../lib/fail.js'
 // ★ 卡 t_8a6689dc：canonical 契约（schemaVersion）闸门 + 单元格文案的唯一实现
 import { checkResultSchema, PLUGIN_SCHEMA_VERSION } from '../lib/contract.js'
@@ -2282,22 +2282,28 @@ export default {
           return false
         }
       }
-      // ★ 2026-11-11 第六版：写之前把「合并区左上角的原值」拍下来。
-      //   用途：万一值跑到锚点上（WPS 的合并格判据六版全失效），能原样还回去。
-      //   这里不做「是不是合并区」的判断 —— 只记锚点在哪、原来是什么值。
+      // ★ 2026-11-11 第八版：写之前把「合并区候选格」整片拍下来。
+      //   不再问 WPS「锚点是谁」—— 六版全在真机上失效，退化时 Cells(1,1).Address
+      //   会返回非左上角格自己（$K$13），于是 `anchor !== self` 不成立、什么都记不下，
+      //   还原逻辑整段跳过，真机红字就是这么来的（K13 写 46344 / 读回空 / 没还回去）。
+      //   只用一个不会撒谎的事实：Rows.Count / Columns.Count。
+      //   值只可能落在本格或合并区内某一格 → 整片拍下来，就一定有落点。
       if (!w.anchorSnapped) {
         w.anchorSnapped = true
         try {
           const c0 = sheet.Cells(w.row, w.col)
           const ma0 = c0.MergeArea
-          const an0 = ma0 ? ma0.Cells(1, 1) : null
-          const anAddr0 = an0 ? String(an0.Address || '').replace(/\$/g, '') : ''
-          const selfAddr0 = String(c0.Address || '').replace(/\$/g, '')
-          if (anAddr0 && anAddr0 !== selfAddr0) {
-            w.anchorAddr = anAddr0
-            w.anchorPrev = an0.Value2
+          const rc = Number(ma0 && ma0.Rows && ma0.Rows.Count) || 1
+          const cc = Number(ma0 && ma0.Columns && ma0.Columns.Count) || 1
+          const snap = []
+          for (let r = w.row; r > w.row - rc && r >= 1; r--) {
+            for (let c = w.col; c > w.col - cc && c >= 1; c--) {
+              const cell = sheet.Cells(r, c)
+              snap.push({ addr: `${colLetter(c)}${r}`, prev: cell.Value2 })
+            }
           }
-        } catch (e) { /* 摸不到就不记，后面按普通失败处理 */ }
+          w.mergeSnap = snap
+        } catch (e) { /* 摸不到就不拍，后面按普通失败处理 */ }
       }
       const r = this.writeCell(sheet, w.row, w.col, this._cellValueOf(w))
       if (r && r.ok) {
@@ -2320,20 +2326,21 @@ export default {
       //   不依赖 WPS 任何合并字段，只问「我刚写的值现在在哪」：
       //     在锚点上 → 值跑偏了，还回原值，报「与 X 合并，这一格没写」
       //     不在锚点上 → 真的没写进去，按原路记 fail
-      if (r && r.kind !== 'com' && w.anchorAddr) {
+      if (r && r.kind !== 'com' && (w.mergeSnap || w.anchorAddr)) {
         const reverted = this._revertMergedWrite(sheet, w)
         if (reverted) {
+          const hit = reverted.addr
           st.merged = (st.merged || 0) + 1
-          if (!st.mergedEx) st.mergedEx = { row: w.row, col: colLetter(w.col), block: w.anchorAddr }
+          if (!st.mergedEx) st.mergedEx = { row: w.row, col: colLetter(w.col), block: hit }
           w.result = 'merged'
-          w.error = `与 ${w.anchorAddr} 合并`
+          w.error = `与 ${hit} 合并`
           if (w.it) {
             w.it.state = 'skip'
-            w.it.mergedInto = w.anchorAddr
+            w.it.mergedInto = hit
             w.it.failReason = w.it.failReason || 'merged'
-            w.it.text = `${String(w.it.text || '')}（与 ${w.anchorAddr} 合并，这一格没写）`
+            w.it.text = `${String(w.it.text || '')}（与 ${hit} 合并，这一格没写）`
           }
-          this.log(`R${w.row} ${colLetter(w.col)} 写进去的值跑到 ${w.anchorAddr}（合并区非左上角）→ 已还原锚点原值，跳过不写`)
+          this.log(`R${w.row} ${colLetter(w.col)} 写进去的值跑到 ${hit}（合并区非左上角）→ 已还原该格原值，跳过不写`)
           return false
         }
       }
@@ -2352,30 +2359,42 @@ export default {
     },
 
     /**
-     * 写完之后发现「读回空、但值跑到合并区左上角了」→ 把锚点还原成写前的值。
+     * 写完之后发现「读回空、但值跑到合并区某一格了」→ 把那一格还原成写前的值。
      *
-     * 这条路不依赖 WPS 的任何合并字段（MergeCells / MergeArea.Address / Row / Rows.Count
-     * 六版全在真机上失效过），只用两个事实：
-     *   ① 锚点地址（MergeArea.Cells(1,1).Address，摸不到就放弃）
-     *   ② 锚点当前的值是不是我刚写的那个值
-     * 是 → 值确实跑偏了 → 还回原值 → 调用方报「合并跳过」。
-     * 不是 → 真没写进去 → 返回 null，按普通失败走。
+     * ★ 第八版：不再依赖「锚点是谁」。
+     *   WPS 退化时 MergeArea.Cells(1,1).Address 返回非左上角格自己（$K$13），
+     *   旧版 `anAddr !== selfAddr` 不成立 → anchorAddr 记成空 → 还原整段跳过。
+     *
+     *   现在只有一个事实：值只可能落在本格或合并区内某一格。
+     *   写前把 Rows.Count × Columns.Count 那片格全拍下来（通常 2×1，成本可忽略），
+     *   写后逐格问「我刚写的值是不是在这格里」。命中 → 那一格还原 + 报「与 X 合并」。
+     *   命不中 → 真没写进去 → 返回 null，按普通失败走。
+     *
+     * mergeSnap 是逐格 w 上的（_writeOneChecked 每格各拍各的），不是全局缓存。
      */
     _revertMergedWrite(sheet, w) {
       try {
-        const an = w.anchorAddr ? sheet.Range(w.anchorAddr) : null
-        // ★ 传原始值，不要先 cellText —— 日期列写 Date、读回 46400，
-        //   一旦在这儿转成文本再比，两边永远不相等（口径交给 judgeReadback 归一化）
-        const d = shouldRevertAnchor({
-          anchorAddr: w.anchorAddr,
+        // 兼容旧快照（anchorAddr 单点）—— 老数据/老路径也不会因此失效
+        const snap = Array.isArray(w.mergeSnap) && w.mergeSnap.length
+          ? w.mergeSnap
+          : (w.anchorAddr ? [{ addr: w.anchorAddr, prev: w.anchorPrev }] : [])
+
+        // 扫描逻辑抽成纯函数（test/merge-revert 那三条必测锁的就是它）
+        const hit = findMovedValue({
+          snap,
           selfAddr: `${colLetter(w.col)}${w.row}`,
-          anchorPrev: w.anchorPrev,
-          anchorNow: an ? an.Value2 : undefined,
           want: this._cellValueOf(w),
+          readCell: (addr) => {
+            const c = sheet.Range(addr)
+            return c ? c.Value2 : undefined
+          },
         })
-        if (!d.revert) return null
-        an.Value2 = w.anchorPrev               // 还原成写前的值（undefined 就写空）
-        return { addr: w.anchorAddr, reason: d.reason }
+        if (!hit) return null
+
+        const target = sheet.Range(hit.addr)
+        if (!target) return null
+        target.Value2 = hit.prev                               // 还原成写前的值
+        return { addr: hit.addr, reason: hit.reason }
       } catch (e) {
         return null
       }

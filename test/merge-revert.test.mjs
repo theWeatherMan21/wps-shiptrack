@@ -10,7 +10,7 @@
 // 修法：复用 cellwrite.judgeReadback（内部有 sameDate 归一化），并且必须传 prev ——
 //   不传 prev，「锚点还是旧值」会被判成 format-diff 而不是 fail，导致凭空还原、抹掉用户正确值。
 
-import { shouldRevertAnchor, mergeVerdict } from '../src/lib/writeplan.js';
+import { shouldRevertAnchor, mergeVerdict, findMovedValue } from '../src/lib/writeplan.js';
 import { judgeReadback } from '../src/lib/cellwrite.js';
 
 let pass = 0, fail = 0;
@@ -121,6 +121,50 @@ console.log('⑥ 与快路径 mergeVerdict 的关系：它说可写也不等于�
     maAddr: '$L$12:$L$13', maAnchorAddr: '$L$12', maRows: 2, maCols: 1,
   });
   ok(normal.nonAnchor === true, 'MergeArea 正常时快路径直接跳过（不写、不污染、不用还原）', JSON.stringify(normal));
+}
+
+console.log('⑦ 第八版：值跑偏扫描（知澜的规格 · 真机 K13 那两格）');
+{
+  const mk = (m) => (addr) => { if (!(addr in m)) throw new Error('no cell'); return m[addr]; };
+  const SNAP = [{ addr: 'K12', prev: 'kept' }, { addr: 'K13', prev: '' }];
+
+  // ① 真机场景：K13 写 46400，值落到 K12，K13 读回空
+  const h1 = findMovedValue({ snap: SNAP, selfAddr: 'K13', want: D, readCell: mk({ K12: 46400, K13: '' }) });
+  ok(h1 && h1.addr === 'K12', 'K13 写 46400 → 扫描命中 K12', JSON.stringify(h1));
+  ok(h1 && h1.prev === 'kept', '还原用的是快照原值 kept', String(h1 && h1.prev));
+  ok(h1 && h1.reason === 'scan-hit', '理由是 scan-hit', String(h1 && h1.reason));
+
+  // ② 左上角写成功 → 本格跳过，不许误还原
+  const h2 = findMovedValue({ snap: SNAP, selfAddr: 'K12', want: D, readCell: mk({ K12: 46400, K13: '' }) });
+  ok(h2 === null, 'K12 左上角写成功 → 本格跳过，不误还原', JSON.stringify(h2));
+
+  // ③ 未合并格 → 快照只有自己 → 不命中
+  const h3 = findMovedValue({ snap: [{ addr: 'M13', prev: '' }], selfAddr: 'M13', want: D, readCell: mk({ M13: '' }) });
+  ok(h3 === null, '未合并格 M13 → 扫描不命中，不受影响', JSON.stringify(h3));
+
+  // ④ 锚点还是旧值 → 真没写进去
+  const h4 = findMovedValue({ snap: [{ addr: 'K12', prev: 'kept' }], selfAddr: 'K13', want: D, readCell: mk({ K12: 'kept' }) });
+  ok(h4 === null, '锚点还是旧值 kept → 命不中，按普通失败报', JSON.stringify(h4));
+
+  // ⑤ 文本列同样工作
+  const h5 = findMovedValue({ snap: [{ addr: 'R12', prev: 'old' }], selfAddr: 'R13', want: '放空箱 11-05', readCell: mk({ R12: '放空箱 11-05' }) });
+  ok(h5 && h5.addr === 'R12', '文本列：值跑到 R12 → 命中', JSON.stringify(h5));
+
+  // ⑥ 某格摸不到 → 跳过继续，不中断
+  const h6 = findMovedValue({
+    snap: [{ addr: 'K11', prev: '' }, { addr: 'K12', prev: 'kept' }], selfAddr: 'K13', want: D,
+    readCell: (addr) => { if (addr === 'K11') throw new Error('COM 摸不到'); return 46400; },
+  });
+  ok(h6 && h6.addr === 'K12', '某格摸不到 → 跳过继续找', JSON.stringify(h6));
+
+  // ⑦ 空快照 / 无值 → null，绝不抛
+  ok(findMovedValue({ snap: [], selfAddr: 'K13', want: D }) === null, '空快照 → null');
+  ok(findMovedValue({ snap: SNAP, selfAddr: 'K13', want: '' }) === null, '没有要写的值 → null');
+  ok(findMovedValue({}) === null, '全空 → null');
+
+  // ⑧ $ 前缀 / 大小写不影响
+  const h8 = findMovedValue({ snap: [{ addr: '$k$12', prev: 'kept' }], selfAddr: ' k13 ', want: D, readCell: mk({ '$k$12': 46400 }) });
+  ok(h8 && h8.addr === '$k$12', '$ / 空格 / 大小写不影响匹配', JSON.stringify(h8));
 }
 
 console.log(`\n${fail ? '✗' : '✓'} ${pass} 通过 / ${fail} 失败`);

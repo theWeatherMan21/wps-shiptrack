@@ -203,3 +203,44 @@ export function shouldRevertAnchor({ anchorAddr, selfAddr, anchorPrev, anchorNow
   }
   return { revert: true, reason: 'value-moved-to-anchor' };
 }
+
+/**
+ * 值跑偏扫描：在「写前快照的那片格」里找出「我刚写的值落到了哪一格」。
+ *
+ * 为什么这么问：WPS 的合并区字段（MergeCells / MergeArea.Address / Row / Rows.Count）
+ * 六版全在真机上失效，问不出「锚点是谁」——退化时 Cells(1,1).Address 会返回
+ * 非左上角格自己（$K$13），旧版 `anchor !== self` 不成立，快照记成空，还原整段跳过。
+ *
+ * 但有个不会撒谎的事实：**值只可能落在本格或合并区内某一格**。
+ * 所以写前把 Rows.Count × Columns.Count 那片格全拍下来（通常 2×1，成本可忽略），
+ * 写后逐格问「我刚写的值是不是在这格里」。命中那一格就是落点。
+ *
+ * @param {object} o
+ * @param {Array<{addr:string, prev:any}>} o.snap   写前快照（含本格也无妨，本格会被跳过）
+ * @param {string} o.selfAddr                       本格地址（如 'K13'）
+ * @param {any}    o.want                           我刚写的值（Date / number / string）
+ * @param {(addr:string)=>any} o.readCell           读某格当前值（COM 摸不到可抛错）
+ * @returns {{addr:string, prev:any, reason:string}|null} 命中返回落点，没命中返回 null
+ */
+export function findMovedValue({ snap, selfAddr, want, readCell } = {}) {
+  if (!Array.isArray(snap) || !snap.length) return null;
+  if (want === undefined || want === null || String(want).trim() === '') return null;
+
+  const norm = (x) => String(x == null ? '' : x).replace(/\$/g, '').replace(/\s/g, '').toUpperCase();
+  const self = norm(selfAddr);
+
+  for (const s of snap) {
+    if (!s || !s.addr) continue;
+    if (norm(s.addr) === self) continue;          // 本格跳过：它读回空正是「没写进去」的依据
+
+    let back;
+    try { back = readCell ? readCell(s.addr) : undefined } catch (e) { continue; }
+
+    // ★ 口径复用 judgeReadback：日期写 Date、读回 46400 必须认成同一天，裸文本比永不相等
+    if (judgeReadback({ prev: undefined, back, want }) !== 'ok') continue;
+
+    return { addr: s.addr, prev: s.prev, reason: 'scan-hit' };
+  }
+
+  return null;
+}
