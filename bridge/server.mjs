@@ -36,7 +36,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 // Windows 上不能直接 import('C:\\a\\b.mjs')（ESM 只认 file:// URL）——统一走这个
 const dynImport = (p) => import(pathToFileURL(p).href);
 const REPO = process.env.SSH_REPO
-  || path.resolve(os.homedir(), 'Documents', 'trae_projects', 'ShipScheduleHub');
+  || path.resolve(os.homedir(), 'dev', 'ShipScheduleHub');
 // 可用 WPS_TRACK_CLI 覆盖 —— 端到端测试要注入假 CLI，验证「参数从入口到出口」真的传下去了
 const CLI = process.env.WPS_TRACK_CLI || path.join(REPO, 'engine/tracking/cli.mjs');
 // ★ 数值配置统一走 ./timeouts.mjs（纯函数、可单测）：
