@@ -52,16 +52,60 @@
       </div>
     </div>
 
-    <!-- 三步：选单号列 → 选输出列 → 刷新 -->
-    <div class="row">
-      <button @click="pickNumberCol">① 选单号列</button>
-      <button @click="pickOutputCol">② 选输出列</button>
-      <button @click="pickCarrierCol" class="mini-btn">船司列（可选）</button>
-      <button @click="pickVesselCol" class="mini-btn" :title="'选中船名（如 MSC LONSON）那一列再点'">船名列（可选）</button>
-      <button @click="pickVoyageCol" class="mini-btn" :title="'选中航次（如 GA645W）那一列再点'">航次列（可选）</button>
-      <button @click="refresh(true)" :disabled="busy || !ready">③ 立即刷新</button>
+    <!-- ★ t_a72fba24：默认只留「一行识别结果 + 立即查询」，选列控件收进「更多设置」。
+         船司列控件已删除（认出单号形态就知道是哪家，不用问）。 -->
+    <div class="row auto">
+      <span class="auto-state">
+        <span class="dot" :class="bridge ? 'ok' : 'bad'"></span>
+        <template v-if="detecting">正在识别列…</template>
+        <template v-else-if="detected && detected.ok">
+          识别到：单号 <b>{{ colLetter(detected.numberCol) }}</b> 列
+          → 输出 <b>{{ colLetter(detected.outCol) }}</b>
+          <template v-if="detected.vesselCol">
+            · <template v-if="detected.vesselMode === 'single'">船名航次同格 <b>{{ colLetter(detected.vesselCol) }}</b></template>
+            <template v-else>船名 <b>{{ colLetter(detected.vesselCol) }}</b><template v-if="detected.voyageCol"> / 航次 <b>{{ colLetter(detected.voyageCol) }}</b></template></template>
+          </template>
+          · {{ cfg.rows || detected.sampleRows }} 行
+          <span v-if="detected.tier === 'preview'" class="tier-warn">（首次会先预览，你点头才写）</span>
+          <span v-else-if="detected.tier === 'manual'" class="tier-warn">（认不准，「更多设置」里手动选）</span>
+        </template>
+        <template v-else-if="detected">没识别出列 → 在「更多设置」里手动选</template>
+        <template v-else>打开一张表，自动识别列</template>
+      </span>
+      <button @click="refresh(true)" :disabled="busy || !ready">立即查询</button>
       <button @click="stop" :disabled="!hasRunning">停止</button>
+      <button class="mini-btn" @click="moreOpen = !moreOpen">{{ moreOpen ? '收起设置 ▴' : '更多设置 ▾' }}</button>
       <button v-if="pendingWrites.length" class="mini-btn pending-btn" :title="`暂存了 ${pendingWrites.length} 行结果：查询中切走的那几张表，切回来点这里一次写回`" @click="flushPending">补齐回填 {{ pendingWrites.length }}</button>
+    </div>
+    <div v-if="detected && detected.fixes && detected.fixes.length" class="auto-fix">
+      <span v-for="(f, i) in detected.fixes" :key="i">{{ f }}</span>
+    </div>
+
+    <!-- ★ 中置信首次：结果只在面板预览，一格都不写（写错会被下一轮当已有值读回去，错会自我繁殖） -->
+    <div v-if="previewAsk" class="previewbar">
+      <div class="pb-hd">识别结果先给你看一眼 —— 表格一格都还没写：<b>{{ previewAskTextShow() }}</b></div>
+      <div class="sb-btns">
+        <button class="mini pb-go" @click="confirmPreview">就对</button>
+        <button class="mini" @click="cancelPreview">先不写</button>
+      </div>
+    </div>
+
+    <!-- ★ 格式变了才提示一次（一致就静默；行数变多不算变） -->
+    <div v-if="cfgConflict" class="conflictbar">
+      <div><b>格式好像变了</b>：{{ cfgConflict.text }}。按新的来？</div>
+      <div class="sb-btns">
+        <button class="mini pb-go" @click="useNewDetect">按新的</button>
+        <button class="mini" @click="keepOldDetect">沿用旧的</button>
+      </div>
+    </div>
+
+    <!-- 更多设置：猜错才展开（原来那 5 个按钮） -->
+    <div class="row" v-if="moreOpen">
+      <button @click="pickNumberCol">选单号列</button>
+      <button @click="pickOutputCol">选输出列</button>
+      <button @click="pickVesselCol" class="mini-btn" :title="'选中船名（如 MSC LONSON）那一列再点'">船名列</button>
+      <button @click="pickVoyageCol" class="mini-btn" :title="'选中航次（如 GA645W）那一列再点'">航次列</button>
+      <button @click="detectNow({ force: true })" class="mini-btn" :disabled="detecting">重新识别</button>
     </div>
 
     <!-- ★ 0.9.45 批次条：主区域只留「在跑 / 当前」那一条；跑完的（完成 / 已停）收进「历史 N」默认折叠；
@@ -220,6 +264,8 @@ import { decideBeforeRun, summarizeRun, shouldClaim } from '../lib/jobguard.js' 
 // ★ 11-03 爹地原话「写入 ETD/ETA，请加一个按钮来确认吧，不要静默替换」：
 //   船期写回的判据与文案全在 lib/schedask.js（纯函数 + 可单测），组件只负责收集 / 出条 / 确认后写。
 import { decideScheduleWrite, shortDateText, summarizeAsk } from '../lib/schedask.js'
+// ★ t_a72fba24：识别结果的落 cfg 规则（纯函数，可单测）：样本规整 / 首认知情 / 变化检测
+import { sampleToMatrix, cfgFromDetection, compareToConfirmed, needsPreview, previewText, positionsOf } from '../lib/detectcols.js'
 
 const colLetter = (n) => {
   let s = ''
@@ -263,6 +309,15 @@ export default {
       pendingWrites: [],   // ★ 10-28：切表期间查到的结果先攒着，切回来点「补齐回填」再写，不整轮作废
       diag: '',
       cfg: { numberCol: 0, outCol: 0, startRow: 0, rows: 0, mode: 'column', carrierCol: 0, polCol: 0, podCol: 0, vesselCol: 0, voyageCol: 0 },
+      // ★ t_a72fba24：行列自动识别。detected = 最近一次识别结果；detectedSig = 签名（比变化用）
+      detected: null,
+      detectedSig: '',
+      detecting: false,
+      // ★ 中置信首次：结果只在面板预览，一格都不写，等他一键「就对」
+      previewAsk: null,     // { batchId, numCol, outCol, rows }
+      // ★ 每次识别 vs 上次确认配置：列变了才提示一次
+      cfgConflict: null,    // { text, det }
+      moreOpen: false,      // 「更多设置 ▾」是否展开（默认收起，猜错才展开）
       scan: null,
       readVia: '',
       writeVia: '',
@@ -779,6 +834,8 @@ export default {
       this.cfg = { numberCol: 0, outCol: 0, startRow: 0, rows: 0, mode: 'column', carrierCol: 0, polCol: 0, podCol: 0, vesselCol: 0, voyageCol: 0 }
       this.scan = null
       this.loadCfg()
+      // ★ t_a72fba24：切到新表自动识别一次（签名没变时 applyDetection 不覆盖用户手改的列）
+      this.detectNow()
       const mine = this.latestForDoc(d)
       this.viewBatchId = mine ? mine.id : ''
     },
@@ -986,7 +1043,7 @@ export default {
         const sheet = this.app().ActiveSheet
         if (this.runningForDoc(this.docKey()).length) this.log('这张表正在查询：改配置只影响下一轮，本轮按开始时快照跑')
         const { r1, r2, how, mode } = this.resolveRange(s, sheet)
-        this.cfg = { ...this.cfg, numberCol: s.col, startRow: r1, rows: Math.max(1, r2 - r1 + 1), mode }
+        this.cfg = { ...this.cfg, numberCol: s.col, startRow: r1, rows: Math.max(1, r2 - r1 + 1), mode, detManual: true, detConfirmed: null }
         this.saveCfg()
         this.log(`单号列 = ${colLetter(s.col)} · 第 ${r1}–${r2} 行（${how}）`)
         this.scan = null
@@ -1035,7 +1092,7 @@ export default {
         //   同列时回填只写一次拼接值，不会互相覆盖 —— 这里只提示一句，不拦。
         const other = field === 'vesselCol' ? this.cfg.voyageCol : this.cfg.vesselCol
         const sameCol = Number(other || 0) === Number(s.col)
-        this.cfg = { ...this.cfg, [field]: s.col }
+        this.cfg = { ...this.cfg, [field]: s.col, detManual: true, detConfirmed: null }
         this.saveCfg()
         this.log(sameCol
           ? `${label}列 = ${colLetter(s.col)}（和另一列同一格 → 回填「船名 航次」一次写进去）`
@@ -1133,6 +1190,145 @@ export default {
       } else if (needPort) {
         this.log('表头没认出 POL/POD → 改用事件本身推断起讫港（兜底）')
       }
+    },
+
+    // ══ ★ t_a72fba24：行列自动识别（表头语义 + 内容特征 + 同格/分格 + 置信分层）══
+    // 架构约束：桥是 Node 读磁盘，WPS 里未保存的表它看不见 → 样本只能由这里用 COM 读出来喂过去。
+    // 规则库在桥侧（bridge/detect-columns.mjs + engine/tracking/detect.mjs），插件不另写一份。
+    colLetter(n) {
+      let s = ''
+      let x = Number(n) || 0
+      while (x > 0) { const m = (x - 1) % 26; s = String.fromCharCode(65 + m) + s; x = Math.floor((x - 1) / 26) }
+      return s
+    },
+
+    /** 一次 COM 读 A1:AZ30（30 行 × 52 列），转成二维字符串矩阵 */
+    readSampleGrid(sheet, maxRows = 30, maxCols = 52) {
+      const a1 = `A1:${this.addr(maxRows, maxCols)}`
+      let raw = null
+      try { raw = sheet.Range(a1).Value2 } catch (e) {
+        this.log('读样本失败：' + String((e && e.message) || e).slice(0, 80))
+        return []
+      }
+      if (raw == null) return []
+      const str = (v) => (v == null ? '' : (typeof v === 'string' ? v : String(v)))
+      if (!Array.isArray(raw)) return [[str(raw)]]
+      if (Array.isArray(raw[0])) return raw.map((r) => (Array.isArray(r) ? r.map(str) : [str(r)]))
+      return [raw.map(str)]      // 一维 = 只有一行，WPS 在单行选区会这么返回
+    },
+
+    /** 识别当前表 → 填 cfg。force=true 时即使签名没变也覆盖用户手选 */
+    async detectNow({ force = false } = {}) {
+      if (this.detecting || !this.bridge) return null
+      let sheet = null
+      try { sheet = this.app().ActiveSheet } catch (e) { return null }
+      if (!sheet) return null
+      this.detecting = true
+      try {
+        const rows = this.readSampleGrid(sheet, 30, 52)
+        if (!rows.length || !rows[0] || !rows[0].length) {
+          this.detected = null
+          this.log('表是空的，没东西可识别')
+          return null
+        }
+        const r = await this.httpPost('/detect-columns', { rows, sheet: sheet.Name }, 12000)
+        if (!r || !r.ok) {
+          this.detected = { ok: false, reason: (r && (r.reason || r.error)) || '识别失败' }
+          this.log('识别失败：' + this.detected.reason)
+          return null
+        }
+        this.detected = r
+        this.log('自动识别：' + (r.reason || '') + (r.fixes && r.fixes.length ? '；' + r.fixes.join('；') : ''))
+        this.applyDetection(r, { force })
+        return r
+      } finally {
+        this.detecting = false
+      }
+    },
+
+    /**
+     * 识别结果 → cfg。三条硬规矩：
+     *   ① 行数**按整表**算（识别只看前 30 行样本，sampleRows 不能当查询范围）
+     *   ② 认出的列原样落到 cfg（认 B 就写 B），并且 store 一份「确认位置」给下次比对
+     *   ③ 手工覆盖过列（detManual）就不再被自动识别盖掉，除非显式 force
+     */
+    applyDetection(det, { force = false } = {}) {
+      if (!det || !det.ok || !det.numberCol) return null
+      const sig = `${det.numberCol}|${det.outCol}|${det.vesselCol}|${det.voyageCol}|${det.vesselMode}`
+      const prev = this.detectedSig
+      if (!force && this.cfg.detManual) return null            // 人手动选过 → 不抢
+      if (!force && prev === sig && this.cfg.numberCol > 0 && this.cfg.rows > 0) return null
+
+      let sheet = null
+      try { sheet = this.app().ActiveSheet } catch (e) { sheet = null }
+      const startRow = Math.max(1, Number(det.startRow) || 1)
+      let rows = 0
+      try {
+        if (sheet) {
+          const usedLast = this.usedLastRow(sheet)
+          const last = this.numberLastRow(sheet, usedLast, det.numberCol)
+          rows = Math.max(1, last - startRow + 1)
+        }
+      } catch (e) { rows = 0 }
+      if (!rows) rows = Math.max(1, Number(det.sampleRows) || 1)
+
+      const patch = cfgFromDetection(det, { startRow, rows })
+      if (!patch) return null
+      this.cfg = { ...this.cfg, ...patch, detManual: false }
+      this.detectedSig = sig
+      this.saveCfg()
+      if (prev && prev !== sig) this.log(`表格式变了（${prev} → ${sig}），已按新的来；不对可在「更多设置」里改`)
+      return this.cfg
+    },
+
+    /** 预览条上的文案：「单号 B 列 · 输出 K 列 · 12 行」 */
+    previewAskTextShow() { return this.previewAsk ? previewText(this.previewAsk) : '' },
+
+    /**
+     * 「就对」：把预览里的结果真正写进表格，并把这张表的格式记为确认配置。
+     * 不再重查一遍 —— 结果是刚查回来的，再查一次既慢又可能被站点限流。
+     */
+    confirmPreview() {
+      const p = this.previewAsk
+      if (!p) return
+      this.previewAsk = null
+      const b = this.batchById(p.batchId)
+      if (!b) return
+      b.preview = false
+      const outCol = b.cfg.outCol
+      let n = 0
+      for (const it of b.items) {
+        if (!it.number || it.state === 'skip' || it.state === 'querying' || it.state === 'idle' || it.state === 'pending') continue
+        if (it.keptOld) continue
+        this.writeResult(b, it, b.sheet, it.row, outCol)
+        n++
+      }
+      // 存为该 doc+sheet 的确认配置：之后每次识别只要结果一致就静默直写
+      const pos = positionsOf(this.detected)
+      if (pos && pos.numberCol) this.cfg = { ...this.cfg, detConfirmed: pos, detTier: 'auto' }
+      this.saveCfg(b.doc)
+      this.log(`预览确认：写入 ${n} 行；这张表的格式已记为确认配置（之后直接写，不再问）`)
+    },
+
+    /** 「先不写」：一格都不动，也不记确认配置（下次还是先预览） */
+    cancelPreview() {
+      this.previewAsk = null
+      this.log('预览没确认：表格一格都没写')
+    },
+
+    /** 格式变了 → 按新的来：用新识别的列，继续本轮查询 */
+    useNewDetect() {
+      const c = this.cfgConflict
+      this.cfgConflict = null
+      if (c && c.det) this.applyDetection(c.det, { force: true })
+      this.refresh(true, { skipDetect: true })
+    },
+
+    /** 格式变了 → 沿用旧的：按已确认的列继续，别乱改他的表 */
+    keepOldDetect() {
+      this.cfgConflict = null
+      this.log('沿用旧的列配置（本次不按新识别的来）')
+      this.refresh(true, { skipDetect: true })
     },
 
     // 表头自动认列：S/L、船司、船公司、CARRIER
@@ -2100,7 +2296,7 @@ export default {
       try {
         const s = this.readSel()
         if (this.cfg.numberCol === 0) {
-          this.cfg = { ...this.cfg, outCol: s.col }
+          this.cfg = { ...this.cfg, outCol: s.col, detManual: true, detConfirmed: null }
           this.saveCfg()
           this.panelErr = ''
           this.log(`输出列 = ${colLetter(s.col)}（等单号列选好再跑）`)
@@ -2382,9 +2578,24 @@ export default {
       const a = this.app()
       const sheet = a && a.ActiveSheet
       const doc = this.docKey()
-      if (!this.ready) {
-        this.flash('先点 ① 选单号列、② 选输出列')
+      if (!sheet) {
+        this.panelErr = '没有活动工作表'
         return
+      }
+      // ★ t_a72fba24 第一条铁律：**每次**都重新识别（一次 COM 读 30 行，毫秒级）。
+      //   · 和存下的确认配置一致 → 静默，直接查直接写（零点击）
+      //   · 不一致 → 只提示一次「格式好像变了」，等他点「按新的 / 沿用旧的」
+      //   · 行数变多不算变化（新增订单是常态，不打扰）
+      if (!opts.skipDetect) {
+        const det = await this.detectNow()
+        if (det && det.ok) {
+          const diff = compareToConfirmed(this.cfg, det)
+          if (diff.changed) { this.cfgConflict = { text: diff.text, det }; return }
+        }
+        if (!this.ready) {
+          this.flash('没认出列来，展开「更多设置」手动选单号列和输出列')
+          return
+        }
       }
       if (this.cfg.outCol === this.cfg.numberCol) {
         this.panelErr = '配置异常：输出列和单号列是同一列，拒绝执行（会覆盖提单号）'
@@ -2469,6 +2680,9 @@ export default {
       const cfgSnap = { ...this.cfg }
       this.writeAcc = { ok: 0, fail: 0, miss: 0, runs: 0, cells: 0, fills: 0, ms: 0 }   // 本轮写回账本从零开始
       const b = this.newBatch({ doc, sheet, cfg: cfgSnap, items, queue: todo, kind: opts.auto ? 'auto' : 'run', manual })
+      // ★ 中置信首次（0.4–0.8 且这张表还没确认过）→ 本轮只预览，一格都不写
+      b.preview = needsPreview(this.cfg, this.detected)
+      if (b.preview) this.log('这张表是首次识别（中置信）→ 本轮只预览结果，不写表格；你点「就对」才写')
       b.capErr = capErr
       b.outSnap = outSnap
       b.colSnap = colSnap
@@ -2589,6 +2803,14 @@ export default {
       b.state = b.stop ? 'stopped' : 'done'
       this.publishBatches()
       this.log(`第 ${b.seq} 批（${b.doc}）汇总：${b.summary}`)
+      // ★ 预览批次收尾：告诉他「认成这样、几行」，点「就对」才写
+      if (b.preview) {
+        const n = b.items.filter((x) => x.number && x.state !== 'skip' && x.state !== 'querying' && x.state !== 'idle').length
+        if (n) {
+          this.previewAsk = { batchId: b.id, numCol: b.cfg.numberCol, outCol: b.cfg.outCol, rows: n }
+          this.log(`预览：${n} 行结果等你确认（表格一格都还没写）`)
+        }
+      }
       // ★ 11-03：船期变更在这一批收尾时才交出去（自动写 or 出确认条）——绝不在查询途中写日期
       try { this.settleSchedule(b) } catch (e) { this.log('船期确认条异常: ' + ((e && e.message) || e)) }
       this.scheduleRetry(b)
@@ -3262,6 +3484,9 @@ export default {
     writeResult(batch, it, sheet, row, outCol, definitiveNow) {
       const b = batch || this.vb
       if (b && b.capErr) return
+      // ★ 中置信首次：结果只留在面板上，**一格都不写**。
+      //   写错的格下一轮会被当「已有值」读回去，错会自我繁殖 —— 所以宁可不写。
+      if (b && b.preview) { it.previewOnly = true; return }
       // ★ 0.9.43：切表**不再**在这里分流 —— 一律入队，由 _flushWriteQueue 判断这张表现在能不能写：
       //   能（这个 WPS 版本摸得到非活动表）就直接写进去；不能就自动攒进待补队列，切回来自动补。
       //   这样「(a) 还是 (b)」由运行现场自己回答，代码不用等实测就知道该走哪条路。
@@ -3448,6 +3673,12 @@ export default {
 .step.todo b { color: #8a6d00; }
 .step.idle { background: #fafafa; color: #888; }
 .row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+/* ★ t_a72fba24：默认那一行 = 识别摘要 + 立即查询，选列控件收进「更多设置」 */
+.row.auto { align-items: center; gap: 8px; }
+.auto-state { flex: 1 1 100%; display: flex; align-items: center; gap: 6px; font-size: 12px; color: #333; padding: 2px 0 4px; }
+.auto-state .dot { flex: 0 0 auto; }
+.auto-fix { margin: -4px 0 8px; font-size: 11px; color: #8a6d3b; display: flex; flex-direction: column; gap: 2px; }
+.tier-warn { color: #a15c00; }
 button { font-size: 12px; padding: 4px 8px; border: 1px solid #c8ccd4; border-radius: 4px; background: #f7f8fa; cursor: pointer; }
 button:disabled { opacity: .45; cursor: default; }
 .mini { font-size: 11px; padding: 2px 6px; margin: 4px 4px 0 0; }
@@ -3524,6 +3755,17 @@ tr.skip td { color: #aaa; }
 button.bchip { font-family: inherit; line-height: 1.4; }
 .bchips.more { margin-top: -2px; padding-left: 8px; border-left: 2px solid #e6e9ef; }
 .hist-more { font-size: 10px; align-self: center; }
+/* ★ 11-11 行列自动识别：默认面板就一行 + 一个按钮，猜错才展开 */
+.auto { align-items: center; }
+.auto-state { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; font-size: 11.5px; color: #333; }
+.tier-warn { color: #a15c00; }
+.auto-fix { display: flex; flex-direction: column; gap: 2px; margin: 2px 0 8px; font-size: 11px; color: #888; line-height: 1.5; }
+.previewbar { margin: 6px 0 8px; padding: 8px 10px; border: 1px solid #9dbdf7; border-left: 4px solid #2f6df6;
+  background: #f4f8ff; border-radius: 8px; font-size: 12px; color: #1b3f7a; }
+.pb-hd { margin-bottom: 4px; }
+.mini.pb-go { background: #2f6df6; border-color: #2f6df6; color: #fff; font-weight: 700; }
+.conflictbar { margin: 6px 0 8px; padding: 8px 10px; border: 1px solid #f0c36d; border-left: 4px solid #d98b00;
+  background: #fffdf3; border-radius: 8px; font-size: 12px; color: #5b4300; }
 /* ★ 11-03 ETD/ETA 回填确认条（爹地要的按钮：不许静默替换） */
 .schedbar { margin: 6px 0 8px; padding: 8px 10px; border: 1px solid #f0c36d; border-left: 4px solid #d98b00;
   background: #fffdf3; border-radius: 8px; font-size: 12px; color: #5b4300; }

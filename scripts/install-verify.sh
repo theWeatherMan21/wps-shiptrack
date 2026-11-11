@@ -51,4 +51,15 @@ mkdir -p "$HOME/.hermes/wps-shiptrack"
 printf '{"version":"%s","installedAt":"%s","dir":"%s"}\n' \
   "$VER" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$J/$ADDON_NAME" > "$HOME/.hermes/wps-shiptrack/installed.json"
 
-echo "✅ 装机完成并校验通过：$ADDON_NAME · v$VER · 入口 $IDX"
+echo "✅ 装机完成并校验通过：$ADDON_NAME · v${VER} · 入口 ${IDX}"
+
+echo "== 6) 宿主机进程检查（第四种「装了没生效」：进程比装机还老）=="
+WPID=$(pgrep -x wpsoffice 2>/dev/null | head -1)
+if [ -n "$WPID" ]; then
+  WSTART=$(ps -o lstart= -p "$WPID" 2>/dev/null | sed 's/^ *//')
+  echo "⚠️  WPS 正在运行（PID ${WPID}，启动于 ${WSTART}）"
+  echo "   它加载的是本次装机【之前】那份插件 —— 关窗口无效，必须完全退出（Cmd+Q / 菜单「退出」）再打开。"
+  echo "   判据：面板右下角版本号应显示 v${VER}，不是旧版本。"
+else
+  echo "   WPS 没在运行 —— 下次打开会用新插件，无需重启。"
+fi

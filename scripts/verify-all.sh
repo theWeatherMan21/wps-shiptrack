@@ -47,6 +47,10 @@ run "单测：自更新降级保护"  "$ADDON" node test/update-guard.test.mjs
 # ★ 10-30：读回校验的三种列型都不许判 fail（日期列/数值列误报「表可能被保护」的红条正身）
 run "不变量：写回读回判定"    "$ADDON" node test/cellwrite.test.mjs
 run "单测：表头识别"        "$ADDON" node scripts/headers-test.mjs
+# ★ 11-11 卡 t_a72fba24：Excel 行列自动识别（夹具矩阵 + 置信分档 + 变化检测 + 桥端到端）
+run "单测：Excel 行列识别"   "$ADDON" node test/detect-columns.test.mjs
+run "单测：识别粘合层"       "$ADDON" node test/detectcols-lib.test.mjs
+run "探针：桥 /detect-columns" "$ADDON" node test/detect-columns-e2e.mjs
 run "单测：ribbon"          "$ADDON" node scripts/ribbon-test.mjs
 # ★ 卡 t_8a6689dc：canonical 契约（schemaVersion）—— 闸门纯函数 + 桥真进程端到端
 run "单测：契约闸门"        "$ADDON" node test/schema.test.mjs

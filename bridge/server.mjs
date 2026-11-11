@@ -12,6 +12,7 @@
 //   POST /config {doc,cfg}             -> 存列设置
 //   GET /carriers                      -> 支持哪些船司（识别规则表 + 已装适配器）
 //   GET /identify?number=XXX           -> 只做离线识别（船司归属），不联网
+//   POST /detect-columns {rows,sheet}  -> Excel 行列自动识别（表头语义 + 内容特征 + 同格/分格 + 置信分档）
 //   GET /track?number=XXX[&carrier=]   -> 真查询，返回归一化结果；[&timeout=120000]
 //   GET /track-batch?numbers=a,b,c     -> 批量查（同船司串行 / 跨船司并行），NDJSON 流式回传每行结果
 //
@@ -440,6 +441,46 @@ const server = http.createServer(async (req, res) => {
       const d = await detector();
       return send(res, 200, { ok: true, number, ...d.detectCarrier(number), shape: d.describeShape(number) });
     } catch (e) { return send(res, 200, { ok: false, number, error: String(e.message || e) }); }
+  }
+
+  // ★ 2026-11-11（卡 t_a72fba24）：Excel 行列自动识别
+  //   样本由插件用 COM 读 A1:AZ30 后 POST 进来（桥读磁盘文件拿到的是未保存前的旧版，不能用）。
+  //   规则库在桥侧：detect-columns.mjs（表头词表）+ engine/tracking/detect.mjs→identify.mjs（单号校验）。
+  if (url.pathname === '/detect-columns' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (b) => {
+      body += b;
+      // 30 行 × 52 列 × 每格 ≤ 64 字符 → 上限 1MB 足够，超了就是被塞东西
+      if (body.length > 1024 * 1024) { try { req.destroy(); } catch (e) {} send(res, 413, { ok: false, error: '样本太大（>1MB）' }); }
+    });
+    req.on('end', async () => {
+      try {
+        const j = JSON.parse(body || '{}');
+        const rows = Array.isArray(j.rows) ? j.rows : [];
+        if (!rows.length) return send(res, 400, { ok: false, error: '缺 rows（插件读出的 A1:AZ30 样本）' });
+        const mod = await dynImport(path.join(HERE, 'detect-columns.mjs'));
+        // 内容校验器：detectCarrier 判归属 + containerCheck 判箱号校验位（单一事实来源在 engine/tracking/identify.mjs）
+        let idmod = null, ruleSource = '形态兜底（引擎不可用）';
+        try {
+          const d = await detector();
+          const id = await dynImport(path.join(REPO, 'engine/tracking/identify.mjs'));
+          idmod = { detectCarrier: d.detectCarrier, containerCheck: id.containerCheck };
+          ruleSource = 'engine/tracking/identify.mjs';
+        } catch (e) {
+          console.error('[detect-columns] 识别器不可用，按纯形态判:', String(e.message || e).slice(0, 120));
+        }
+        const det = mod.detectColumns({
+          rows,
+          sheet: String(j.sheet || ''),
+          headerRow: typeof j.headerRow === 'number' ? j.headerRow : undefined,
+          identify: idmod,
+        });
+        return send(res, 200, { ok: true, ...det, ruleSource });
+      } catch (e) {
+        return send(res, 200, { ok: false, error: String(e.message || e) });
+      }
+    });
+    return;
   }
 
   if (url.pathname === '/track') {

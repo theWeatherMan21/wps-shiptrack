@@ -46,14 +46,16 @@ await page.goto(`http://127.0.0.1:${port}/index.html`, { waitUntil: 'networkidle
 await page.waitForTimeout(1500);
 
 const checks = [];
-const need = ['选单号列', '选输出列', '立即刷新'];
+const need = ['立即查询', '停止', '更多设置'];
 for (const label of need) {
   const ok = await page.getByRole('button', { name: new RegExp(label) }).count() > 0;
   checks.push([`按钮「${label}」存在`, ok]);
 }
 
-// 关键一步：点「选单号列」→ 触发 detectHeaderCols / 模板里的港口列显示（colLetter 那次就崩在这里）
+// 关键一步：展开「更多设置」→ 点「选单号列」→ 触发 detectHeaderCols / 港口列显示（colLetter 那次就崩在这里）
 try {
+  await page.getByRole('button', { name: /更多设置/ }).click({ timeout: 8000 });
+  await page.waitForTimeout(200);
   await page.getByRole('button', { name: /选单号列/ }).click({ timeout: 8000 });
   await page.waitForTimeout(1200);
   checks.push(['点「选单号列」后面板仍存活', !errors.length]);

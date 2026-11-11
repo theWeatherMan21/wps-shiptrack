@@ -86,10 +86,24 @@ async function open(opts = {}) {
   await page.waitForTimeout(500)
   return { ctx, page, errs }
 }
-const click = (p, re) => p.getByRole('button', { name: re }).click()
+// ★ 11-11（t_a72fba24）：面板瘦身后「选单号列 / 选输出列」收进了「更多设置 ▾」，
+// 探针照旧点这些按钮 —— 找不到就先展开「更多设置」再点一次（面板结构变了，行为不变）。
+const click = async (p, re) => {
+  const btn = p.getByRole('button', { name: re })
+  try {
+    await btn.first().click({ timeout: 4000 })
+  } catch (e) {
+    const more = p.getByRole('button', { name: /更多设置/ })
+    if (await more.count()) {
+      await more.first().click({ timeout: 4000 }).catch(() => {})
+      await p.waitForTimeout(150)
+    }
+    await btn.first().click({ timeout: 4000 })
+  }
+}
 // 按 ③ 开跑；按钮不可用（配置没齐/正在跑）时静默跳过
 const tryRun = async (p) => {
-  try { await p.getByRole('button', { name: /③ 立即刷新/ }).click({ timeout: 3000, force: true }) } catch (e) { /* 跳过 */ }
+  try { await p.getByRole('button', { name: /立即查询|③ 立即刷新/ }).click({ timeout: 3000, force: true }) } catch (e) { /* 跳过 */ }
   await p.waitForTimeout(300)
 }
 const waitIdle = async (p, ms = 12000) => {
@@ -97,7 +111,7 @@ const waitIdle = async (p, ms = 12000) => {
   while (Date.now() - t0 < ms) {
     await p.waitForTimeout(200)
     const busy = await p.evaluate(() => {
-      const b = [...document.querySelectorAll('button')].find((x) => x.textContent.includes('立即刷新'))
+      const b = [...document.querySelectorAll('button')].find((x) => /立即查询|立即刷新/.test(x.textContent))
       return b ? b.disabled : false
     })
     if (!busy) return

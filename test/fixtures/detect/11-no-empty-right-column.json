@@ -1,0 +1,62 @@
+{
+ "name": "右侧没有空列 → 覆盖写右边第一个「非语义」列（状态列 C），并在 fixes 写明",
+ "sheet": "窄表",
+ "expect": {
+  "headerRow": 0,
+  "numberCol": 2,
+  "outCol": 3,
+  "vesselCol": 4,
+  "vesselMode": "single",
+  "fixHas": "覆盖写"
+ },
+ "rows": [
+  [
+   "序号",
+   "提单号",
+   "状态",
+   "船名航次",
+   "起运港",
+   "目的港"
+  ],
+  [
+   "1",
+   "TESTMAE0123457",
+   "未查",
+   "MSC LONSON GA645W",
+   "SHANGHAI",
+   "GDANSK"
+  ],
+  [
+   "2",
+   "TESTCOS012345",
+   "未查",
+   "MSC LONSON GA645W",
+   "SHANGHAI",
+   "GDANSK"
+  ],
+  [
+   "3",
+   "TESTEGL0123456",
+   "未查",
+   "MSC LONSON GA645W",
+   "SHANGHAI",
+   "GDANSK"
+  ],
+  [
+   "4",
+   "TESTONE0123456",
+   "未查",
+   "MSC LONSON GA645W",
+   "SHANGHAI",
+   "GDANSK"
+  ],
+  [
+   "5",
+   "TESTHLC0123456",
+   "未查",
+   "MSC LONSON GA645W",
+   "SHANGHAI",
+   "GDANSK"
+  ]
+ ]
+}
