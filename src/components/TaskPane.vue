@@ -224,6 +224,7 @@
       <summary>诊断 / 日志</summary>
       <pre>{{ diag }}</pre>
       <button class="mini" @click="diagDump">重新体检</button>
+      <button class="mini" @click="probeMerge" title="把输出列每一行的 MergeCells / MergeArea / Address 全打出来 —— 判据到底该用哪个值，看数据说话">合并格探针</button>
       <button class="mini" @click="exportWriteFails" :title="`最近 ${writeFailLog.length} 条真写不进的格子（行 / 列 / 原因 / 写法 / 时间），导出成 JSON`">导出写入失败{{ writeFailLog.length ? '（' + writeFailLog.length + '）' : '' }}</button>
       <button class="mini" @click="resetCfg">清空配置</button>
     </details>
@@ -2545,6 +2546,66 @@ export default {
         this.flash('复制不了，手工粘这条：' + cmd, 15000)
       }
     },
+    /**
+     * ★ 2026-11-11 合并格探针：三次都栽在「WPS 的合并格返回值到底是啥」上，别再猜。
+     *
+     * 打三样东西，对着看就知道判据该用哪个：
+     *   MergeCells        布尔（VBA 规范 -1/0，实测部分合并返 0）
+     *   MergeArea.Address 合并区范围（$K$12:$K$13）
+     *   MergeArea.Row/Col 合并区左上角坐标
+     *   Address           本格地址（$K$13）
+     *
+     * 判读：
+     *   非左上角格：Address=$K$13 且 MergeArea.Address=$K$12:$K$13 → 地址比较成立
+     *   若 MergeArea.Address 也返回 $K$13 → WPS 连 MergeArea 都不可信，改用 Rows.Count > 1
+     *   Rows.Count / Cols.Count 永远是最硬的：合并区 >=2，普通格 =1
+     */
+    probeMerge() {
+      const out = []
+      out.push('=== 合并格探针 ' + new Date().toLocaleString() + ' ===')
+      try {
+        const a = this.app()
+        if (!a) { out.push('WPS Application 摸不到'); this.log(out.join('\n')); return }
+        const doc = a.ActiveDocument
+        const sheet = doc.ActiveSheet
+        const cfg = this.cfg || {}
+        const outCol = Number(cfg.outCol) || 0
+        const startRow = Number(cfg.startRow) || 2
+        const rows = Number(cfg.rows) || 15
+        out.push('表: ' + doc.Name + ' | 工作表: ' + sheet.Name)
+        out.push('输出列: ' + (outCol || '(未定)') + ' | 行: ' + startRow + '-' + (startRow + rows - 1))
+        if (!outCol) { out.push('输出列还没识别出来，先点「立即查询」或手动指定'); this.log(out.join('\n')); return }
+        let mergedCount = 0
+        for (let r = startRow; r < startRow + rows; r++) {
+          try {
+            const cell = sheet.Cells(r, outCol)
+            const mc = cell.MergeCells
+            const ma = cell.MergeArea
+            const maAddr = ma ? ma.Address : '(null)'
+            const maRow = ma ? ma.Row : '(null)'
+            const maCol = ma ? ma.Column : '(null)'
+            const ownAddr = cell.Address
+            let rowsCnt = '(?)', colsCnt = '(?)'
+            try { rowsCnt = ma ? ma.Rows.Count : '(null)' } catch (e) { rowsCnt = '(err)' }
+            try { colsCnt = ma ? ma.Columns.Count : '(null)' } catch (e) { colsCnt = '(err)' }
+            const norm = (x) => String(x || '').replace(/\$/g, '').toUpperCase()
+            const addrDiff = norm(maAddr) !== norm(ownAddr)
+            const sizeDiff = (Number(rowsCnt) > 1) || (Number(colsCnt) > 1)
+            const flag = (addrDiff || sizeDiff) ? ' ★合并区非左上角' : ''
+            if (flag) mergedCount++
+            out.push(`R${r}: MergeCells=${JSON.stringify(mc)} | MergeArea=${maAddr} @(${maRow},${maCol}) | Address=${ownAddr} | Rows=${rowsCnt} Cols=${colsCnt} | 地址不同=${addrDiff} 尺寸>1=${sizeDiff}${flag}`)
+          } catch (e) {
+            out.push(`R${r}: 读取异常 ${e && e.message ? e.message : e}`)
+          }
+        }
+        out.push('--- 命中合并区非左上角: ' + mergedCount + ' 格 ---')
+        out.push('判读：若「地址不同」和「尺寸>1」一致 → 两种判据等价；若只有尺寸>1 为真 → 改用 Rows.Count。')
+      } catch (e) {
+        out.push('探针失败: ' + (e && e.message ? e.message : e))
+      }
+      this.log(out.join('\n'))
+    },
+
     diagDump() {
       const a = this.app()
       const lines = []
