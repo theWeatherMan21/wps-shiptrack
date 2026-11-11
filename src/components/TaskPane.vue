@@ -251,7 +251,7 @@ import { pickEtdEta } from '../lib/dates.js'
 // ★ 10-30：读回校验的口径只有一份（lib/cellwrite.js）—— 批量路径与逐格路径共用，
 //   以前逐格用裸比较、批量用归一化，日期列/数值列走逐格必然误判「补不进去」。
 import { cellMatches, judgeReadback, writeCellCore, cellText } from '../lib/cellwrite.js'
-import { planVesselVoyage, mergeBlockOf, mergeSkipText, isVbaTrue, canUseMergeFastPath } from '../lib/writeplan.js'   // ★ 11-10：船名/航次同列 + 合并格 + VBA 布尔
+import { planVesselVoyage, mergeBlockOf, mergeSkipText, isVbaTrue, canUseMergeFastPath, isMergedNonAnchor } from '../lib/writeplan.js'   // ★ 11-10：船名/航次同列 + 合并格 + VBA 布尔
 import { summarize as summarizeFails, classifyFail } from '../lib/fail.js'
 // ★ 卡 t_8a6689dc：canonical 契约（schemaVersion）闸门 + 单元格文案的唯一实现
 import { checkResultSchema, PLUGIN_SCHEMA_VERSION } from '../lib/contract.js'
@@ -2065,15 +2065,34 @@ export default {
       let area = null
       try {
         const cell = sheet.Cells(row, col)
-        // ★ WPS COM 返回 -1/0，不是 true/false —— `=== true` 恒假，这个判断曾经完全没生效
-        if (isVbaTrue(cell.MergeCells)) {
+
+        // ★ 判据用「MergeArea 左上角坐标 vs 本格坐标」，不用 MergeCells 布尔值 ——
+        //   这个布尔值在 WPS 上两次坑人：单格合并返 -1（hotfix9 踩过）、
+        //   区域内部分合并返 0（hotfix11 踩过）。
+        //   坐标相同 → 非合并区 或 合并区左上角 → 可写
+        //   坐标不同 → 合并区里的非左上角 → 写进去值落到左上角、读回空
+        let nonAnchor = null
+        try {
+          const ma0 = cell.MergeArea
+          nonAnchor = isMergedNonAnchor(
+            ma0 && ma0.Row, ma0 && ma0.Column, row, col,
+          )
+        } catch (e) { nonAnchor = null }
+
+        if (nonAnchor === false) {
+          area = { mergeCells: false }          // 地址相同 → 非合并区 或 左上角
+        } else if (nonAnchor === true) {
+          const ma = cell.MergeArea
+          area = { mergeCells: true, topRow: ma.Row, topCol: ma.Column, address: ma.Address }
+        } else if (isVbaTrue(cell.MergeCells)) {
+          // 地址比较摸不到（老版本 COM）→ 退回布尔值兜底
           const ma = cell.MergeArea
           if (ma) area = { mergeCells: true, topRow: ma.Row, topCol: ma.Column, address: ma.Address }
         } else {
           area = { mergeCells: false }
         }
       } catch (e) {
-        return null   // 老版本摸不到 MergeCells/MergeArea → 不猜，按原路写
+        return null   // 摸不到 → 不猜，按原路写
       }
       return mergeBlockOf(area, row, col)
     },

@@ -13,7 +13,7 @@
 // 这个测试锁的就是「多行段绝不允许走快路径」这一条 —— 它是所有批量写的公共入口。
 
 import {
-  canUseMergeFastPath, mergeBlockOf, mergeSkipText, isVbaTrue,
+  canUseMergeFastPath, mergeBlockOf, mergeSkipText, isVbaTrue, isMergedNonAnchor,
 } from '../src/lib/writeplan.js';
 
 let pass = 0, fail = 0;
@@ -22,20 +22,20 @@ const ok = (cond, name, extra = '') => {
   else { fail++; console.log(`  ✗ ${name}  ${extra}`); }
 };
 
-console.log('① 快路径的准入条件');
+console.log('① 快路径：永久停用（两次真机事故的最终结论）');
 {
-  // 核心：多行段一律不走快路径，不管 MergeCells 返回什么
-  ok(canUseMergeFastPath(15, 0) === false, '多行段 + MergeCells=0（WPS 部分合并）→ 禁止走快路径');
+  // 第一次（hotfix9）：单格判断 === true，WPS 返 -1 → 恒假
+  // 第二次（hotfix11）：段级判断 !isVbaTrue(0) → 把「部分合并」当成「没合并」
+  // 结论：WPS 的 MergeCells 布尔值不可信，任何情况下都不许拿它跳过逐格检查
+  ok(canUseMergeFastPath(15, 0) === false, '多行段 + MergeCells=0（WPS 部分合并）→ 禁止');
   ok(canUseMergeFastPath(2, 0) === false, '两行段 + 0 → 禁止');
   ok(canUseMergeFastPath(15, null) === false, '多行段 + null → 禁止');
-  ok(canUseMergeFastPath(15, -1) === false, '多行段 + -1（真合并）→ 禁止');
+  ok(canUseMergeFastPath(15, -1) === false, '多行段 + -1 → 禁止');
   ok(canUseMergeFastPath(15, false) === false, '多行段 + false → 禁止');
-
-  // 单格段才允许
-  ok(canUseMergeFastPath(1, 0) === true, '单格段 + 0 → 允许（确实没合并）');
-  ok(canUseMergeFastPath(1, false) === true, '单格段 + false → 允许');
-  ok(canUseMergeFastPath(1, -1) === false, '单格段 + -1（真合并）→ 禁止');
-  ok(canUseMergeFastPath(1, null) === false, '单格段 + null（摸不到）→ 禁止，走逐格兜底');
+  ok(canUseMergeFastPath(1, 0) === false, '单格段 + 0 → 也禁止（知澜：单格也直接摸，彻底消残余风险）');
+  ok(canUseMergeFastPath(1, false) === false, '单格段 + false → 也禁止');
+  ok(canUseMergeFastPath(1, -1) === false, '单格段 + -1 → 禁止');
+  ok(canUseMergeFastPath(1, null) === false, '单格段 + null → 禁止');
   ok(canUseMergeFastPath(1, undefined) === false, '单格段 + undefined → 禁止');
 }
 
@@ -114,6 +114,21 @@ console.log('⑤ 不制造假阳性：真没合并的表照常全写');
     if (!blk) kept.push(w.row);
   }
   ok(kept.length === 14, '14 行全保留（没有被误杀）', `实际 ${kept.length}`);
+}
+
+
+console.log('⑥ 行列号比较：判据不依赖 MergeCells 布尔值');
+{
+  // 最终判据 —— 布尔值在 WPS 上两次坑人，MergeArea 的左上角坐标是硬事实
+  ok(isMergedNonAnchor(12, 12, 13, 12) === true, 'L13：MergeArea 从 (12,12) 起 → 非左上角');
+  ok(isMergedNonAnchor(12, 12, 12, 12) === false, 'L12：坐标相同 → 左上角，可写');
+  ok(isMergedNonAnchor(13, 13, 13, 13) === false, '非合并格：MergeArea 等于自身 → 可写');
+  ok(isMergedNonAnchor(12, 11, 13, 12) === true, '跨列合并 K12:L13 里的 L13 → 非左上角');
+  ok(isMergedNonAnchor('12', '12', '13', '12') === true, '字符串数字也认');
+  ok(isMergedNonAnchor(null, 12, 13, 12) === null, '摸不到 Row → null（交调用方兜底）');
+  ok(isMergedNonAnchor(12, 12, null, 12) === null, '摸不到 cell row → null');
+  ok(isMergedNonAnchor(undefined, undefined, undefined, undefined) === null, '全摸不到 → null');
+  ok(isMergedNonAnchor(12, 12, 13, 12) === true, '换列同样成立（K13）');
 }
 
 console.log(`\n${fail ? '✗' : '✓'} ${pass} 通过 / ${fail} 失败`);
