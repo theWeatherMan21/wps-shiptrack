@@ -1,7 +1,7 @@
 {
 	"name": "ShipTrack",
 	"addonType": "et",
-	"version": "1.0.0-hotfix16",
+	"version": "1.0.0-hotfix17",
 	"private": true,
 	"type": "module",
 	"scripts": {

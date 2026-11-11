@@ -168,3 +168,27 @@ export function isMergedNonAnchor(mergeAreaRow, mergeAreaCol, cellRow, cellCol) 
   const v = mergeVerdict({ maRow: mergeAreaRow, maCol: mergeAreaCol, cellRow, cellCol });
   return v.nonAnchor;
 }
+
+/**
+ * 写完之后：值是不是跑到合并区左上角去了？（第六版兜底判据）
+ *
+ * 不依赖 WPS 的任何合并字段 —— 六版判据全在真机上失效过
+ * （MergeCells 返 -1/0、MergeArea.Address 退化单格、Row/Column 返回自身、Rows.Count 也试过）。
+ * 这条路只问两个事实：锚点在哪、锚点现在的值是不是我刚写的那个。
+ *
+ * @returns {{revert: boolean, reason: string}}
+ *   revert=true  → 值跑偏了，调用方把锚点还原成写前的值，并报「与 X 合并，这一格没写」
+ *   revert=false → 真没写进去（或锚点没被动），按普通失败处理
+ */
+export function shouldRevertAnchor({ anchorAddr, selfAddr, anchorNowText, wantText } = {}) {
+  const norm = (x) => String(x == null ? '' : x).replace(/\$/g, '').replace(/\s/g, '').toUpperCase();
+  const a = norm(anchorAddr);
+  if (!a) return { revert: false, reason: 'no-anchor' };
+  // 锚点就是本格 → 不是「值跑别处」，只是写失败
+  if (a === norm(selfAddr)) return { revert: false, reason: 'anchor-is-self' };
+  const now = String(anchorNowText == null ? '' : anchorNowText).trim();
+  const want = String(wantText == null ? '' : wantText).trim();
+  if (!want) return { revert: false, reason: 'nothing-wanted' };
+  if (now !== want) return { revert: false, reason: 'anchor-untouched' };
+  return { revert: true, reason: 'value-moved-to-anchor' };
+}
