@@ -2569,37 +2569,57 @@ export default {
         const doc = a.ActiveDocument
         const sheet = doc.ActiveSheet
         const cfg = this.cfg || {}
-        const outCol = Number(cfg.outCol) || 0
         const startRow = Number(cfg.startRow) || 2
         const rows = Number(cfg.rows) || 15
         out.push('表: ' + doc.Name + ' | 工作表: ' + sheet.Name)
-        out.push('输出列: ' + (outCol || '(未定)') + ' | 行: ' + startRow + '-' + (startRow + rows - 1))
-        if (!outCol) { out.push('输出列还没识别出来，先点「立即查询」或手动指定'); this.log(out.join('\n')); return }
-        let mergedCount = 0
-        for (let r = startRow; r < startRow + rows; r++) {
-          try {
-            const cell = sheet.Cells(r, outCol)
-            const mc = cell.MergeCells
-            const ma = cell.MergeArea
-            const maAddr = ma ? ma.Address : '(null)'
-            const maRow = ma ? ma.Row : '(null)'
-            const maCol = ma ? ma.Column : '(null)'
-            const ownAddr = cell.Address
-            let rowsCnt = '(?)', colsCnt = '(?)'
-            try { rowsCnt = ma ? ma.Rows.Count : '(null)' } catch (e) { rowsCnt = '(err)' }
-            try { colsCnt = ma ? ma.Columns.Count : '(null)' } catch (e) { colsCnt = '(err)' }
-            const norm = (x) => String(x || '').replace(/\$/g, '').toUpperCase()
-            const addrDiff = norm(maAddr) !== norm(ownAddr)
-            const sizeDiff = (Number(rowsCnt) > 1) || (Number(colsCnt) > 1)
-            const flag = (addrDiff || sizeDiff) ? ' ★合并区非左上角' : ''
-            if (flag) mergedCount++
-            out.push(`R${r}: MergeCells=${JSON.stringify(mc)} | MergeArea=${maAddr} @(${maRow},${maCol}) | Address=${ownAddr} | Rows=${rowsCnt} Cols=${colsCnt} | 地址不同=${addrDiff} 尺寸>1=${sizeDiff}${flag}`)
-          } catch (e) {
-            out.push(`R${r}: 读取异常 ${e && e.message ? e.message : e}`)
+        out.push('行: ' + startRow + '-' + (startRow + rows - 1))
+
+        // ★ 扫「所有会被写的列」，不只输出列。
+        //   爹地这次报错在 ETD 列（L），只扫 outCol（R）会输出一堆「没合并」，白重启一次。
+        const targets = []
+        const add = (label, c) => { const n = Number(c) || 0; if (n > 0) targets.push([label, n]) }
+        add('单号列', cfg.numberCol)
+        add('输出列', cfg.outCol)
+        add('ETD列', cfg.etdCol)
+        add('ETA列', cfg.etaCol)
+        add('POL列', cfg.polCol)
+        add('POD列', cfg.podCol)
+        if (!targets.length) { out.push('cfg 里一个列都没定，先点「立即查询」'); this.log(out.join('\n')); return }
+        out.push('要扫的列: ' + targets.map(([l, c]) => l + '=' + colLetter(c)).join(' '))
+
+        let totalMerged = 0
+        for (const [label, c] of targets) {
+          out.push('--- ' + label + ' = ' + colLetter(c) + '(' + c + ') ---')
+          let mergedCount = 0
+          for (let r = startRow; r < startRow + rows; r++) {
+            try {
+              const cell = sheet.Cells(r, c)
+              const mc = cell.MergeCells
+              const ma = cell.MergeArea
+              const maAddr = ma ? ma.Address : '(null)'
+              const maRow = ma ? ma.Row : '(null)'
+              const maCol = ma ? ma.Column : '(null)'
+              const ownAddr = cell.Address
+              let rowsCnt = '(?)', colsCnt = '(?)'
+              try { rowsCnt = ma ? ma.Rows.Count : '(null)' } catch (e) { rowsCnt = '(err)' }
+              try { colsCnt = ma ? ma.Columns.Count : '(null)' } catch (e) { colsCnt = '(err)' }
+              const norm = (x) => String(x || '').replace(/\$/g, '').toUpperCase()
+              const addrDiff = norm(maAddr) !== norm(ownAddr)
+              const sizeDiff = (Number(rowsCnt) > 1) || (Number(colsCnt) > 1)
+              const flag = (addrDiff || sizeDiff) ? ' ★非左上角' : ''
+              if (flag) { mergedCount++; totalMerged++ }
+              out.push(`${colLetter(c)}${r}: MergeCells=${JSON.stringify(mc)} | MergeArea=${maAddr} @(${maRow},${maCol}) | Address=${ownAddr} | Rows=${rowsCnt} Cols=${colsCnt} | 地址不同=${addrDiff} 尺寸>1=${sizeDiff}${flag}`)
+            } catch (e) {
+              out.push(`${colLetter(c)}${r}: 读取异常 ${e && e.message ? e.message : e}`)
+            }
           }
+          out.push('--- ' + label + ' 命中 ' + mergedCount + ' 格 ---')
         }
-        out.push('--- 命中合并区非左上角: ' + mergedCount + ' 格 ---')
-        out.push('判读：若「地址不同」和「尺寸>1」一致 → 两种判据等价；若只有尺寸>1 为真 → 改用 Rows.Count。')
+        out.push('=== 合计命中合并区非左上角: ' + totalMerged + ' 格 ===')
+        out.push('判读：')
+        out.push('  地址不同=true 且 尺寸>1=true   → 两种判据等价，用坐标即可')
+        out.push('  只有 尺寸>1=true                → MergeArea.Address 不可信，改用 Rows.Count')
+        out.push('  两者都 false 但确实该跳过        → 这格不是合并区，问题在别处')
       } catch (e) {
         out.push('探针失败: ' + (e && e.message ? e.message : e))
       }
