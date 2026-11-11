@@ -5,6 +5,7 @@
 set -euo pipefail
 
 ADDON_NAME="${ADDON_NAME:-ShipTrack4_}"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="${1:-$(cd "$(dirname "$0")/.." && pwd)/wps-addon-build}"
 VER="${2:-$(python3 -c "import json,sys;print(json.load(open('$(dirname "$0")/../package.json'))['version'])")}"
 H="$HOME/Applications/HermesFileHelper.app"
@@ -78,4 +79,41 @@ if [ -n "$WPID" ]; then
   fi
 else
   echo "   WPS 没在运行 —— 下次打开会用新插件，无需重启。"
+fi
+
+# ---- 桥进程：第五种「装了没生效」—— 插件是新的、桥跑的是旧规则（2026-11-11 知澜实测踩到）----
+# 桥是常驻 Node 进程，代码在磁盘上改了它不会自己重载；面板版本号显示 hotfix10（对），
+# 真正干活的 /detect-columns 还是老逻辑 —— 比 WPS 那个更隐蔽。
+BPID=$(lsof -nP -iTCP:"${WPS_TRACK_PORT:-8791}" -sTCP:LISTEN -t 2>/dev/null | head -1)
+if [ -n "$BPID" ]; then
+  BSTART=$(ps -o lstart= -p "$BPID" 2>/dev/null | sed 's/^ *//')
+  BEPOCH=$(date -j -f "%a %b %d %T %Y" "$BSTART" +%s 2>/dev/null || echo 0)
+  # 「代码的新鲜度」= bridge/ 下最新一个 .mjs 的 mtime（含本次改的 detect-columns.mjs）
+  NEWEST=$(find "$REPO_ROOT/bridge" -name '*.mjs' -exec stat -f '%m %N' {} + 2>/dev/null | sort -rn | head -1)
+  NEPOCH=${NEWEST%% *}
+  NPATH=${NEWEST#* }
+  if [ "$BEPOCH" -gt 0 ] && [ -n "${NEPOCH:-}" ] && [ "$NEPOCH" -gt "$BEPOCH" ]; then
+    printf '\033[1;31m⚠️  桥进程比 bridge/ 里的代码旧（PID %s 启动于 %s，而 %s 改于 %s）\033[0m\n' \
+      "$BPID" "$BSTART" "$(basename "$NPATH")" "$(date -r "$NEPOCH" '+%F %T')"
+    printf '\033[1;31m   桥不重载代码 → /detect-columns 还是旧规则。重启：scripts/bridge.sh restart\033[0m\n'
+  else
+    echo "   桥在跑（PID ${BPID}，启动于 ${BSTART}）—— 比 bridge/ 里最新的代码新，规则是当次的。"
+  fi
+else
+  echo "   桥没在跑 —— 面板会提示「桥未连接」，先 scripts/bridge.sh start。"
+fi
+
+echo "== 8) 桥端点实证（判据用端点不用时间戳：时间戳证明重启过，证明不了跑的是哪版代码）=="
+if ! curl -s --max-time 3 http://127.0.0.1:8791/health >/dev/null 2>&1; then
+  echo "   桥没在跑（8791 不通）→ launchctl kickstart -k gui/$(id -u)/com.wanyi.wps-shiptrack-bridge"
+else
+  DC=$(curl -s --max-time 5 -X POST http://127.0.0.1:8791/detect-columns \
+        -H 'Content-Type: application/json' \
+        -d '{"rows":[["提单号",""],["TSTU0000001",""]]}' 2>/dev/null)
+  if echo "$DC" | grep -q '"numberCol"'; then
+    echo "   ✅ 桥已是新版（/detect-columns 返回了 numberCol）"
+  else
+    echo "   ⚠️  桥上跑的是旧代码 —— /detect-columns 不可用：$(echo "$DC" | head -c 80)"
+    echo "      → launchctl kickstart -k gui/$(id -u)/com.wanyi.wps-shiptrack-bridge"
+  fi
 fi
