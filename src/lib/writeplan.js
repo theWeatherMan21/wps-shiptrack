@@ -79,3 +79,20 @@ export function mergeSkipText(block) {
   const a = block && block.addr ? block.addr : '合并区'
   return `与 ${a} 合并，这一格没写`
 }
+
+/**
+ * 批量段能否走「整段无合并」快路径。
+ *
+ * ★ 2026-11-11 真机复现：WPS 对「区域内部分合并」（如 L2:L15 里只有 L12:L13 合并）
+ *   返回的是 **0**，而 VBA 规范应是 **Null**。把 0 当「这段没有合并」会让整段跳过逐格检查，
+ *   于是 L13（非左上角）照写 → 值落到 L12 → 读回空 → 报「赋值没生效」，
+ *   还会把 mergeChecked 写死、第二道兜底检查再也进不去。
+ *
+ * 所以快路径**只对单格段开放**：多行段一律逐格摸（15 行 = 15 次 COM，毫秒级）。
+ * 宁可多摸几下，也不能把整类 bug 留在公共入口上 —— 这个函数被所有批量写共用。
+ */
+export function canUseMergeFastPath(segLength, rangeMergeCells) {
+  if (Number(segLength) !== 1) return false
+  if (rangeMergeCells === null || rangeMergeCells === undefined) return false
+  return !isVbaTrue(rangeMergeCells)
+}

@@ -251,7 +251,7 @@ import { pickEtdEta } from '../lib/dates.js'
 // ★ 10-30：读回校验的口径只有一份（lib/cellwrite.js）—— 批量路径与逐格路径共用，
 //   以前逐格用裸比较、批量用归一化，日期列/数值列走逐格必然误判「补不进去」。
 import { cellMatches, judgeReadback, writeCellCore, cellText } from '../lib/cellwrite.js'
-import { planVesselVoyage, mergeBlockOf, mergeSkipText, isVbaTrue } from '../lib/writeplan.js'   // ★ 11-10：船名/航次同列 + 合并格 + VBA 布尔
+import { planVesselVoyage, mergeBlockOf, mergeSkipText, isVbaTrue, canUseMergeFastPath } from '../lib/writeplan.js'   // ★ 11-10：船名/航次同列 + 合并格 + VBA 布尔
 import { summarize as summarizeFails, classifyFail } from '../lib/fail.js'
 // ★ 卡 t_8a6689dc：canonical 契约（schemaVersion）闸门 + 单元格文案的唯一实现
 import { checkResultSchema, PLUGIN_SCHEMA_VERSION } from '../lib/contract.js'
@@ -2089,8 +2089,11 @@ export default {
         const a2 = `${colLetter(seg[seg.length - 1].col)}${seg[seg.length - 1].row}`
         mc = sheet.Range(`${a1}:${a2}`).MergeCells
       } catch (e) { mc = null }
-      // 快路径：整段明确没合并（VBA 的 0 / false）就不用逐格摸；摸不到（null）仍走逐格
-      if (mc !== null && mc !== undefined && !isVbaTrue(mc)) {
+      // ★ 2026-11-11 真机复现（爹地表 L12:L13 合并、L13 照写、读回空）：
+      //   快路径只对「单格段」有效。多行段一律逐格摸 —— WPS 对「区域内部分合并」返回 0
+      //   （VBA 规范应是 Null），0 会被判成「没合并」→ 整段跳过检查 → 非左上角格照写、读回空。
+      //   判定收进 canUseMergeFastPath（纯函数，可单测），别在这里散着写。
+      if (canUseMergeFastPath(seg.length, mc)) {
         for (const w of seg) w.mergeChecked = true
         return seg
       }
