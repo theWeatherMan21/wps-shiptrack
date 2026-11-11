@@ -141,21 +141,18 @@
       <span v-if="historyCount > historyShown.length" class="hist-more muted">只显示最近 {{ historyShown.length }} 条（共 {{ historyCount }}）</span>
     </div>
 
-    <!-- 三步清单：永远显示每一步选没选，不靠「报错」告诉用户下一步 -->
-    <div class="steps">
+    <!-- 列状态清单：只在「更多设置」展开时出现（默认面板不许有配置项）。
+         「船司列」这一行也删了 —— 控件既然没了，就别留一行说明占地方。 -->
+    <div v-if="moreOpen" class="steps">
       <div class="step" :class="cfg.numberCol > 0 ? 'done' : 'todo'">
-        <b>① 单号列</b>
+        <b>单号列</b>
         <span v-if="cfg.numberCol > 0">{{ numColText }} · 第 {{ cfg.startRow }}–{{ cfg.startRow + cfg.rows - 1 }} 行</span>
         <span v-else class="muted">未选</span>
       </div>
       <div class="step" :class="cfg.outCol > 0 ? 'done' : (cfg.numberCol > 0 ? 'todo' : 'idle')">
-        <b>② 输出列</b>
+        <b>输出列</b>
         <span v-if="cfg.outCol > 0">{{ outColText }}</span>
         <span v-else class="muted">未选</span>
-      </div>
-      <div class="step" :class="cfg.carrierCol > 0 ? 'done' : 'idle'">
-        <b>船司列</b>
-        <span>{{ cfg.carrierCol > 0 ? carrierColText : '可选（按单号识别）' }}</span>
       </div>
       <div class="step" :class="(cfg.vesselCol > 0 || cfg.voyageCol > 0) ? 'done' : 'idle'">
         <b>船名/航次</b>
@@ -163,9 +160,9 @@
         <span v-else class="muted">可选（配了才回填）</span>
       </div>
     </div>
-    <div class="next" v-if="stepHint">{{ stepHint }}</div>
+    <div class="next" v-if="moreOpen && stepHint">{{ stepHint }}</div>
 
-    <div class="cfg" v-if="cfg.numberCol > 0">
+    <div class="cfg" v-if="moreOpen && cfg.numberCol > 0">
       <div class="muted">{{ scanText }}</div>
       <div class="muted">范围：{{ cfg.mode === 'column' ? '跟随表格（新加的行会一起查）' : '固定选区（只查选的那几行）' }}</div>
       <div class="muted" v-if="carriers">船司覆盖：{{ carriers.liveCount }}/{{ carriers.count }} 已接入</div>
@@ -561,8 +558,8 @@ export default {
       return colLetter(this.cfg.outCol)
     },
     stepHint() {
-      if (this.cfg.numberCol === 0) return '第 1 步：在表格里选中提单号那一列（整列选中也行）→ 点「① 选单号列」'
-      if (this.cfg.outCol === 0) return '第 2 步：选中要写结果的列 → 点「② 选输出列」'
+      if (this.cfg.numberCol === 0) return '在表格里选中提单号那一列（整列选中也行）→ 点上面的「选单号列」'
+      if (this.cfg.outCol === 0) return '选中要写结果的列 → 点上面的「选输出列」'
       return ''
     },
     carrierColText() {

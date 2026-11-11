@@ -1,5 +1,5 @@
 {
- "name": "右侧没有空列 → 覆盖写右边第一个「非语义」列（状态列 C），并在 fixes 写明",
+ "name": "右侧没有空列 → 状态列续写右边第一个「非语义」列（状态列 C），并在 fixes 写明",
  "sheet": "窄表",
  "expect": {
   "headerRow": 0,
@@ -7,7 +7,7 @@
   "outCol": 3,
   "vesselCol": 4,
   "vesselMode": "single",
-  "fixHas": "覆盖写"
+  "outColBy": "status"
  },
  "rows": [
   [

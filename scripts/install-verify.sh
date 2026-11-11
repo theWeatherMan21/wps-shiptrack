@@ -54,12 +54,28 @@ printf '{"version":"%s","installedAt":"%s","dir":"%s"}\n' \
 echo "✅ 装机完成并校验通过：$ADDON_NAME · v${VER} · 入口 ${IDX}"
 
 echo "== 6) 宿主机进程检查（第四种「装了没生效」：进程比装机还老）=="
+# 判据必须是「进程启动时刻 vs 装机时刻」，不能只看「WPS 在不在跑」——
+# 装了新版之后又打开过 WPS 的，进程是新的，这时候再喊「重启」就是误报。
 WPID=$(pgrep -x wpsoffice 2>/dev/null | head -1)
+INSTALL_EPOCH=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" +%s 2>/dev/null || date +%s)
+# installed.json 里记的是本次装机的 UTC 时刻，换算成 epoch 来比
+IJ_TS=$(python3 - "$HOME/.hermes/wps-shiptrack/installed.json" <<'PYEOF' 2>/dev/null || true
+import json,sys,calendar,time
+j=json.load(open(sys.argv[1]))
+print(calendar.timegm(time.strptime(j["installedAt"], "%Y-%m-%dT%H:%M:%SZ")))
+PYEOF
+)
+[ -n "${IJ_TS:-}" ] && INSTALL_EPOCH="$IJ_TS"
 if [ -n "$WPID" ]; then
   WSTART=$(ps -o lstart= -p "$WPID" 2>/dev/null | sed 's/^ *//')
-  echo "⚠️  WPS 正在运行（PID ${WPID}，启动于 ${WSTART}）"
-  echo "   它加载的是本次装机【之前】那份插件 —— 关窗口无效，必须完全退出（Cmd+Q / 菜单「退出」）再打开。"
-  echo "   判据：面板右下角版本号应显示 v${VER}，不是旧版本。"
+  WSTART_EPOCH=$(date -j -f "%a %b %d %T %Y" "$WSTART" +%s 2>/dev/null || echo 0)
+  if [ "$WSTART_EPOCH" -gt 0 ] && [ "$WSTART_EPOCH" -lt "$INSTALL_EPOCH" ]; then
+    printf '\033[1;31m⚠️  WPS 正在运行（PID %s，启动于 %s），比本次装机（%s）早 —— 加载的是旧插件\033[0m\n' \
+      "$WPID" "$WSTART" "$(date -r "$INSTALL_EPOCH" '+%F %T')"
+    printf '\033[1;31m   关窗口无效，必须完全退出（Cmd+Q / 菜单「退出」）再打开。判据：面板右下角应显示 v%s。\033[0m\n' "$VER"
+  else
+    echo "   WPS 正在运行（PID ${WPID}，启动于 ${WSTART}）—— 比本次装机晚，用的就是新插件。"
+  fi
 else
   echo "   WPS 没在运行 —— 下次打开会用新插件，无需重启。"
 fi

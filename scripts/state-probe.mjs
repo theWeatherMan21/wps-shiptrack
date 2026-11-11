@@ -90,16 +90,16 @@ async function open(opts = {}) {
 // 探针照旧点这些按钮 —— 找不到就先展开「更多设置」再点一次（面板结构变了，行为不变）。
 const click = async (p, re) => {
   const btn = p.getByRole('button', { name: re })
-  try {
-    await btn.first().click({ timeout: 4000 })
-  } catch (e) {
+  // 面板瘦身后列选择器在「更多设置 ▾」里：先看按钮在不在，不在就展开一次
+  if ((await btn.count()) === 0) {
     const more = p.getByRole('button', { name: /更多设置/ })
     if (await more.count()) {
-      await more.first().click({ timeout: 4000 }).catch(() => {})
+      await more.first().click().catch(() => {})
       await p.waitForTimeout(150)
     }
-    await btn.first().click({ timeout: 4000 })
   }
+  // 30s：H31 那类用例里 COM 是 15ms/次的忙等，点一下要几秒才返回（原来没写超时 = 默认 30s，别收紧）
+  await btn.first().click({ timeout: 30000 })
 }
 // 按 ③ 开跑；按钮不可用（配置没齐/正在跑）时静默跳过
 const tryRun = async (p) => {
@@ -185,7 +185,7 @@ await seg('H3', async () => {
   await tryRun(page)   // 0.9.23 起选完列不再自动开跑
   await waitIdle(page)
   await page.evaluate(() => { window.__bridgeDown = true })
-  await click(page, /立即刷新/)
+  await click(page, /立即查询|立即刷新/)
   await page.waitForTimeout(900)
   const b1 = await banner(page)
   await page.evaluate(() => { window.__bridgeDown = false })

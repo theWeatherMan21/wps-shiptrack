@@ -28,7 +28,7 @@ const HEADER_WORDS = {
     'vesselvoy', 'vesselname',
   ],
   voyage: ['航次', '航次号', 'voyage', 'voy', 'voyno', 'voyageno', 'vesselvoy'],
-  carrier: ['船司', '船公司', '船东', '承运人', 'carrier', 'line', 'shippingline', '船公司名称'],
+  carrier: ['船司', '船公司', '船东', '承运人', 'carrier', 'line', 'shippingline', '船公司名称', 'sl', 's/l', '船司代码', '承运人代码'],
   date: [
     'etd', 'eta', 'atd', 'ata', '开船', '起运', '到港', '抵港', '离港',
     '预计离港', '预计到港', '实际离港', '实际到港', '船期', '日期',
@@ -49,6 +49,9 @@ const NEVER_WRITE_WORDS = [
 
 // 提单类表头词（内容打平时优先选它，而不是箱号列）
 const BL_PREF = new Set(['提单号', '提单', '主提单', 'bl', 'blno', 'bol', 'hbl', 'mbl', 'billoflading', '单号']);
+// ★ 主提单（MBL）优先于货代提单（HBL）：船司官网只认主提单号，HBL 是货代自己出的号，
+//   拿去官网查必然「查无此单」。爹地的表里 HBL/MBL 常常并排，必须选 MBL。
+const MASTER_BL = new Set(['主提单', 'mbl', 'mblno', 'masterbl', 'masterbilloflading', '主提单号']);
 
 // ── 归一化 ──────────────────────────────────────────────────────────────────
 /** 表头/单元格文本归一：去空格、全角转半角、小写、去分隔符 */
@@ -95,7 +98,9 @@ export function classifyHeader(raw) {
   for (const [kind, words] of Object.entries(HEADER_WORDS)) {
     for (const w of words) {
       const nw = normHeader(w);
-      if (nw.length >= 2 && h.includes(nw)) hits.push({ kind, word: w, len: nw.length });
+      // 包含匹配只对 ≥3 字符的词开放：'sl'/'eta' 这种 2-3 字母的短码只认精确，
+      // 否则 'Slip'/'Beta' 之类会被误判成船司/日期列
+      if (nw.length >= 3 && h.includes(nw)) hits.push({ kind, word: w, len: nw.length });
     }
   }
   if (!hits.length) return { kind: null, score: 0, word: '' };
@@ -181,7 +186,25 @@ export function judgeNumber(raw, idmod) {
   return 'strong';
 }
 
-/** 一列前 N 个非空值的比例统计 */
+/** 这一格像不像「上一轮写进去的追踪结果」（事件 + 日期 + 港口 的组合） */
+export function looksLikeTrackingText(v) {
+  const s = normCell(v);
+  if (!s || s.length < 4) return false;
+  const zh = /(离港|装船|卸船|到港|抵港|中转|转运|清关|报关|还箱|提柜|查无|官网|预计|已开船|已到港)/;
+  const en = /(Export Received|Full Transshipment|Loaded|Discharged|Arrived|Departed|Gate ?In|Gate ?Out|Empty|Vessel|Booking Confirmed|No Record|Not Found)/i;
+  if (!zh.test(s) && !en.test(s)) return false;
+  // 有事件词还不够，通常还带日期或地点，避免把「备注里写了"预计"」误判
+  return /\d{1,2}[-/月]\d{1,2}|\b[A-Z]{4,}\b|\d{4}-\d{2}/.test(s) || s.length >= 12;
+}
+
+/** 这一格像不像「插件写的状态短词」（未查 / 已查 / 查无此号…）—— 这类列本来就是给我们写的 */
+export function looksLikeStatusText(v) {
+  const s = normCell(v);
+  if (!s || s.length > 12) return false;
+  return /^(未查|已查|待查|没查|查无此号|官网查无|查询失败|查询超时|超时|无记录|暂无|已更新|待更新|失败|成功|进行中|已跳过|合并跳过)$/.test(s);
+}
+
+/** 这一列前 N 个非空值的比例统计 */
 function columnProfile(rows, colIdx, maxRows = 20, idmod = null) {
   const vals = [];
   for (let i = 0; i < Math.min(rows.length, maxRows); i++) {
@@ -197,6 +220,8 @@ function columnProfile(rows, colIdx, maxRows = 20, idmod = null) {
     vessel: vals.filter(looksLikeVessel).length / total,
     vesselVoyage: vals.filter(looksLikeVesselVoyage).length / total,
     date: vals.filter(looksLikeDate).length / total,
+    trackingText: vals.filter(looksLikeTrackingText).length / total,
+    statusText: vals.filter(looksLikeStatusText).length / total,
     empty: 0,
   };
   return { total, ratio, sample: vals.slice(0, 5) };
@@ -260,7 +285,10 @@ export function detectColumns(input = {}) {
       const st = (p.ratio && p.ratio.strong) || 0;
       // 内容校验（识别器认 / 箱号校验位过）单独计入分数 —— 两列都像单号时，
       // 「提单号」列比「箱号」列更该被选（fixture 07：TESTMAE0123450 校验位错 = weak）
-      const score = tag.score * 0.5 + r * 0.3 + st * 0.2 + (BL_PREF.has(normHeader(tag.word)) ? 0.01 : 0);
+      const hw = normHeader(tag.word);
+      // MBL 额外加权：同分时压过 HBL（官网只认主提单号）
+      const prefBonus = MASTER_BL.has(hw) ? 0.08 : (BL_PREF.has(hw) ? 0.02 : 0);
+      const score = tag.score * 0.5 + r * 0.3 + st * 0.2 + prefBonus;
       if (!best || score > best.score) best = { col: c + 1, score, r, strong: st, tag };
     }
     if (best && best.r >= 0.5) {
@@ -354,28 +382,37 @@ export function detectColumns(input = {}) {
     }
   }
 
-  // ⑦ 定输出列：单号列右边第一个「连续全空」的列块起点
-  let outCol = 0;
+  // ⑦ 定输出列（三档，绝不乱覆盖有内容的列）
+  let outCol = 0, outColBy = '';
   {
-    const canWrite = (c) => !blocked.some((b) => b.col === c);
+    const isBlocked = (c) => blocked.some((b) => b.col === c);
+    // 7a0 内容全是「未查 / 已查 / 查无此号」这类短词 → 这列本来就是给我们写的
+    //     注意不能只看表头（爹地表 B 列也叫「状态栏」，但内容是 9/8/8 箱量，不能覆盖）
     for (let c = numberCol + 1; c <= colCount; c++) {
-      if (!canWrite(c)) continue;
+      if (isBlocked(c)) continue;
       const p = profiles[c - 1];
-      if (p.total === 0) { outCol = c; break; }   // 全空列 → 可写
+      if (p.total && p.ratio.statusText >= 0.5) { outCol = c; outColBy = 'status'; break; }
     }
+    // 7a 先找「上一轮写过的追踪结果列」——输出列天然会有上一轮的值（离港 10-08 XINGANG…），
+    //    这不是脏数据，正是我们上次写的地方，继续写它才对。
+    if (!outCol) for (let c = numberCol + 1; c <= colCount; c++) {
+      if (isBlocked(c)) continue;
+      const p = profiles[c - 1];
+      if (p.total && p.ratio.trackingText >= 0.4) { outCol = c; outColBy = 'previous-run'; break; }
+    }
+    // 7b 没有上一轮结果 → 右侧第一个全空列
     if (!outCol) {
-      // 没有空列 → 取单号列右边第一个「能覆盖」的列，并说明。
-      // ★ 语义列（船名/航次/港口/船司/日期/客户金额备注）一律不覆盖：把状态文字写进船名格
-      //   就是把表格弄坏 —— 这种时候宁可 outCol=0 交给「更多设置」里人指定。
-      const semantic = new Set(['vessel', 'voyage', 'pol', 'pod', 'carrier', 'date', 'never']);
       for (let c = numberCol + 1; c <= colCount; c++) {
-        if (!canWrite(c)) continue;
-        if (semantic.has(headerTags[c - 1].kind)) continue;
-        if (c === vesselCol || c === voyageCol) continue;
-        outCol = c; break;
+        if (isBlocked(c)) continue;
+        if (profiles[c - 1].total === 0) { outCol = c; outColBy = 'empty'; break; }
       }
-      if (outCol) fixes.push(`右侧没有空列，将覆盖写 ${colLetter(outCol)} 列`);
-      else fixes.push('右侧没有空列，也没有可覆盖的非语义列 → 请在「更多设置」里指定输出列');
+    }
+    // 7c 都没有 → outCol=0。★ 绝不覆盖箱型/卖价/联系方式这类有内容的列：
+    //    把状态文字写进 VOL 格就是把表弄坏，宁可让用户指定。
+    if (!outCol) {
+      fixes.push('右侧没有空列，也没有上次写入的追踪列 → 请在「更多设置」里指定输出列');
+    } else if (outColBy === 'previous-run') {
+      fixes.push(`输出列 ${colLetter(outCol)} 有上一轮的追踪结果，继续写这里`);
     }
   }
 
@@ -407,7 +444,7 @@ export function detectColumns(input = {}) {
     ...base,
     ok: true,
     headerRow,
-    numberCol, outCol, carrierCol, polCol, podCol,
+    numberCol, outCol, outColBy, carrierCol, polCol, podCol,
     vesselCol, voyageCol, vesselMode, vesselBy,
     startRow, sampleRows,
     confidence, tier,
