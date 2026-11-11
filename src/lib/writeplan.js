@@ -10,6 +10,7 @@
 //      不许写成「读回不一致」（那是把不可写说成写失败，方向全错）。
 //   3. 撞结果列 / 单号列一律不写（别把业务结论覆盖掉）。
 
+import { judgeReadback } from './cellwrite.js'
 const letter = (n) => {
   let c = ''
   let x = Number(n || 0)
@@ -180,15 +181,25 @@ export function isMergedNonAnchor(mergeAreaRow, mergeAreaCol, cellRow, cellCol) 
  *   revert=true  → 值跑偏了，调用方把锚点还原成写前的值，并报「与 X 合并，这一格没写」
  *   revert=false → 真没写进去（或锚点没被动），按普通失败处理
  */
-export function shouldRevertAnchor({ anchorAddr, selfAddr, anchorNowText, wantText } = {}) {
+export function shouldRevertAnchor({ anchorAddr, selfAddr, anchorPrev, anchorNow, want } = {}) {
   const norm = (x) => String(x == null ? '' : x).replace(/\$/g, '').replace(/\s/g, '').toUpperCase();
   const a = norm(anchorAddr);
   if (!a) return { revert: false, reason: 'no-anchor' };
   // 锚点就是本格 → 不是「值跑别处」，只是写失败
   if (a === norm(selfAddr)) return { revert: false, reason: 'anchor-is-self' };
-  const now = String(anchorNowText == null ? '' : anchorNowText).trim();
-  const want = String(wantText == null ? '' : wantText).trim();
-  if (!want) return { revert: false, reason: 'nothing-wanted' };
-  if (now !== want) return { revert: false, reason: 'anchor-untouched' };
+  if (want === undefined || want === null || String(want).trim() === '') {
+    return { revert: false, reason: 'nothing-wanted' };
+  }
+  // ★ 口径必须复用 cellwrite.judgeReadback，不能自己拿裸文本比。
+  //   日期列：写入的是 Date，读回是序列号 46400 —— cellText 一个 "46400"、一个 "2027-01-13"，
+  //   裸比永远不相等，于是日期列永远判「锚点没被动」→ 还原逻辑在唯一出问题的列上 100% 失效。
+  //   judgeReadback 内部有 sameDate 归一化，且 require prev（锚点写前的值）——
+  //   不传 prev，「锚点还是旧值」会被判成 format-diff 而不是 fail，导致凭空还原、抹掉用户正确值。
+  const v = judgeReadback({ prev: anchorPrev, back: anchorNow, want });
+  // ★ 只有 'ok' 才还原。judgeReadback 还有 'format-diff'（值不同、只是形态差）——
+  //   那种情况锚点上不是我要的那个值，还原等于把用户的数改坏。
+  if (v !== 'ok') {
+    return { revert: false, reason: v === 'fail' ? 'anchor-untouched' : 'anchor-not-my-value' };
+  }
   return { revert: true, reason: 'value-moved-to-anchor' };
 }

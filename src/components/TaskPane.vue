@@ -2364,11 +2364,14 @@ export default {
     _revertMergedWrite(sheet, w) {
       try {
         const an = w.anchorAddr ? sheet.Range(w.anchorAddr) : null
+        // ★ 传原始值，不要先 cellText —— 日期列写 Date、读回 46400，
+        //   一旦在这儿转成文本再比，两边永远不相等（口径交给 judgeReadback 归一化）
         const d = shouldRevertAnchor({
           anchorAddr: w.anchorAddr,
           selfAddr: `${colLetter(w.col)}${w.row}`,
-          anchorNowText: an ? cellText(an.Value2) : '',
-          wantText: cellText(this._cellValueOf(w)),
+          anchorPrev: w.anchorPrev,
+          anchorNow: an ? an.Value2 : undefined,
+          want: this._cellValueOf(w),
         })
         if (!d.revert) return null
         an.Value2 = w.anchorPrev               // 还原成写前的值（undefined 就写空）
