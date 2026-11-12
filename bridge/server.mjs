@@ -543,9 +543,15 @@ const server = http.createServer(async (req, res) => {
     if (!number) return send(res, 400, { ok: false, error: '缺 number' });
     // ★ 卡 t_8a6689dc：插件上报它自己认得的契约版本（?schema=N），桥记到日志里，
     //   事后能一眼看出「这一票是哪个年代的插件问的」。太旧 → 只回降级桩。
-    const pj = CONTRACT.judgePlugin(url.searchParams.get('schema'));
-    if (!pj.known) {
-      console.error(`[track] ${number} 插件未上报契约版本（旧插件）· 桥支持 v${CONTRACT.version ?? '?'}`);
+    const rawSchema = url.searchParams.get('schema');
+    const pj = CONTRACT.judgePlugin(rawSchema);
+    // ★ 11-12：四态分开写。原来「没传 schema」也走 !pj.known → 写成「旧插件」，
+    //   curl / CLI / 探针每打一次就造一条假警报。没有插件 ≠ 插件旧。
+    const callerKind = CONTRACT.classifyCaller(rawSchema);
+    if (callerKind === 'direct') {
+      console.error(`[track] ${number} 直连调用（未带插件契约）· 桥支持 v${CONTRACT.version ?? '?'}`);
+    } else if (callerKind === 'unparsable') {
+      console.error(`[track] ${number} 插件契约版本无法解析（schema=${String(rawSchema).slice(0, 20)}）→ 按旧插件处理 · 桥支持 v${CONTRACT.version ?? '?'}`);
     } else if (pj.tooOld) {
       console.error(`[track] ${number} 拒绝：插件契约 v${pj.version} < 桥 v${CONTRACT.min} → 降级桩`);
       return send(res, 200, CONTRACT.refusal(number, carrier));

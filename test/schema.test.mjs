@@ -96,5 +96,24 @@ check('区间自洽（min ≤ 自身 ≤ max）', PLUGIN_MIN_SCHEMA <= PLUGIN_SC
   check('读不到引擎版本时插件没上报 → 也不拦', jn.known === false, JSON.stringify(jn))
 }
 
+// ④ 调用方四态（11-12 加）：没有插件 ≠ 插件旧
+{
+  const C = makeContract(1);   // 注意：参数是引擎的 schemaVersion 数字，不是对象
+  // 直连：curl / CLI / 探针 —— 中性，自检不该记
+  check('无 schema → 直连', C.classifyCaller(null) === 'direct', String(C.classifyCaller(null)));
+  check('空串 → 直连', C.classifyCaller('') === 'direct', String(C.classifyCaller('')));
+  check('纯空白 → 直连', C.classifyCaller('   ') === 'direct', String(C.classifyCaller('   ')));
+  // 带了头但认不出：插件真有问题，要告警
+  check('非数字 → 无法解析', C.classifyCaller('abc') === 'unparsable', String(C.classifyCaller('abc')));
+  check('小数 → 无法解析', C.classifyCaller('1.5') === 'unparsable', String(C.classifyCaller('1.5')));
+  check('带前缀 → 无法解析', C.classifyCaller('v1') === 'unparsable', String(C.classifyCaller('v1')));
+  // 版本判定
+  check('v1 对 v1 → ok', C.classifyCaller(1) === 'ok', String(C.classifyCaller(1)));
+  check('v1 对 v2 → ok（比桥新也放行）', C.classifyCaller(2) === 'ok', String(C.classifyCaller(2)));
+  const C3 = makeContract(3);
+  check('v1 对 v3 → tooOld', C3.classifyCaller(1) === 'tooOld', String(C3.classifyCaller(1)));
+  check('  └ 数字字符串同样判定', C3.classifyCaller('1') === 'tooOld');
+}
+
 console.log(bad === 0 ? '\nALL PASS' : `\n${bad} FAILED`)
 process.exit(bad === 0 ? 0 : 1)

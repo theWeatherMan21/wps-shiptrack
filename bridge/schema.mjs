@@ -46,6 +46,22 @@ export function makeContract(engineVersion) {
       return { ...base, known: true, version: n, tooOld: n < v, tooNew: n > v }
     },
 
+    /** 这一票的调用方到底是谁 —— 四态，别把「没有插件」写成「插件旧」。
+     *
+     *  11-12 知澜指出：原来 judgePlugin(null).known === false 被写成「插件未上报契约版本（旧插件）」，
+     *  于是 curl / CLI / 探针每打一次就给自检造一条假警报，真该重启插件的提醒被噪声埋掉。
+     *  「根本不存在插件」和「插件版本旧」是两件事，前者中性、后者才要告警。
+     */
+    classifyCaller(raw) {
+      const s = raw == null ? '' : String(raw).trim()
+      if (s === '') return 'direct'                 // 直连调用：curl / CLI / 探针，没有插件这回事
+      if (!/^\d+$/.test(s)) return 'unparsable'    // 带了头但不是版本号：插件有问题，要告警
+      // 不依赖 this：直接用闭包里的 v，方法被解构调用也不会错
+      const n = Number(s)
+      if (v !== null && n < v) return 'tooOld'
+      return 'ok'
+    },
+
     /** 降级桩：只有单号 + 一句人话，业务字段一个都不给 */
     refusal(number, carrier) {
       return {
