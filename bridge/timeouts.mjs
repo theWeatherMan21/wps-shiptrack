@@ -55,6 +55,25 @@ export function resolveCacheTtl(env = process.env, fallback = 10 * 60 * 1000) {
  */
 export const PER_CARRIER_TIMEOUT = { hapag: 55000 };
 
+/** 一次查询（含所有换槽/网络重试）的总预算，毫秒。
+ *
+ * 为什么需要它（11-12 实测 99999999 探针）：
+ *   单次上限只是「一次尝试最多等多久」，不是「一次查询最多等多久」。
+ *   换槽重试每换一个档案就重新起一次表：
+ *     p0 20s 撞墙 → p1 20s FAIL → p2 55s 撞墙 → p3 55s FAIL = 一次查询 116 秒。
+ *   爹地的痛点是「90 秒干等」，这样最坏变成 116 秒，方向反了。
+ *
+ * 90 秒的依据：历史 CF 墙样本 93.0–93.2s 全部注定失败 —— 等到 90 秒还没有的，
+ * 再等也不会变好。
+ *
+ * 两件事分开管：
+ *   单次上限（PER_CARRIER_TIMEOUT）管「读到 not available 要多久」——55s 不动；
+ *   总预算（这个）管「最多让用户等多久」——90s 封顶。
+ *   换槽重试前的判据不是「还有没有剩余」，而是「剩余够不够完整跑一次」：
+ *   只剩 35s 换槽也读不到要 40–50s 的信息，白烧预算还多等。
+ */
+export const QUERY_TOTAL_BUDGET_MS = 90000;
+
 /** 取某家的超时上限；没配置就回 fallback（且绝不放大 fallback） */
 export function timeoutForCarrier(carrier, fallback) {
   const n = PER_CARRIER_TIMEOUT[String(carrier || '').toLowerCase()];

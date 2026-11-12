@@ -28,7 +28,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import os from 'node:os';
-import { resolveTimeouts, makeClampTimeout, resolvePort, resolveCacheTtl, timeoutForCarrier, describeTimeoutChoice } from './timeouts.mjs';
+import { resolveTimeouts, makeClampTimeout, resolvePort, resolveCacheTtl, timeoutForCarrier, describeTimeoutChoice, QUERY_TOTAL_BUDGET_MS } from './timeouts.mjs';
 import { makeContract } from './schema.mjs';
 import { makeProfilePool, resolveCooldownMs } from './profiles.mjs';
 
@@ -582,7 +582,17 @@ const server = http.createServer(async (req, res) => {
     // ★ 11-12：Hapag 撞 CF 墙超时 → 该槽冷却，换另一个档案再试一次（知澜批复）。
     //   同档案硬撞只是把 30 秒预算烧两遍（OOCL 实测同档案第 2 次必被拦），换槽才有意义。
     const hapagWall = r.timeout && String(r.timedOutCarrier || r.carrier || '').toLowerCase() === 'hapag';
-    if (!r.ok && (isCooldownKind(r.errorKind) || hapagWall) && r.profile && runs < 3) {
+    // ★ 11-12（总预算）：单次上限只管「一次尝试等多久」，换槽重试每换一个档案就重新起表 ——
+    //   实测一次查询能烧到 116 秒（p0 20s 撞墙 → p1 20s FAIL → p2 55s 撞墙 → p3 55s FAIL）。
+    //   爹地的痛点是「90 秒干等」，这样最坏反而翻倍。所以换槽前先问「剩下的够不够完整跑一次」，
+    //   不是「还剩没剩」：只剩 35s 换槽也读不到要 40–50s 的 not available，白烧预算还多等。
+    const nextSingle = timeoutForCarrier(String(r.timedOutCarrier || r.carrier || carrier || ''), timeoutMs);
+    const budgetLeft = QUERY_TOTAL_BUDGET_MS - (Date.now() - t0);
+    const canAffordRetry = budgetLeft >= nextSingle;
+    if (!r.ok && (isCooldownKind(r.errorKind) || hapagWall) && r.profile && runs < 3 && !canAffordRetry) {
+      console.error(`[bridge] ${number} 总预算不够换槽（剩 ${Math.round(budgetLeft / 1000)}s < 下次单次 ${Math.round(nextSingle / 1000)}s）→ 不重试，直接报`);
+    }
+    if (!r.ok && (isCooldownKind(r.errorKind) || hapagWall) && r.profile && runs < 3 && canAffordRetry) {
       const from = r.profile;
       console.error(`[bridge] ${number} ${hapagWall ? '撞 CF 墙超时' : `撞盾 ${r.errorKind}`} → ${from} 冷却并换档案重试`);
       const r2 = await runCli({ ...runArgs, retry: true, slotCooldown: shieldCool });
@@ -595,7 +605,10 @@ const server = http.createServer(async (req, res) => {
     }
     const hardDown = r.error && /ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET|ERR_NAME_NOT_RESOLVED|ENOTFOUND|EAI_AGAIN/i.test(String(r.error));
     // 连接不上（断网 / 代理没开）→ 立刻重试毫无意义，只是再开一个浏览器空烧
-    if (!r.ok && r.error && RETRY_WORTHY.test(r.error) && !r.timeout && Date.now() - t0 < 60000 && runs < 3) {
+    // ★ 11-12：这条网络重试原来用「已用 < 60s」当闸 —— 首次跑了 55s 仍满足 55<60，
+    //   再跑 55s 就是 110s。改成跟换槽同一条判据：剩余预算够不够完整跑一次。
+    if (!r.ok && r.error && RETRY_WORTHY.test(r.error) && !r.timeout && runs < 3
+        && QUERY_TOTAL_BUDGET_MS - (Date.now() - t0) >= timeoutForCarrier(String(r.carrier || carrier || ''), timeoutMs)) {
       // 连接级失败：先判断是不是「网络姿势」问题 —— 换个极性（走代理 ⇄ 强制直连）再试一次
       const conn = isConnectionLevel(r.error);
       const net = await netProfile().catch(() => null);

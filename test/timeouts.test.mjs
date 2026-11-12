@@ -7,7 +7,7 @@
 import {
   num, resolveTimeouts, makeClampTimeout, resolvePort, resolveCacheTtl,
   timeoutForCarrier, PER_CARRIER_TIMEOUT,
- describeTimeoutChoice } from '../bridge/timeouts.mjs';
+ describeTimeoutChoice, QUERY_TOTAL_BUDGET_MS } from '../bridge/timeouts.mjs';
 
 let bad = 0;
 const check = (name, cond, detail = '') => {
@@ -116,6 +116,23 @@ check('resolveCacheTtl(abc) → 有限数', Number.isFinite(resolveCacheTtl({ WP
 
   // 大小写归一
   check('大写 HAPAG 同样留痕', typeof describeTimeoutChoice('HAPAG', 20000) === 'string');
+}
+
+// ⑦ 总预算（11-12 加）：单次上限不是一次查询的上限，换槽重试会叠加
+{
+  check('总预算存在且为 90s', QUERY_TOTAL_BUDGET_MS === 90000, String(QUERY_TOTAL_BUDGET_MS));
+  // 依据：历史 CF 墙样本 93.0–93.2s 全部注定失败 —— 90s 还没有的，再等也不会变好
+  check('总预算 ≤ 历史 CF 墙下界 93s', QUERY_TOTAL_BUDGET_MS <= 93000);
+  // 总预算必须≥ 单次上限，否则第一次都跑不完（这条防有人把预算调到比单次还小）
+  check('总预算 ≥ Hapag 单次上限', QUERY_TOTAL_BUDGET_MS >= PER_CARRIER_TIMEOUT.hapag, `${QUERY_TOTAL_BUDGET_MS} vs ${PER_CARRIER_TIMEOUT.hapag}`);
+  // 换槽判据：剩余预算够不够完整跑一次
+  const afford = (spent, single) => QUERY_TOTAL_BUDGET_MS - spent >= single;
+  check('已用 0s，够换槽', afford(0, 55000) === true);
+  check('已用 55s，剩 35s 不够一次 → 不换槽', afford(55000, 55000) === false);
+  check('已用 10s，剩 80s 够 → 换槽', afford(10000, 55000) === true);
+  check('已用 35s，剩 55s 刚好够 → 换槽', afford(35000, 55000) === true);
+  // 旧版最坏情形：55s 首投 + 55s 重试 = 110s，新版封在 90s 内
+  check('最坏不再是 116s（首投即撞墙不重试）', afford(55000, 55000) === false);
 }
 
 console.log(bad === 0 ? '\n全部通过' : `\n失败 ${bad} 项`);
