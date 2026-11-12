@@ -2039,7 +2039,12 @@ export default {
           }
         }
       }
-      if (paints.length) st.fills = this.paintRows(sheet, paints, batch && batch.doc, batch && batch.cfg.outCol)
+      if (paints.length) {
+        st.fills = this.paintRows(sheet, paints, batch && batch.doc, batch && batch.cfg.outCol)
+        // 阶段是引擎按事件推断的（表里没起讫港列）：照样上色，但说一句，别让人以为百分百确定
+        const inf = (paints._inferred || []).length
+        if (inf) this.log(`${inf} 行的阶段由事件推断（表里没有起讫港列）—— 已按阶段着色，行内有偏差时以事件为准`)
+      }
       if (sinceYield) await this._yieldToUI()   // 收尾也让一帧，最后一格进度能画出来
     },
     _cellValueOf(w) {
@@ -2183,8 +2188,17 @@ export default {
         for (const w of run) {
           const it = w.it
           if (!it || w.result !== 'ok') continue
-          if (it.state === 'ok' && it.stage > 0 && !it.inferred) paints.push({ row: w.row, color: STAGE_COLOR[it.stage] || NO_FILL })
-          else if (it.state === 'ok') paints.push({ row: w.row, color: NO_FILL })
+          // ★ 11-12：不再因 inferred 拒绝上色（知澜判定，我核实后同意）。
+          //   原来条件是 `&& !it.inferred`，而 inferred = !pol || !pod ——
+          //   爹地这张表只有「单号/输出/船司/船名」四列，没有起讫港列 → pod 恒为空
+          //   → inferred 恒 true → 每一行都不上色，还会走 else 分支刷 NO_FILL 把原有颜色擦掉。
+          //   表现就是「查完一行颜色都没有」，查对了也等于没查。
+          //   颜色表达的是「走到哪一步」，不是「港口准不准」；阶段错一格仍比全表无色有用。
+          //   推断这件事照样留痕（下面 paintRows 之后汇总一次日志），只是不再拿它当着色开关。
+          if (it.state === 'ok' && it.stage > 0) {
+            paints.push({ row: w.row, color: STAGE_COLOR[it.stage] || NO_FILL })
+            if (it.inferred) { if (!paints._inferred) paints._inferred = []; paints._inferred.push(w.row) }
+          } else if (it.state === 'ok') paints.push({ row: w.row, color: NO_FILL })
         }
       }
     },
@@ -3299,7 +3313,7 @@ export default {
             : stageOf(r.events || [], { pol: routePol || pol, pod: routePod || pod })
           it.stage = st.stage
           it.stageLabel = st.label
-          it.inferred = !!st.inferred   // 港口列读不到 → 用事件瞎猜，猜出来也不许着色
+          it.inferred = !!st.inferred   // 港口列读不到 → 阶段靠事件推断。11-12 起不再因此拒着色（见 _writeSeg），只留痕
           // 表格里有 ETD/ETA 列 → 用船司返回的真实船期覆盖
           this.writeScheduleDates(b, sheet, t.row, r, routePod || pod, t.number)
         }

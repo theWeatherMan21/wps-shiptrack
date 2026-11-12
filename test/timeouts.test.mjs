@@ -6,6 +6,7 @@
 // --timeout NaN 引擎报错、listen(NaN) 随机端口导致插件连不上。
 import {
   num, resolveTimeouts, makeClampTimeout, resolvePort, resolveCacheTtl,
+  timeoutForCarrier, PER_CARRIER_TIMEOUT,
 } from '../bridge/timeouts.mjs';
 
 let bad = 0;
@@ -70,6 +71,24 @@ for (const [raw, want, label] of [
   check(`resolvePort(${JSON.stringify(raw)}) → ${want}（${label}）`, got === want, `实得 ${got}`);
 }
 check('resolveCacheTtl(abc) → 有限数', Number.isFinite(resolveCacheTtl({ WPS_TRACK_CACHE_MS: 'abc' })));
+
+
+// ⑤ 按船司超时（11-12 加）：Hapag 30s，其余家不受影响，且绝不放大 fallback
+{
+  check('Hapag 收紧到 55s', timeoutForCarrier('hapag', 90000) === 55000, String(timeoutForCarrier('hapag', 90000)));
+  check('大写 HAPAG 同样收紧', timeoutForCarrier('HAPAG', 90000) === 55000, String(timeoutForCarrier('HAPAG', 90000)));
+  check('Maersk 不受影响', timeoutForCarrier('maersk', 90000) === 90000);
+  check('未知家回 fallback', timeoutForCarrier('nosuch', 90000) === 90000);
+  check('空串回 fallback', timeoutForCarrier('', 90000) === 90000);
+  check('null 回 fallback', timeoutForCarrier(null, 90000) === 90000);
+  // 保命条：fallback 比表里还小的时候不许放大（调用方已经自己夹过一次了）
+  check('不放大 fallback', timeoutForCarrier('hapag', 20000) === 20000, String(timeoutForCarrier('hapag', 20000)));
+  check('Hapag 值就是 55000', PER_CARRIER_TIMEOUT.hapag === 55000);
+  // 依据（爹地 11-12 定的原则）：官网返回的任何信息都有用，超时要够读到它，不是够读到「成功」。
+  // 「45GP / not available」要 39.5–50.6s 才出来 —— 低于 51s 就会把这批信息砍成「站点无响应」。
+  check('Hapag 值覆盖 not available 上界 50.6s', PER_CARRIER_TIMEOUT.hapag >= 51000, String(PER_CARRIER_TIMEOUT.hapag));
+  check('Hapag 值不低于成功上界 20s', PER_CARRIER_TIMEOUT.hapag >= 20000);
+}
 
 console.log(bad === 0 ? '\n全部通过' : `\n失败 ${bad} 项`);
 process.exit(bad === 0 ? 0 : 1);

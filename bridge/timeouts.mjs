@@ -36,3 +36,27 @@ export function resolvePort(env = process.env, fallback = 8791) {
 export function resolveCacheTtl(env = process.env, fallback = 10 * 60 * 1000) {
   return num(env.WPS_TRACK_CACHE_MS, fallback);
 }
+
+/** 按船司的超时上限（毫秒）。没列出的家走 defaultTimeout。
+ *
+ * 为什么要这张表（11-12 实测：Hapag 成功 52 次 + 失败 31 次）：
+ *   Hapag 成功全部落在 10.4–19.5 秒，**没有一次超过 20 秒**；
+ *   失败的耗时分三簇：
+ *     8.0–11.3s   官网无此单记录（正常业务，不是故障）
+ *     39.5–50.6s  查到订舱但箱号未分配（业务状态，见 hapag.mjs booking-no-container）
+ *     93.0s       被桥 90s 砍断 —— 全部注定失败
+ *   所以 90 秒对 Hapag 只意味着「多等 70 秒然后失败」，没有第三种结局。
+ *
+ * 为什么定 55 秒而不是 30 秒（一度按「成功样本最快」定成 30s，被爹地否掉）：
+ *   官网回来的任何提单信息都有用，判断它有没有用不是我的权力。
+ *   「45GP / not available」=「订舱已建、箱型 45GP、箱号还没分配」，是业务状态信息，
+ *   而它要 39.5–50.6 秒才吐出来 —— 30 秒会把它全部砍成「站点无响应」，那是丢信息，不是省时间。
+ *   定超时该看「读到信息要多久」，不是「成功的多快」。55s = 覆盖 50.6s + 余量。
+ */
+export const PER_CARRIER_TIMEOUT = { hapag: 55000 };
+
+/** 取某家的超时上限；没配置就回 fallback（且绝不放大 fallback） */
+export function timeoutForCarrier(carrier, fallback) {
+  const n = PER_CARRIER_TIMEOUT[String(carrier || '').toLowerCase()];
+  return Number.isFinite(n) && n > 0 ? Math.min(n, fallback) : fallback;
+}

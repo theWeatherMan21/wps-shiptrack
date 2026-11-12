@@ -28,7 +28,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import os from 'node:os';
-import { resolveTimeouts, makeClampTimeout, resolvePort, resolveCacheTtl } from './timeouts.mjs';
+import { resolveTimeouts, makeClampTimeout, resolvePort, resolveCacheTtl, timeoutForCarrier } from './timeouts.mjs';
 import { makeContract } from './schema.mjs';
 import { makeProfilePool, resolveCooldownMs } from './profiles.mjs';
 
@@ -240,9 +240,37 @@ function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = nul
         });
       } catch (e) { /* ignore */ }
     }
-    const timer = setTimeout(() => { killed = true; killTree('SIGTERM'); setTimeout(() => killTree('SIGKILL'), 3000); }, timeoutMs);
+    // ★ 11-12：超时按船司。auto 时一开始不知道是哪家，收到 track-started 才收紧（见下面的 stdout 处理）。
+    //   Hapag 成功上界 19.5s、失败全在 93s（桥砍）——90 秒对它只是多等 70 秒，见 timeouts.mjs 的表。
+    let effTimeout = timeoutMs;
+    let timedOutCarrier = String(carrier || '').toLowerCase() || null;
+    if (timedOutCarrier) effTimeout = timeoutForCarrier(timedOutCarrier, timeoutMs);
+    const killNow = () => { killed = true; killTree('SIGTERM'); setTimeout(() => killTree('SIGKILL'), 3000); };
+    let timer = setTimeout(killNow, effTimeout);
 
-    child.stdout.on('data', (b) => { out += b.toString(); });
+    child.stdout.on('data', (b) => {
+      const chunk = b.toString();
+      out += chunk;
+      // auto 模式：引擎自报船司后才收紧，避免「先按 90s 起表、30s 才改」也能省下 60s
+      if (!carrier && chunk.includes('track-started')) {
+        try {
+          const startedEvt = out.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } })
+            .find((e) => e && e.type === 'track-started');
+          const cid = String((startedEvt && startedEvt.carrier) || '').toLowerCase();
+          if (cid) {
+            timedOutCarrier = cid;
+            const per = timeoutForCarrier(cid, timeoutMs);
+            if (per < effTimeout) {
+              const spent = Date.now() - t0;
+              effTimeout = per;
+              clearTimeout(timer);
+              timer = setTimeout(killNow, Math.max(5000, per - spent));
+              console.error(`[bridge] ${number} 按船司收紧超时 ${timeoutMs}ms → ${per}ms（${cid}，已用 ${spent}ms）`);
+            }
+          }
+        } catch { /* 解析不出来就按原超时跑 */ }
+      }
+    });
     child.stderr.on('data', (b) => { err += b.toString(); });
 
     let settled = false;
@@ -272,11 +300,26 @@ function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = nul
 
       // ★ 卡 t_cec031c1：超时是桥这一层杀的进程，引擎来不及出 canonical —— 本地造一个最小的，
       //   否则插件又得自己拼文案（「同一票两个界面文案不同」就是这么来的）。
-      if (killed) return finish({
-        ok: false, number, carrier: carrier || started?.carrier || null,
-        error: `超时（${Math.round(timeoutMs / 1000)}s 未出结果）`, timeout: true, ms,
-        canonical: fallbackCanonical({ carrier: carrier || started?.carrier || null, failKind: 'network', shortText: '查询超时（稍后重试）', error: 'timeout' }),
-      });
+      if (killed) {
+        // ★ 11-12：Hapag 的「超时」几乎都是 CF 挑战没过，说「超时」会让人以为是网络问题。
+        //   文案必须直接说是站点无响应，爹地才知道该等还是该换渠道手工查。
+        const cid = timedOutCarrier || String(carrier || started?.carrier || '').toLowerCase() || null;
+        const isHapag = cid === 'hapag';
+        const secs = Math.round(effTimeout / 1000);
+        return finish({
+          ok: false, number, carrier: cid,
+          error: isHapag
+            ? `Hapag 站点无响应（CF 挑战未通过，${secs}s 内无结果）`
+            : `超时（${secs}s 未出结果）`,
+          timeout: true, timedOutCarrier: cid, ms,
+          canonical: fallbackCanonical({
+            carrier: cid,
+            failKind: isHapag ? 'blocked' : 'network',   // CF 墙是「被拦」不是「网络不通」
+            shortText: isHapag ? 'Hapag 站点无响应（稍后重试或手工查）' : '查询超时（稍后重试）',
+            error: 'timeout',
+          }),
+        });
+      }
       // ★ 10-28：原来只挑 msg/code，把引擎带出的 manualUrl/manualLabel 丢了 → 插件就没法给「手工查」链接
       // ★ 卡 t_cec031c1：同理，引擎算好的 canonical 必须原样透传，不能在这一层重建对象把它丢掉
       if (error) return finish({
@@ -526,9 +569,12 @@ const server = http.createServer(async (req, res) => {
     // ★ 卡 t_991b99f7 ②：撞盾 → 该槽已经带着冷却放回池子，这里换另一个档案重跑一次。
     //   为什么值得多跑一次：同档案第 2 次必被拦（OOCL 实测，117s 烧满预算），
     //   而换新档案 + 冷却后马上就恢复；原槽硬撞只是把预算烧光。
-    if (!r.ok && isCooldownKind(r.errorKind) && r.profile && runs < 3) {
+    // ★ 11-12：Hapag 撞 CF 墙超时 → 该槽冷却，换另一个档案再试一次（知澜批复）。
+    //   同档案硬撞只是把 30 秒预算烧两遍（OOCL 实测同档案第 2 次必被拦），换槽才有意义。
+    const hapagWall = r.timeout && String(r.timedOutCarrier || r.carrier || '').toLowerCase() === 'hapag';
+    if (!r.ok && (isCooldownKind(r.errorKind) || hapagWall) && r.profile && runs < 3) {
       const from = r.profile;
-      console.error(`[bridge] ${number} 撞盾 ${r.errorKind} → ${from} 冷却并换档案重试`);
+      console.error(`[bridge] ${number} ${hapagWall ? '撞 CF 墙超时' : `撞盾 ${r.errorKind}`} → ${from} 冷却并换档案重试`);
       const r2 = await runCli({ ...runArgs, retry: true, slotCooldown: shieldCool });
       runs++;
       // 打标给插件/日志看：这次结果是换过档案才拿到的
