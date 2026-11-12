@@ -244,7 +244,13 @@ function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = nul
     //   Hapag 成功上界 19.5s、失败全在 93s（桥砍）——90 秒对它只是多等 70 秒，见 timeouts.mjs 的表。
     let effTimeout = timeoutMs;
     let timedOutCarrier = String(carrier || '').toLowerCase() || null;
-    if (timedOutCarrier) effTimeout = timeoutForCarrier(timedOutCarrier, timeoutMs);
+    if (timedOutCarrier) {
+      effTimeout = timeoutForCarrier(timedOutCarrier, timeoutMs);
+      // 手选船司这条路原来一行日志都没有：调用方传 20000、家配置 55000 时，
+      // 55000 这趟根本没参与，事后完全看不出来。跟 auto 那条一样留痕。
+      const note = describeTimeoutChoice(timedOutCarrier, timeoutMs);
+      if (note) console.error(`[bridge] ${number} ${note}`);
+    }
     const killNow = () => { killed = true; killTree('SIGTERM'); setTimeout(() => killTree('SIGKILL'), 3000); };
     let timer = setTimeout(killNow, effTimeout);
 
