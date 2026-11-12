@@ -252,7 +252,7 @@ import { pickEtdEta } from '../lib/dates.js'
 // ★ 10-30：读回校验的口径只有一份（lib/cellwrite.js）—— 批量路径与逐格路径共用，
 //   以前逐格用裸比较、批量用归一化，日期列/数值列走逐格必然误判「补不进去」。
 import { cellMatches, judgeReadback, writeCellCore, cellText } from '../lib/cellwrite.js'
-import { planVesselVoyage, mergeBlockOf, mergeSkipText, isVbaTrue, canUseMergeFastPath, mergeVerdict, findMovedValue } from '../lib/writeplan.js'   // ★ 11-10：船名/航次同列 + 合并格 + VBA 布尔
+import { planVesselVoyage, mergeBlockOf, mergeSkipText, isVbaTrue, canUseMergeFastPath, mergeVerdict, findMovedValue, describeSnapMiss } from '../lib/writeplan.js'   // ★ 11-10：船名/航次同列 + 合并格 + VBA 布尔
 import { summarize as summarizeFails, classifyFail } from '../lib/fail.js'
 // ★ 卡 t_8a6689dc：canonical 契约（schemaVersion）闸门 + 单元格文案的唯一实现
 import { checkResultSchema, PLUGIN_SCHEMA_VERSION } from '../lib/contract.js'
@@ -2352,7 +2352,23 @@ export default {
       else st.rbp = (st.rbp || 0) + 1
       if (!st.failEx) st.failEx = { row: w.row, col: colLetter(w.col), wrote: (r && r.wrote) || '', back: (r && r.backText) || '', kind: (r && r.kind) || 'readback' }
       w.result = 'fail'
-      w.error = r && r.error
+      // ★ 11-12：红字自带证据 —— 不再让人为了定位去点诊断、复制日志。
+      //   合并格修了八版，每次卡在「分不清快照没拍到 / 拍到了但值没落进去」：
+      //     快照 1 格          → WPS 连 Rows.Count 都返 1，兜底无解
+      //     快照 N 格 + 未命中  → 拍到了候选区，值真没写进去
+      //     kind=com           → 写入本身抛异常，跟合并无关
+      try {
+        const miss = describeSnapMiss({
+          snap: w.mergeSnap || [],
+          kind: (r && r.kind) || 'readback',
+          row: w.row,
+          col: colLetter(w.col),
+        })
+        w.error = miss.text
+        this.log(miss.log)
+      } catch (e) {
+        w.error = r && r.error
+      }
       // ★ 0.9.45：真写不进才记——{row, col, error, via, ts} 进环形缓冲，供事后归因
       this._recordWriteFail(w, r, viaHint)
       return false

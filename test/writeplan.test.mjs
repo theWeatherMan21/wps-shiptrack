@@ -4,7 +4,7 @@
 //   ① 船名列 = 航次列时**只写一次**「船名 空格 航次」；同列写两遍 → 只剩航次（原 bug）
 //   ② 合并单元格只有左上角能写；非左上角一律跳过并报「与 K12:K13 合并」，不许报读回不一致
 //   ③ 撞结果列/单号列不许写；两个都没查到一格都不动
-import { planVesselVoyage, mergeBlockOf, mergeSkipText, isVbaTrue } from '../src/lib/writeplan.js'
+import { planVesselVoyage, mergeBlockOf, mergeSkipText, isVbaTrue , describeSnapMiss} from '../src/lib/writeplan.js'
 
 let fail = 0
 const ok = (cond, label, extra = '') => {
@@ -101,5 +101,31 @@ ok(mergeBlockOf({ mergeCells: 0 }, 13, 11) === null, 'MergeCells=0 → 可写')
   ok(r5.length === 0, '船名列撞输出列 → 不写（blocked 优先于拼航次）', JSON.stringify(r5))
 }
 
+
+// ★ 11-12：兜底未命中时，红字必须自带证据（知澜：别再让爹地点诊断复制日志）
+{
+  const SNAP2 = [{ addr: 'K12', prev: '2026-11-18' }, { addr: 'K13', prev: '' }]
+  const a = describeSnapMiss({ snap: SNAP2, kind: 'readback', row: 13, col: 'K' })
+  ok(a.cells === 2 && a.text.indexOf('快照 2 格') >= 0, '快照 2 格 → 红字写「快照 2 格」', a.text)
+  ok(a.text.indexOf('K12="2026-11-18"') >= 0, '红字带出候选区各格原值', a.text)
+  ok(a.text.indexOf('kind=readback') >= 0, '红字带 kind（区分读回空 / COM 异常）', a.text)
+  ok(a.log.indexOf('兜底未命中') >= 0 && a.log.indexOf('mergeSnap=2') >= 0, '诊断日志独立一条', a.log)
+
+  const b = describeSnapMiss({ snap: [{ addr: 'K13', prev: null }], kind: 'readback', row: 13, col: 'K' })
+  ok(b.cells === 1 && b.text.indexOf('快照 1 格') >= 0,
+    '快照 1 格 → Rows.Count 返 1，兜底无解（这行一出就知道要换路）', b.text)
+
+  const c = describeSnapMiss({ snap: [], kind: 'com', row: 13, col: 'K' })
+  ok(c.cells === 0 && c.text.indexOf('快照 0 格') >= 0 && c.text.indexOf('kind=com') >= 0,
+    '写入抛异常 → kind=com，跟合并无关', c.text)
+
+  const d = describeSnapMiss({})
+  ok(d.cells === 0 && typeof d.text === 'string' && d.text.length > 0, '全空也不崩，给得出文案', d.text)
+
+  // 值太长要截断，不许把红字撑爆
+  const long = 'X'.repeat(200)
+  const e = describeSnapMiss({ snap: [{ addr: 'K12', prev: long }], kind: 'readback', row: 13, col: 'K' })
+  ok(e.text.length < 120, '长值截断，红字不撑爆', `len=${e.text.length}`)
+}
 console.log(fail ? `\n${fail} FAIL` : '\nALL PASS')
 process.exit(fail ? 1 : 0)

@@ -250,3 +250,47 @@ export function findMovedValue({ snap, selfAddr, want, readCell } = {}) {
 
   return null;
 }
+
+
+/**
+ * 兜底未命中时，把「我看得见的事实」写进红字本身 —— 不要求用户点诊断、也不要求他复制日志。
+ *
+ * 为什么需要：合并格这条路修了八版，每次定位都卡在「红字只有一句『读回不一致（空）』，
+ * 分不清是快照没拍到、还是拍到了但值没落到那几格」。判据写在代码里，用户看不见。
+ *
+ * 三种情况一句话分清：
+ *   快照 1 格            → Rows.Count 返 1，WPS 根本不承认这是合并区，兜底无解
+ *   快照 N 格 + 未命中    → 拍到了候选区，但值没落进去 → 不是「跑了」，是真没写
+ *   kind=com             → 写入本身抛异常，跟合并无关
+ *
+ * @param {object} o
+ * @param {Array<{addr:string, prev:any}>} o.snap  写前快照
+ * @param {string} o.kind                          写入失败类型（com / readback / format-diff）
+ * @param {number|string} o.row                    行号
+ * @param {string} o.col                           列字母
+ * @param {number} [o.maxValLen]                   每个值最多显示多少字符（默认 24）
+ * @returns {{cells:number, detail:string, text:string, log:string}}
+ */
+export function describeSnapMiss({ snap, kind, row, col, maxValLen } = {}) {
+  const arr = Array.isArray(snap) ? snap : [];
+  const cap = Number(maxValLen) > 0 ? Number(maxValLen) : 24;
+
+  const brief = (v) => {
+    let t;
+    try { t = JSON.stringify(v === undefined ? null : v); } catch (e) { t = '"?"'; }
+    if (t === undefined) t = '"?"';
+    return t.length > cap ? t.slice(0, cap) + '…' : t;
+  };
+
+  const detail = arr.map((s) => `${(s && s.addr) || '?'}=${brief(s && s.prev)}`).join(' ');
+  const cells = arr.length;
+  const k = kind || 'unknown';
+  const where = `R${row == null ? '?' : row} ${col || '?'}`;
+
+  return {
+    cells,
+    detail,
+    text: `${where} 读回空 · 快照 ${cells} 格 [${detail}] · 扫描未命中 · kind=${k}`,
+    log: `${where} 兜底未命中：mergeSnap=${cells} 格（${detail}）· kind=${k}`,
+  };
+}
