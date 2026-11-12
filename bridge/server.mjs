@@ -28,7 +28,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import os from 'node:os';
-import { resolveTimeouts, makeClampTimeout, resolvePort, resolveCacheTtl, timeoutForCarrier } from './timeouts.mjs';
+import { resolveTimeouts, makeClampTimeout, resolvePort, resolveCacheTtl, timeoutForCarrier, describeTimeoutChoice } from './timeouts.mjs';
 import { makeContract } from './schema.mjs';
 import { makeProfilePool, resolveCooldownMs } from './profiles.mjs';
 
@@ -266,6 +266,10 @@ function runCli({ number, carrier, timeoutMs, forceDirect = false, onSpawn = nul
               clearTimeout(timer);
               timer = setTimeout(killNow, Math.max(5000, per - spent));
               console.error(`[bridge] ${number} 按船司收紧超时 ${timeoutMs}ms → ${per}ms（${cid}，已用 ${spent}ms）`);
+            } else {
+              // 家上限 ≥ 调用方上限 → 家配置这一趟没参与，只留痕不告警（正常降配）
+              const note = describeTimeoutChoice(cid, timeoutMs);
+              if (note) console.error(`[bridge] ${number} ${note}`);
             }
           }
         } catch { /* 解析不出来就按原超时跑 */ }

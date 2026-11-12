@@ -60,3 +60,21 @@ export function timeoutForCarrier(carrier, fallback) {
   const n = PER_CARRIER_TIMEOUT[String(carrier || '').toLowerCase()];
   return Number.isFinite(n) && n > 0 ? Math.min(n, fallback) : fallback;
 }
+
+/** 这一趟超时到底按谁算、家配置有没有参与 —— 返回要打的那行日志，返回 null 表示不用打。
+ *
+ * 为什么需要这个（知澜 11-12 指出）：timeoutForCarrier 用 Math.min，只会收紧不会放大。
+ * 调用方传 90000 → 收紧到 55000，有日志；调用方传 20000 → 结果就是 20000，
+ * 家配置 55000 这一趟压根没参与，而过去一行日志都不打 —— 「配了但不生效」查不出来。
+ * 取更严的上限本身是对的（调用方说「我最多等 20 秒」，桥不该硬等 55 秒），
+ * 所以这里只留痕、不告警：这是正常降配，不是故障。
+ */
+export function describeTimeoutChoice(carrier, callerMs) {
+  const cid = String(carrier || '').toLowerCase();
+  const cap = PER_CARRIER_TIMEOUT[cid];
+  const caller = Number(callerMs);
+  if (!Number.isFinite(cap) || !Number.isFinite(caller) || caller <= 0) return null;
+  if (caller === cap) return null;                       // 刚好相等，没什么可说的
+  if (caller < cap) return `调用方上限更严 ${caller}ms < 家配置 ${cap}ms（${cid}）→ 按 ${caller}ms 跑，家配置本趟未参与`;
+  return null;                                            // caller > cap 由「按船司收紧」那行负责
+}

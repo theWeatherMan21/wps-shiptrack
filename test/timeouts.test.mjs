@@ -7,7 +7,7 @@
 import {
   num, resolveTimeouts, makeClampTimeout, resolvePort, resolveCacheTtl,
   timeoutForCarrier, PER_CARRIER_TIMEOUT,
-} from '../bridge/timeouts.mjs';
+ describeTimeoutChoice } from '../bridge/timeouts.mjs';
 
 let bad = 0;
 const check = (name, cond, detail = '') => {
@@ -88,6 +88,34 @@ check('resolveCacheTtl(abc) → 有限数', Number.isFinite(resolveCacheTtl({ WP
   // 「45GP / not available」要 39.5–50.6s 才出来 —— 低于 51s 就会把这批信息砍成「站点无响应」。
   check('Hapag 值覆盖 not available 上界 50.6s', PER_CARRIER_TIMEOUT.hapag >= 51000, String(PER_CARRIER_TIMEOUT.hapag));
   check('Hapag 值不低于成功上界 20s', PER_CARRIER_TIMEOUT.hapag >= 20000);
+}
+
+// ⑥ 「家配置有没有参与」的留痕（知澜 11-12 指出：Math.min 单向收紧，调用方传小值时家配置静默失效）
+{
+  // 调用方 90s > 家 55s → 由「按船司收紧」那行负责，这里不重复打
+  check('调用方 90s 时不重复留痕', describeTimeoutChoice('hapag', 90000) === null, String(describeTimeoutChoice('hapag', 90000)));
+
+  // 调用方 20s < 家 55s → 家配置本趟没参与，必须留痕
+  const note = describeTimeoutChoice('hapag', 20000);
+  check('调用方上限更严时要留痕', typeof note === 'string' && note.includes('20000') && note.includes('55000'), String(note));
+  check('  └ 文案说清「家配置本趟未参与」', String(note).includes('未参与'), String(note));
+  check('  └ 文案带船司名', String(note).includes('hapag'));
+
+  // 相等 → 没什么可说
+  check('相等时不打', describeTimeoutChoice('hapag', 55000) === null);
+
+  // 没有家配置的家 → 不打（不存在「被压住」这回事）
+  check('未配置家不打', describeTimeoutChoice('maersk', 5000) === null);
+  check('未知家不打', describeTimeoutChoice('nosuch', 5000) === null);
+  check('空串不打', describeTimeoutChoice('', 5000) === null);
+
+  // 非法输入不崩
+  check('caller 为 0 不打', describeTimeoutChoice('hapag', 0) === null);
+  check('caller 为 NaN 不打', describeTimeoutChoice('hapag', NaN) === null);
+  check('caller 为 null 不打', describeTimeoutChoice('hapag', null) === null);
+
+  // 大小写归一
+  check('大写 HAPAG 同样留痕', typeof describeTimeoutChoice('HAPAG', 20000) === 'string');
 }
 
 console.log(bad === 0 ? '\n全部通过' : `\n失败 ${bad} 项`);
