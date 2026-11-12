@@ -378,7 +378,26 @@ export function detectColumns(input = {}) {
     // 分列但内容其实是「船名 航次」合体 → 内容为准，改成 single
     if (vesselMode === 'split' && vesselCol) {
       const p = profiles[vesselCol - 1];
-      if (p.total && p.ratio.vesselVoyage >= 0.5) { vesselMode = 'single'; voyageCol = 0; vesselBy = 'content'; }
+      if (p.total && p.ratio.vesselVoyage >= 0.5) { vesselMode = 'single'; voyageCol = vesselCol; vesselBy = 'content'; }
+    }
+
+    // ★ 11-12：vesselMode 必须自洽，不许再产出 split + voyageCol=0。
+    //   识别说「船名航次分两列」却给不出第二列，写入端只能把航次丢掉 ——
+    //   爹地 11-12 撞到的就是这个：P 列 11 行只剩船名，引擎明明查到了航次。
+    //   约定：
+    //     split  ⇔ vesselCol>0 && voyageCol>0 && voyageCol !== vesselCol
+    //     single ⇔ vesselCol>0 && voyageCol === vesselCol   （同格写「船名 航次」）
+    if (vesselCol) {
+      if (vesselMode === 'split' && (!voyageCol || voyageCol === vesselCol)) {
+        fixes.push(`${colLetter(vesselCol)} 列判成「船名航次分两列」，但没有独立的航次列 → 按合体处理（写「船名 航次」）`);
+        vesselMode = 'single';
+        voyageCol = vesselCol;
+      } else if (vesselMode === 'single' && !voyageCol) {
+        voyageCol = vesselCol;              // single 的语义是「同格」，必须有值
+      }
+    } else {
+      vesselMode = 'absent';
+      voyageCol = 0;
     }
   }
 

@@ -172,5 +172,37 @@ ok(colLetter(1) === 'A' && colLetter(26) === 'Z' && colLetter(27) === 'AA' && co
   ok(e3.ok === true && e3.numberCol === 1, 'null/undefined/数字混在样本里也不崩', `col=${e3.numberCol}`)
 }
 
+
+// ── ⑪ vesselMode 必须自洽（11-12 爹地撞到的 split + voyageCol=0）───────────
+//   split  ⇔ vesselCol>0 && voyageCol>0 && voyageCol !== vesselCol
+//   single ⇔ vesselCol>0 && voyageCol === vesselCol
+//   识别说「分两列」却给不出第二列 → 写入端只能把航次丢掉，P 列 11 行只剩船名
+{
+  const bad = []
+  const fxFiles = fs.readdirSync(FIX_DIR).filter((x) => x.endsWith('.json')).sort()
+  for (const fn of fxFiles) {
+    const f = JSON.parse(fs.readFileSync(path.join(FIX_DIR, fn), 'utf8'))
+    const d = detectColumns({ rows: f.rows, identify: idmod, headers: f.headers })
+    if (!d || !d.ok) continue
+    f.name = fn
+    const v = Number(d.vesselCol) || 0
+    const y = Number(d.voyageCol) || 0
+    const m = String(d.vesselMode || 'absent')
+
+    if (m === 'split' && !(v > 0 && y > 0 && y !== v)) bad.push(`${f.name}: split 但 v=${v} y=${y}`)
+    if (m === 'single' && !(v > 0 && y === v)) bad.push(`${f.name}: single 但 v=${v} y=${y}`)
+    if (m === 'absent' && (v || y)) bad.push(`${f.name}: absent 但 v=${v} y=${y}`)
+  }
+  ok(bad.length === 0, `${fxFiles.length} 个夹具的 vesselMode 全部自洽`, bad.join(' | '))
+
+  // 表头写 V/V 但内容只有船名 → 必须 single + voyageCol = vesselCol（不许 split）
+  const vv = detectColumns({
+    rows: [['提单号', 'V/V', '状态'], ['TESTMAE0123457', 'MSC LORETO', '未查'], ['TESTMAE0123458', 'MSC ISABELLA', '未查']],
+    identify: idmod,
+  })
+  ok(vv && vv.vesselMode === 'single', 'V/V 表头 + 纯船名内容 → single', `mode=${vv && vv.vesselMode}`)
+  ok(vv && Number(vv.voyageCol) === Number(vv.vesselCol), 'single 的 voyageCol 必须等于 vesselCol', `v=${vv && vv.vesselCol} y=${vv && vv.voyageCol}`)
+}
+
 console.log(fail ? `\n${fail} FAILED` : '\nALL PASS')
 process.exit(fail ? 1 : 0)

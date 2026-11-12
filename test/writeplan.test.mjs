@@ -73,5 +73,33 @@ ok(mergeBlockOf({ mergeCells: -1, topRow: 12, topCol: 11, address: '$K$12:$K$13'
   'MergeCells=-1（WPS 真实返回）→ 判为不可写')
 ok(mergeBlockOf({ mergeCells: 0 }, 13, 11) === null, 'MergeCells=0 → 可写')
 
+
+// ★ 11-12：没有独立航次列时不许静默丢航次（爹地撞到 P 列 11 行只剩船名）
+{
+  const r1 = planVesselVoyage({ vesselCol: 16, voyageCol: 0, outCol: 18, numCol: 15,
+                               vessel: 'MSC FLORENCE XV', voyage: 'GA645W' })
+  ok(r1.length === 1 && r1[0].col === 16 && r1[0].text === 'MSC FLORENCE XV GA645W',
+    '① voyageCol=0 但有航次 → 拼进船名列，不丢', JSON.stringify(r1))
+
+  const r2 = planVesselVoyage({ vesselCol: 16, voyageCol: 16, outCol: 18, numCol: 15,
+                               vessel: 'MSC FLORENCE XV', voyage: 'GA645W' })
+  ok(r2.length === 1 && r2[0].col === 16 && r2[0].text === 'MSC FLORENCE XV GA645W',
+    '③ 同格（vesselCol===voyageCol）→ 拼一起写一格，不写第二格', JSON.stringify(r2))
+
+  const r3 = planVesselVoyage({ vesselCol: 16, voyageCol: 17, outCol: 18, numCol: 15,
+                               vessel: 'MSC FLORENCE XV', voyage: 'GA645W' })
+  ok(r3.length === 2 && r3[0].col === 16 && r3[0].text === 'MSC FLORENCE XV'
+     && r3[1].col === 17 && r3[1].text === 'GA645W',
+    '真分两列时照旧分开写', JSON.stringify(r3))
+
+  const r4 = planVesselVoyage({ vesselCol: 16, voyageCol: 0, outCol: 18, numCol: 15,
+                               vessel: 'MSC FLORENCE XV', voyage: '' })
+  ok(r4.length === 1 && r4[0].text === 'MSC FLORENCE XV', '没有航次就只写船名', JSON.stringify(r4))
+
+  const r5 = planVesselVoyage({ vesselCol: 18, voyageCol: 0, outCol: 18, numCol: 15,
+                               vessel: 'V', voyage: 'Y' })
+  ok(r5.length === 0, '船名列撞输出列 → 不写（blocked 优先于拼航次）', JSON.stringify(r5))
+}
+
 console.log(fail ? `\n${fail} FAIL` : '\nALL PASS')
 process.exit(fail ? 1 : 0)

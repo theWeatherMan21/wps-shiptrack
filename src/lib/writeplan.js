@@ -40,6 +40,12 @@ export function planVesselVoyage({ vesselCol, voyageCol, outCol, numCol, vessel,
     if (blocked(vCol)) return []
     return [{ col: vCol, text: [v, y].filter(Boolean).join(' ') }]
   }
+  // ★ 11-12：没有独立航次列，但引擎查到了航次 —— 拼到船名后面，不许静默丢掉。
+  //   爹地撞到的就是这个：识别给了 vesselMode='split'（分两列）却 voyageCol=0，
+  //   引擎明明返回了 GA645W，写入端只写船名，11 行 P 列全剩船名。
+  if (!yCol && y && vCol && !blocked(vCol)) {
+    return [{ col: vCol, text: [v, y].filter(Boolean).join(' ') }]
+  }
   const out = []
   if (vCol && v && !blocked(vCol)) out.push({ col: vCol, text: v })
   if (yCol && y && !blocked(yCol)) out.push({ col: yCol, text: y })
