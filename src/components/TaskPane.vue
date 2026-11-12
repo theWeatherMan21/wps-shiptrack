@@ -252,7 +252,7 @@ import { pickEtdEta } from '../lib/dates.js'
 // ★ 10-30：读回校验的口径只有一份（lib/cellwrite.js）—— 批量路径与逐格路径共用，
 //   以前逐格用裸比较、批量用归一化，日期列/数值列走逐格必然误判「补不进去」。
 import { cellMatches, judgeReadback, writeCellCore, cellText } from '../lib/cellwrite.js'
-import { planVesselVoyage, mergeBlockOf, mergeSkipText, isVbaTrue, canUseMergeFastPath, mergeVerdict, findMovedValue, describeSnapMiss } from '../lib/writeplan.js'   // ★ 11-10：船名/航次同列 + 合并格 + VBA 布尔
+import { planVesselVoyage, mergeBlockOf, mergeSkipText, isVbaTrue, canUseMergeFastPath, mergeVerdict, findMovedValue, describeSnapMiss, shouldKeepOldText } from '../lib/writeplan.js'   // ★ 11-10：船名/航次同列 + 合并格 + VBA 布尔
 import { summarize as summarizeFails, classifyFail } from '../lib/fail.js'
 // ★ 卡 t_8a6689dc：canonical 契约（schemaVersion）闸门 + 单元格文案的唯一实现
 import { checkResultSchema, PLUGIN_SCHEMA_VERSION } from '../lib/contract.js'
@@ -3735,6 +3735,17 @@ export default {
         outCol, numCol: it.numCol, vessel: it.vessel, voyage: it.voyage
       })
       for (const t of targets) {
+        // ★ 11-12：不许「本次没带回航次」把格子里已有的航次抹掉。
+        //   planVesselVoyage 只按这次的查询结果算，它不知道格子里原来有什么；
+        //   引擎某次缺航次（缓存命中 / 站点改版 / 超时降级）就会写成纯船名，旧航次消失。
+        //   判据在 writeplan.shouldKeepOldText（三条：旧值以新值开头 + 更长 + 多出的是单个 token）。
+        let cur = ''
+        try { cur = this.readOne(sheet, row, t.col) || '' } catch (e) { cur = '' }
+        const k = shouldKeepOldText({ cur, next: t.text })
+        if (k.keep) {
+          this.log(`R${row} ${colLetter(t.col)} 本次只带回「${t.text}」，格子里是「${cur}」→ 保留旧值（多出的 ${k.extra} 不会丢）`)
+          continue
+        }
         const wv = this.writeRowChecked(b, sheet, row, t.col, t.text, it.number, it.numCol, it)
         if (!wv || !wv.ok) this.log(`写 ${colLetter(t.col)}${row} 船名/航次失败: ${wv ? wv.error : '未知'}`)
       }

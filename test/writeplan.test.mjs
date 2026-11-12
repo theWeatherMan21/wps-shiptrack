@@ -4,7 +4,7 @@
 //   ① 船名列 = 航次列时**只写一次**「船名 空格 航次」；同列写两遍 → 只剩航次（原 bug）
 //   ② 合并单元格只有左上角能写；非左上角一律跳过并报「与 K12:K13 合并」，不许报读回不一致
 //   ③ 撞结果列/单号列不许写；两个都没查到一格都不动
-import { planVesselVoyage, mergeBlockOf, mergeSkipText, isVbaTrue , describeSnapMiss} from '../src/lib/writeplan.js'
+import { planVesselVoyage, mergeBlockOf, mergeSkipText, isVbaTrue , describeSnapMiss, shouldKeepOldText} from '../src/lib/writeplan.js'
 
 let fail = 0
 const ok = (cond, label, extra = '') => {
@@ -126,6 +126,35 @@ ok(mergeBlockOf({ mergeCells: 0 }, 13, 11) === null, 'MergeCells=0 → 可写')
   const long = 'X'.repeat(200)
   const e = describeSnapMiss({ snap: [{ addr: 'K12', prev: long }], kind: 'readback', row: 13, col: 'K' })
   ok(e.text.length < 120, '长值截断，红字不撑爆', `len=${e.text.length}`)
+}
+
+// ★ 11-12：反向覆盖 —— 本次没带回航次，不许把格子里已有的航次抹掉
+{
+  const t = (cur, next) => shouldKeepOldText({ cur, next })
+
+  ok(t('MSC FLORENCE XV GA645W', 'MSC FLORENCE XV').keep === true,
+    '① 旧值=船名+航次、新值只有船名 → 保留旧值（航次不丢）', JSON.stringify(t('MSC FLORENCE XV GA645W','MSC FLORENCE XV')))
+  ok(t('MSC FLORENCE XV GA645W', 'MSC FLORENCE XV').extra === 'GA645W',
+    '多出来的那段就是航次，能说出来', String(t('MSC FLORENCE XV GA645W','MSC FLORENCE XV').extra))
+
+  ok(t('MSC FLORENCE XV GA645W', 'MSC FLORENCE XV GA646W').keep === false,
+    '② 航次变了 → 正常覆盖', t('MSC FLORENCE XV GA645W','MSC FLORENCE XV GA646W').reason)
+
+  ok(t('MSC MARIANNA D', 'MSC FLORENCE XV').keep === false,
+    '③ 换船 → 正常覆盖', t('MSC MARIANNA D','MSC FLORENCE XV').reason)
+
+  ok(t('', 'MSC FLORENCE XV').keep === false, '④ 格子空 → 正常写')
+  ok(t('MSC FLORENCE XV GA645W', 'MSC FLORENCE XV GA645W').keep === false,
+    '⑤ 等长 → 正常（same）', t('MSC FLORENCE XV GA645W','MSC FLORENCE XV GA645W').reason)
+
+  // 边界
+  ok(t('MSC FLORENCE XV GA645W', '').keep === false, '新值为空 → 不拦（交给上游决定）')
+  ok(t('MSC FLORENCE XV 备注 abc', 'MSC FLORENCE XV').keep === false,
+    '多出的是两段（含空格）→ 不是航次形态，正常覆盖',
+    t('MSC FLORENCE XV 备注 abc','MSC FLORENCE XV').reason)
+  ok(t('  MSC FLORENCE XV   GA645W ', 'MSC FLORENCE XV').keep === true, '多余空白不影响判定')
+  ok(t(null, 'MSC FLORENCE XV').keep === false, 'null 旧值不崩')
+  ok(t(undefined, undefined).keep === false, '全空不崩')
 }
 console.log(fail ? `\n${fail} FAIL` : '\nALL PASS')
 process.exit(fail ? 1 : 0)

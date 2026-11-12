@@ -294,3 +294,46 @@ export function describeSnapMiss({ snap, kind, row, col, maxValLen } = {}) {
     log: `${where} 兜底未命中：mergeSnap=${cells} 格（${detail}）· kind=${k}`,
   };
 }
+
+
+/**
+ * 这次的船名值该不该盖掉格子里已有的？—— 覆盖的规则从这里定
+ *
+ * 11-10 的 bug 是「同一格写两遍，后写的航次盖掉船名」，那个已经被 planVesselVoyage
+ * （同格只返回一项）堵死了。但同一个位置还有**反方向**的覆盖，更隐蔽：
+ *
+ *   第一次查询  v='MSC FLORENCE XV' y='GA645W' → P 写 'MSC FLORENCE XV GA645W'
+ *   第二次查询  v='MSC FLORENCE XV' y=''       → P 写 'MSC FLORENCE XV'   ← 航次没了
+ *
+ * planVesselVoyage 只按这次的查询结果算，它不知道格子里原来有什么。引擎某次没带回航次
+ * （缓存命中 / 站点改版 / 超时降级），就会把上一轮的航次清掉 —— 表现是「航次自己消失了」。
+ *
+ * 判据（三条缺一不可，任一不满足就按正常覆盖走）：
+ *   ① 旧值以新值开头        —— 换船（MSC A → MSC B）不满足，正常覆盖
+ *   ② 旧值比新值长          —— 等长不动
+ *   ③ 多出来的部分是一个 token（不含空白）—— 多出的不是杂串
+ *
+ * 已知保守：船名本身从 'MSC FLORENCE XV' 变短成 'MSC FLORENCE' 时也会判 keep（保留旧值）。
+ * 这是有意的 —— 船名变短极罕见，保留比覆盖成短名安全。要覆盖就手动改那格，或整列清空重跑。
+ *
+ * @param {object} o
+ * @param {any} o.cur   格子里现有的值
+ * @param {any} o.next  这次要写的值
+ * @returns {{keep:boolean, reason:string, extra?:string}}
+ */
+export function shouldKeepOldText({ cur, next } = {}) {
+  const norm = (x) => String(x == null ? '' : x).replace(/\s+/g, ' ').trim();
+  const c = norm(cur);
+  const n = norm(next);
+
+  if (!c) return { keep: false, reason: 'old-empty' };
+  if (!n) return { keep: false, reason: 'nothing-to-write' };
+  if (c === n) return { keep: false, reason: 'same' };
+  if (!c.startsWith(n)) return { keep: false, reason: 'not-prefix' };
+
+  const rest = c.slice(n.length).trim();
+  if (!rest) return { keep: false, reason: 'no-suffix' };
+  if (/\s/.test(rest)) return { keep: false, reason: 'multi-token-suffix' };
+
+  return { keep: true, reason: 'old-has-extra-token', extra: rest };
+}
